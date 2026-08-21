@@ -1,0 +1,27 @@
+# Secrets / local credentials
+.env
+.env.*
+!.env.template
+
+# Python / virtualenv
+*.pyc
+__pycache__/
+.venv/
+venv/
+.pytest_cache/
+
+# Runtime trading state, account data, and logs
+data/
+logs/
+*.log
+
+# Local agent/tooling state
+.claude/
+
+# macOS / editor noise
+.DS_Store
+
+# Accidentally-created literal brace directories
+{src,strategies,config,data,tests,scripts,logs}/
+{src,strategies,config,data,tests,scripts}/
+
