@@ -69,6 +69,7 @@ class OrderAggregate:
     def accept(self, *, order_id: str, status: str) -> None:
         mapping = {
             "live": OrderState.LIVE,
+            "unmatched": OrderState.LIVE,
             "delayed": OrderState.DELAYED,
             "matched": OrderState.MATCHED,
         }
@@ -78,6 +79,12 @@ class OrderAggregate:
             raise ValueError("exchange order id cannot change")
         self.order_id = order_id
         self.state = mapping[status]
+
+    def cancel(self) -> None:
+        """Record exchange cancellation without performing an account action."""
+        if self.state is OrderState.FILLED:
+            raise ValueError("filled order cannot transition to canceled")
+        self.state = OrderState.CANCELED
 
     def record_trade(
         self,
@@ -92,9 +99,17 @@ class OrderAggregate:
             raise ValueError("invalid trade values")
         existing = self.trades.get(trade_id)
         if existing:
-            if (existing.size, existing.price, existing.fee) != (size, price, fee):
+            if (existing.size, existing.price) != (size, price):
                 raise ValueError("trade payload changed for an existing trade id")
-            existing.status = status
+            if existing.accounted and existing.fee != fee:
+                raise ValueError("fee changed after confirmed trade accounting")
+            if not existing.accounted:
+                # The SDK can omit fee_rate_bps on early lifecycle events and
+                # include it when the same trade reaches CONFIRMED.
+                existing.fee = fee
+                existing.status = status
+            elif status is TradeStatus.CONFIRMED:
+                existing.status = status
             record = existing
         else:
             record = TradeRecord(trade_id, size, price, fee, status)

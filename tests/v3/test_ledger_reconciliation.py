@@ -22,6 +22,14 @@ def test_event_ledger_is_append_only_and_idempotent(tmp_path):
     assert [e.event_id for e in ledger.events()] == ["event-1"]
 
 
+def test_event_ledger_serializes_decimal_payloads_losslessly(tmp_path):
+    ledger = EventLedger(tmp_path / "events.db")
+    event = LedgerEvent.create("fill.confirmed", {"price": D("0.20"), "size": D("2")})
+    assert ledger.append(event)
+    restored = tuple(ledger.events())[0]
+    assert restored.payload == {"price": "0.20", "size": "2"}
+
+
 def test_unknown_remote_state_blocks_trading_but_never_creates_actions():
     local = LocalSnapshot(cash=D("10"), position_tokens=frozenset(), order_ids=frozenset())
     remote = RemoteSnapshot(

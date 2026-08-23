@@ -13,6 +13,14 @@ research compatibility; its live path is permanently disabled.
 - No V3 service/worker command exists yet.
 - Authenticated account reads and live-capable client construction are lazy and
   use separate gates; reconciliation can run while paper mode remains enabled.
+- User/market stream events can be normalized, durably replayed, deduplicated,
+  and supervised with bounded reconnect backoff; any disconnect or stream end
+  sets a sticky reconciliation blocker. No stream worker command exists and no
+  authenticated subscription starts automatically. Unknown order IDs are
+  observe-only reconciliation blockers and are never adopted as bot orders
+  unless explicitly supplied as managed local IDs.
+- Queue-aware maker replay and resolved-candidate shadow reports are offline,
+  file-based inspection tools only.
 - Legacy `run_full_loop.py --live` exits before constructing a client.
 - Repository watchdog is status-only and cannot launch the bot.
 - No Polymarket Hermes/Claude cron is required or configured.
@@ -32,6 +40,8 @@ src/v3/
 ├── orders.py           # Fill-aware/idempotent order aggregate
 ├── reconciliation.py   # Read-only local-vs-remote comparison
 ├── risk.py             # Capital, reserve, event, loss, drawdown limits
+├── simulation.py       # Queue-aware maker replay and shadow metrics
+├── streaming.py        # Durable event normalization/replay/reconnect state
 ├── weather.py          # Forecast batching/backoff/calibration metrics
 └── strategies/
     ├── weather.py      # Paper-only weather evaluator
@@ -95,11 +105,34 @@ chmod 600 .env
 ```bash
 python run_v3.py validate-config
 python run_v3.py architecture
+python run_v3.py shadow-report <resolved-candidates.jsonl>
+python run_v3.py replay-report <maker-events.jsonl>
 scripts/pm-status.sh
 ```
 
 These commands do not initialize an authenticated client or call market/account
 APIs.
+
+`shadow-report` expects one resolved candidate per line. Decimal values should
+be encoded as strings:
+
+```json
+{"candidate_id":"candidate-1","expected_probability":"0.70","entry_price":"0.60","outcome":1,"filled_size":"2","fees_paid":"0.01"}
+```
+
+`replay-report` consumes point-in-time events in file order. A conservative maker
+fill occurs only when opposite-side prints at the exact quote price first consume
+the modeled queue ahead. Each quote's `queue_ahead` must include all size ahead
+of it, including earlier simulated quotes at the same level:
+
+```json
+{"event_type":"quote","quote_id":"quote-1","token_id":"token-1","side":"BUY","price":"0.40","size":"5","queue_ahead":"3"}
+{"event_type":"trade","token_id":"token-1","side":"SELL","price":"0.40","size":"4"}
+{"event_type":"cancel","quote_id":"quote-1"}
+```
+
+Runtime JSONL files belong under ignored local state such as `data/`; do not
+commit account-derived events or candidate records.
 
 ## Tests
 
@@ -112,17 +145,20 @@ V3 tests cover fee curves, depth-aware VWAP, complete-set net edge, correlated
 forecast uncertainty, fee-adjusted Kelly, dynamic ticks, fill-only accounting,
 idempotency, capital limits, loss/drawdown breakers, SQLite persistence,
 external-position protection, unified-SDK gating, reconciliation mapping,
-forecast batching/backoff, and non-running entrypoint safety.
+forecast batching/backoff, stream replay/reconnect behavior, queue-aware maker
+fills, fee-aware shadow metrics, and non-running entrypoint safety.
 
 ## Live certification still required
 
 Before any live command is added, V3 still needs:
 
-1. authenticated user-stream ingestion and reconnect recovery;
-2. account reconciliation against a real read-only snapshot;
-3. queue-aware maker paper fills and point-in-time replay;
-4. at least 30 days of shadow data and 100 resolved independent candidates;
-5. explicit review of canary limits and manual-position acknowledgements.
+1. connect the authenticated user-stream processor to a separately reviewed,
+   read-only worker and prove recovery against recorded SDK events;
+2. reconcile against a real read-only account snapshot;
+3. collect real point-in-time books/trades for the queue-aware replay model;
+4. accumulate at least 30 days of shadow data and 100 resolved independent
+   candidates;
+5. explicitly review canary limits and manual-position acknowledgements.
 
 No LLM or cron job belongs in the execution loop. A future Hermes job may produce
 a read-only daily research summary after reliable paper data exists; it must not

@@ -6,7 +6,9 @@ import json
 import sqlite3
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
@@ -72,7 +74,12 @@ class EventLedger:
                     event.event_id,
                     event.event_type,
                     event.occurred_at,
-                    json.dumps(dict(event.payload), sort_keys=True, separators=(",", ":")),
+                    json.dumps(
+                        dict(event.payload),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=_json_default,
+                    ),
                 ),
             )
             return cursor.rowcount == 1
@@ -84,3 +91,13 @@ class EventLedger:
             ).fetchall()
         for event_id, event_type, occurred_at, payload_json in rows:
             yield LedgerEvent(event_id, event_type, occurred_at, json.loads(payload_json))
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Enum):
+        return value.value
+    raise TypeError(f"unsupported ledger payload value: {type(value)!r}")

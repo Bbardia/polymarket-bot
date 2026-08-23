@@ -1,4 +1,5 @@
 import os
+import json
 import subprocess
 from pathlib import Path
 
@@ -52,6 +53,34 @@ def test_v3_cli_exposes_no_start_command():
     assert result.returncode == 0
     assert "start" not in result.stdout.lower()
     assert "validate-config" in result.stdout
+
+
+def test_v3_cli_reports_shadow_and_replay_files_without_network(tmp_path):
+    shadow = tmp_path / "shadow.jsonl"
+    shadow.write_text("\n".join([
+        json.dumps({"candidate_id": "a", "expected_probability": "0.70", "entry_price": "0.60", "outcome": 1, "filled_size": "2"}),
+        json.dumps({"candidate_id": "b", "expected_probability": "0.60", "entry_price": "0.65", "outcome": 0, "filled_size": "0"}),
+    ]) + "\n")
+    replay = tmp_path / "replay.jsonl"
+    replay.write_text("\n".join([
+        json.dumps({"event_type": "quote", "quote_id": "q1", "token_id": "token", "side": "BUY", "price": "0.40", "size": "5", "queue_ahead": "3"}),
+        json.dumps({"event_type": "trade", "token_id": "token", "side": "SELL", "price": "0.40", "size": "4"}),
+    ]) + "\n")
+
+    shadow_result = subprocess.run(
+        [str(PYTHON), "run_v3.py", "shadow-report", str(shadow)], cwd=ROOT,
+        text=True, capture_output=True, timeout=30,
+    )
+    replay_result = subprocess.run(
+        [str(PYTHON), "run_v3.py", "replay-report", str(replay)], cwd=ROOT,
+        text=True, capture_output=True, timeout=30,
+    )
+    assert shadow_result.returncode == 0
+    assert "Candidates: 2" in shadow_result.stdout
+    assert "Filled candidates: 1" in shadow_result.stdout
+    assert replay_result.returncode == 0
+    assert "Quotes placed: 1" in replay_result.stdout
+    assert "Filled size: 1" in replay_result.stdout
 
 
 def test_all_legacy_side_effect_boundaries_are_hard_disabled():

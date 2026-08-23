@@ -8,10 +8,15 @@ live-safety validation.
 __all__ = [
     "api",
     "config",
+    "execution",
     "ledger",
+    "market_context",
     "math",
     "orders",
     "reconciliation",
     "risk",
+    "simulation",
+    "streaming",
+    "strategies",
     "weather",
 ]
