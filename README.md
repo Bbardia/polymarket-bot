@@ -10,7 +10,9 @@ research compatibility; its live path is permanently disabled.
 ## Current safety state
 
 - Uses official `polymarket-client==0.6.0` models and pUSD assumptions.
-- No V3 service/worker command exists yet.
+- `paper-run` is a public-data-only worker with durable local scans, candidates,
+  simulated positions, and settlement records. It refuses to run if account
+  reads or live trading are enabled.
 - Authenticated account reads and live-capable client construction are lazy and
   use separate gates; reconciliation can run while paper mode remains enabled.
 - User/market stream events can be normalized, durably replayed, deduplicated,
@@ -38,6 +40,7 @@ src/v3/
 ├── market_context.py   # Live ticks, minimums, fees, state, resolution rules
 ├── math.py             # Decimal fee, VWAP, uncertainty, Kelly, complete sets
 ├── orders.py           # Fill-aware/idempotent order aggregate
+├── paper.py            # Public-only continuous paper worker and state
 ├── reconciliation.py   # Read-only local-vs-remote comparison
 ├── risk.py             # Capital, reserve, event, loss, drawdown limits
 ├── simulation.py       # Queue-aware maker replay and shadow metrics
@@ -105,13 +108,31 @@ chmod 600 .env
 ```bash
 python run_v3.py validate-config
 python run_v3.py architecture
+python run_v3.py paper-status
+python run_v3.py paper-run --cycles 1
+python run_v3.py paper-run
 python run_v3.py shadow-report <resolved-candidates.jsonl>
 python run_v3.py replay-report <maker-events.jsonl>
 scripts/pm-status.sh
 ```
 
-These commands do not initialize an authenticated client or call market/account
-APIs.
+`validate-config`, `architecture`, `paper-status`, `shadow-report`, and
+`replay-report` are network-free. `paper-run` calls only public market and order
+book APIs; it never initializes an authenticated client or calls account APIs.
+
+The paper worker starts with the configured capital reserve applied, scans a
+bounded set of liquid binary markets, evaluates fee-adjusted complete sets using
+executable depth, and records only simulated positions. Runtime state is written
+under ignored `data/v3-paper/` by default:
+
+```text
+status.json          current health and safety posture
+state.json           paper cash, open positions, and aggregate counts
+scans.jsonl          every evaluated public market/book snapshot
+candidates.jsonl     positive strategy candidates and cap decisions
+paper_trades.jsonl   simulated entries only
+settlements.jsonl    public-resolution paper settlements
+```
 
 `shadow-report` expects one resolved candidate per line. Decimal values should
 be encoded as strings:
@@ -146,7 +167,8 @@ forecast uncertainty, fee-adjusted Kelly, dynamic ticks, fill-only accounting,
 idempotency, capital limits, loss/drawdown breakers, SQLite persistence,
 external-position protection, unified-SDK gating, reconciliation mapping,
 forecast batching/backoff, stream replay/reconnect behavior, queue-aware maker
-fills, fee-aware shadow metrics, and non-running entrypoint safety.
+fills, fee-aware shadow metrics, public-only paper-worker safety, durable paper
+state, and non-live entrypoint safety.
 
 ## Live certification still required
 

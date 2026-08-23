@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Non-running CLI for the Polymarket V3 foundation."""
+"""Paper-first CLI for the Polymarket V3 foundation."""
 
 from __future__ import annotations
 
 import argparse
+import asyncio
+import json
+from dataclasses import replace
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from src.v3.api import UnifiedPolymarketAPI
 from src.v3.config import V3Settings
+from src.v3.paper import PaperSettings, paper_status, run_paper
 from src.v3.simulation import (
     evaluate_shadow_candidates,
     load_replay_events,
@@ -29,7 +33,10 @@ def validate_config() -> int:
 
     print(f"SDK: polymarket-client {api.sdk_version}")
     print("Collateral: pUSD on Polygon")
-    print("Mode: PAPER / LIVE CLIENT BLOCKED" if errors else "Mode: LIVE CLIENT GATE SATISFIED")
+    if settings.paper_trading:
+        print("Mode: PAPER / LIVE CLIENT BLOCKED" if errors else "Mode: INVALID PAPER/LIVE OVERLAP")
+    else:
+        print("Mode: NOT PAPER / LIVE CLIENT BLOCKED" if errors else "Mode: LIVE CLIENT GATE SATISFIED")
     print("Account reads: BLOCKED" if account_errors else "Account reads: GATE SATISFIED")
     print(f"Secure client initialized: {str(api.secure_client_initialized).lower()}")
     print(f"Capital cap: {settings.max_capital} pUSD")
@@ -50,6 +57,7 @@ def show_architecture() -> int:
     print("  read-only streams -> replay-safe normalization and reconnect supervision")
     print("  Decimal math -> fee/VWAP/uncertainty/Kelly")
     print("  hard risk engine -> post-only short-TTL intents")
+    print("  public paper worker -> durable scans, candidates, simulated positions")
     print("  paper evaluators -> weather, complete sets, queue-aware replay")
     print("  execution authorization -> disabled by default")
     return 0
@@ -81,8 +89,24 @@ def replay_report(path: Path) -> int:
     return 0
 
 
+def paper_status_report() -> int:
+    load_dotenv(ROOT / ".env", override=False)
+    settings = PaperSettings.from_env(ROOT)
+    print(json.dumps(paper_status(settings), sort_keys=True, indent=2))
+    return 0
+
+
+def paper_run(*, cycles: int, interval: float | None) -> int:
+    load_dotenv(ROOT / ".env", override=False)
+    settings = PaperSettings.from_env(ROOT)
+    if interval is not None:
+        settings = replace(settings, scan_interval_seconds=interval)
+    asyncio.run(run_paper(settings, cycles=cycles))
+    return 0
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Inspect the paper-first Polymarket V3 foundation.")
+    parser = argparse.ArgumentParser(description="Operate the paper-first Polymarket V3 foundation.")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("validate-config", help="Validate SDK and safety settings without network access.")
     subparsers.add_parser("architecture", help="Show V3 component boundaries.")
@@ -96,6 +120,22 @@ def main() -> int:
         help="Replay a recorded maker quote/trade JSONL file without network access.",
     )
     replay_parser.add_argument("path", type=Path)
+    paper_parser = subparsers.add_parser(
+        "paper-run",
+        help="Run the public-data-only paper worker; zero cycles means continuous.",
+    )
+    paper_parser.add_argument(
+        "--cycles", type=int, default=0,
+        help="Number of scan cycles; default 0 runs continuously.",
+    )
+    paper_parser.add_argument(
+        "--interval", type=float,
+        help="Override seconds between scans.",
+    )
+    subparsers.add_parser(
+        "paper-status",
+        help="Show local paper-worker health without network or account access.",
+    )
     args = parser.parse_args()
     try:
         if args.command == "validate-config":
@@ -104,8 +144,12 @@ def main() -> int:
             return show_architecture()
         if args.command == "shadow-report":
             return shadow_report(args.path)
-        return replay_report(args.path)
-    except (OSError, ValueError) as exc:
+        if args.command == "replay-report":
+            return replay_report(args.path)
+        if args.command == "paper-status":
+            return paper_status_report()
+        return paper_run(cycles=args.cycles, interval=args.interval)
+    except (OSError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))
 
 

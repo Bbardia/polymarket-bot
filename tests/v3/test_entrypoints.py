@@ -53,6 +53,32 @@ def test_v3_cli_exposes_no_start_command():
     assert result.returncode == 0
     assert "start" not in result.stdout.lower()
     assert "validate-config" in result.stdout
+    assert "paper-run" in result.stdout
+    assert "paper-status" in result.stdout
+
+
+def test_paper_status_is_network_free_and_reports_no_authenticated_client(tmp_path):
+    env = os.environ.copy()
+    env.update({
+        "PAPER_TRADING": "true",
+        "ENABLE_V3_LIVE_TRADING": "false",
+        "ENABLE_V3_ACCOUNT_READS": "false",
+        "V3_PAPER_DATA_DIR": str(tmp_path),
+    })
+    result = subprocess.run(
+        [str(PYTHON), "run_v3.py", "paper-status"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["mode"] == "PAPER"
+    assert payload["running"] is False
+    assert payload["public_data_only"] is True
+    assert payload["authenticated_client_initialized"] is False
 
 
 def test_v3_cli_reports_shadow_and_replay_files_without_network(tmp_path):
