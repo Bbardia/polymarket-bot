@@ -33,13 +33,22 @@ logger.add(LOG_DIR / "loop_v2_{time}.log", rotation="1 day", retention="7 days",
 
 TRADES_FILE = Path(__file__).parent / "data" / "loop_v2_trades.jsonl"
 
+LEGACY_LIVE_DISABLED_MESSAGE = (
+    "Legacy live trading is permanently disabled: use the V3 foundation."
+)
+
+
+def _refuse_legacy_live() -> None:
+    raise RuntimeError(LEGACY_LIVE_DISABLED_MESSAGE)
+
 
 # ═══════════════════════════════════════════════════════════════
 #  Trade Execution
 # ═══════════════════════════════════════════════════════════════
 
 def _execute_trade(pm, token_id, price, cost, signal, portfolio=None) -> dict:
-    """Execute a trade via CLOB API with orderbook quality checks."""
+    """Retained for offline history only; live execution is hard-disabled."""
+    _refuse_legacy_live()
     from py_clob_client.clob_types import OrderArgs, OrderType
     from py_clob_client.order_builder.constants import BUY
     from src.orderbook_utils import check_orderbook_quality
@@ -155,6 +164,8 @@ def run_whale_weather_copy_strategy(
     3. Place maker order at best_ask - $0.01 when live trading is enabled
     4. Hold according to the configured exit rules
     """
+    if not dry_run:
+        _refuse_legacy_live()
     # Fetch new signals (90s cache inside — safe to call every cycle)
     new_signals = whale_tracker.fetch_copy_weather_signals(hours_back=6)
     if not new_signals:
@@ -337,6 +348,8 @@ def run_btc_sniper_strategy(
 
     Uses free Binance API (no rate limits) for real-time BTC price.
     """
+    if not dry_run:
+        _refuse_legacy_live()
     signals = btc_sniper.scan()
     if not signals:
         return []
@@ -493,6 +506,8 @@ def run_forecast_scanner_strategy(
     orderbook prices and trades only when the estimated edge clears the dynamic
     uncertainty threshold.
     """
+    if not dry_run:
+        _refuse_legacy_live()
     from src.polymarket_client import PolymarketClient
 
     # Need a PolymarketClient for Gamma API market discovery
@@ -692,6 +707,8 @@ def run_btc_straddle_strategy(
     BTC 5-minute straddle — buy both Up and Down at low prices.
     When BTC oscillates within the window, both legs fill and one pays $1.00.
     """
+    if not dry_run:
+        _refuse_legacy_live()
     markets = straddle.scan()
     if not markets:
         return []
@@ -822,6 +839,8 @@ def manage_weather_positions(
     WHALE_COPY: sell at 10x gain, otherwise hold to resolution.
     Legacy WEATHER: tiered take-profit + stop-loss.
     """
+    if not dry_run:
+        _refuse_legacy_live()
     actions = []
     weather_positions = [
         (pid, p) for pid, p in portfolio.positions.items()
@@ -986,7 +1005,7 @@ def _cleanup_phantom_positions(portfolio, pm=None, dry_run: bool = True):
     if dry_run:
         logger.debug("Phantom cleanup skipped in dry-run mode")
         return
-    Config.assert_live_trading_allowed()
+    _refuse_legacy_live()
     try:
         from py_clob_client.client import ClobClient
         from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
@@ -1188,7 +1207,7 @@ def _auto_redeem_resolved(portfolio, pm=None, dry_run: bool = True):
     if dry_run:
         logger.debug("Auto-redeem skipped in dry-run mode")
         return
-    Config.assert_live_trading_allowed()
+    _refuse_legacy_live()
     global _redeem_seen_ids, _redeem_last_full_log, _redeem_already_redeemed
     try:
         import requests
@@ -1361,7 +1380,7 @@ def _sync_untracked_positions(portfolio, dry_run: bool = True):
     if dry_run:
         logger.debug("Position sync skipped in dry-run mode")
         return
-    Config.assert_live_trading_allowed()
+    _refuse_legacy_live()
     try:
         from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
         from py_clob_client.client import ClobClient
@@ -1439,12 +1458,13 @@ def main():
     args = parser.parse_args()
 
     if args.live:
-        try:
-            Config.assert_live_trading_allowed()
-        except RuntimeError as e:
-            parser.error(str(e))
+        parser.error(
+            "Legacy live trading is permanently disabled: the April-era loop uses "
+            "retired CLOB V1/USDC.e assumptions. Use the V3 validation and paper "
+            "research tools; no V3 start command is available yet."
+        )
 
-    dry_run = not args.live
+    dry_run = True
     mode = "LIVE" if args.live else "DRY RUN"
 
     base_kelly = KellySizer(

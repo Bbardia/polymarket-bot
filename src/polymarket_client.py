@@ -282,30 +282,9 @@ class PolymarketClient:
         self._api_creds_set = False
 
     def init_trading_client(self):
-        """Initialize the authenticated CLOB client for trading."""
-        if not HAS_CLOB:
-            logger.error("py-clob-client not available")
-            return False
-        if not Config.PRIVATE_KEY:
-            logger.error("No private key configured")
-            return False
-
-        try:
-            self.clob_client = ClobClient(
-                Config.CLOB_HOST,
-                key=Config.PRIVATE_KEY,
-                chain_id=Config.CHAIN_ID,
-                signature_type=Config.SIGNATURE_TYPE,
-                funder=Config.FUNDER_ADDRESS,
-            )
-            creds = self.clob_client.create_or_derive_api_creds()
-            self.clob_client.set_api_creds(creds)
-            self._api_creds_set = True
-            logger.success("CLOB trading client initialized")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to init CLOB client: {e}")
-            return False
+        """Legacy live client is permanently disabled after the CLOB V2 cutover."""
+        logger.error("Legacy live trading disabled; use src.v3.api")
+        return False
 
     def test_connection(self) -> bool:
         """Test basic API connectivity."""
@@ -453,49 +432,15 @@ class PolymarketClient:
 
     def place_limit_order(self, token_id: str, price: float, size: float,
                           side: str = "BUY") -> dict:
-        """Place a limit order. Returns order response."""
-        if not self._api_creds_set:
-            logger.error("Trading client not initialized")
-            return {"error": "Not authenticated"}
-
-        side_const = BUY if side.upper() == "BUY" else SELL
-        order_args = OrderArgs(
-            token_id=token_id,
-            price=round(price, 2),
-            size=round(size, 1),
-            side=side_const,
-        )
-        try:
-            signed = self.clob_client.create_order(order_args)
-            result = self.clob_client.post_order(signed, OrderType.GTC)
-            logger.info(f"Order placed: {side} {size}@{price} → {result}")
-            return result
-        except Exception as e:
-            logger.error(f"Order failed: {e}")
-            return {"error": str(e)}
+        """Legacy order placement is permanently disabled."""
+        logger.error("Legacy live trading disabled; use the V3 executor after certification")
+        return {"error": "Legacy live trading disabled"}
 
     def place_market_order(self, token_id: str, amount: float,
                            side: str = "BUY") -> dict:
-        """Place a market order (Fill-or-Kill)."""
-        if not self._api_creds_set:
-            logger.error("Trading client not initialized")
-            return {"error": "Not authenticated"}
-
-        side_const = BUY if side.upper() == "BUY" else SELL
-        mo = MarketOrderArgs(
-            token_id=token_id,
-            amount=amount,
-            side=side_const,
-            order_type=OrderType.FOK,
-        )
-        try:
-            signed = self.clob_client.create_market_order(mo)
-            result = self.clob_client.post_order(signed, OrderType.FOK)
-            logger.info(f"Market order: {side} ${amount} → {result}")
-            return result
-        except Exception as e:
-            logger.error(f"Market order failed: {e}")
-            return {"error": str(e)}
+        """Legacy market-order placement is permanently disabled."""
+        logger.error("Legacy live trading disabled; use the V3 executor after certification")
+        return {"error": "Legacy live trading disabled"}
 
     def get_positions(self) -> list:
         """Get current open positions."""

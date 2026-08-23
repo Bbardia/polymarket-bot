@@ -1,37 +1,7 @@
-# Polymarket Trading Bot - Dependencies
-
-# Official Polymarket Python client (CLOB API)
-py-clob-client==0.34.6
-
-# HTTP requests for Gamma API
-requests>=2.31.0
-
-# WebSocket for real-time data
-websockets>=12.0
-
-# Async support
-aiohttp>=3.9.0
-
-# Environment variables
-python-dotenv>=1.0.0
-
-# Data analysis
-pandas>=2.1.0
-
-# Scheduling
-apscheduler>=3.10.0
-
-# Logging
-loguru>=0.7.0
-
-# CLI interface
-click>=8.1.0
-
-# For Binance/exchange price feeds (crypto strategy)
-ccxt>=4.2.0
-
-# For data storage
-sqlite3  # built-in
-
-# Web3 for Polygon interactions (if needed)
-# web3>=7.0.0
+# Runtime dependencies — pinned direct requirements
+polymarket-client==0.6.0
+requests==2.33.0
+python-dotenv==1.2.2
+loguru==0.7.3
+scipy==1.17.1
+websocket-client==1.9.0
