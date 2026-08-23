@@ -1,108 +1,165 @@
-# Polymarket Trading Bot
+# Polymarket Trading Bot — V3 Foundation
 
-Research-oriented Polymarket trading bot for weather and short-horizon prediction markets. The code is designed to run in **dry-run mode by default** and requires an explicit live-trading opt-in before it can place real orders.
+Paper-first Polymarket research and trading infrastructure for a small,
+risk-capped account. The April-era execution loop is retained only for offline
+research compatibility; its live path is permanently disabled.
 
-> **Warning**: This is experimental software, not financial advice. Prediction-market trading can lose money. Review the code, start in dry-run mode, and use your own risk limits.
+> Experimental software, not financial advice. No strategy is enabled for live
+> trading in this foundation.
 
-## Safety model
+## Current safety state
 
-Live trading is fail-closed:
+- Uses official `polymarket-client==0.6.0` models and pUSD assumptions.
+- No V3 service/worker command exists yet.
+- Authenticated account reads and live-capable client construction are lazy and
+  use separate gates; reconciliation can run while paper mode remains enabled.
+- User/market stream events can be normalized, durably replayed, deduplicated,
+  and supervised with bounded reconnect backoff; any disconnect or stream end
+  sets a sticky reconciliation blocker. No stream worker command exists and no
+  authenticated subscription starts automatically. Unknown order IDs are
+  observe-only reconciliation blockers and are never adopted as bot orders
+  unless explicitly supplied as managed local IDs.
+- Queue-aware maker replay and resolved-candidate shadow reports are offline,
+  file-based inspection tools only.
+- Legacy `run_full_loop.py --live` exits before constructing a client.
+- Repository watchdog is status-only and cannot launch the bot.
+- No Polymarket Hermes/Claude cron is required or configured.
+- Manual positions can be marked observe-only through the ignored local `.env`;
+  reconciliation never sells, cancels, merges, or redeems them.
 
-- `.env` is gitignored and must stay local.
-- `.env.template` contains placeholders only.
-- Running with `--live` is not enough by itself.
-- Real-money trading also requires `ENABLE_LIVE_TRADING=true` and `PAPER_TRADING=false` in `.env`.
-- Runtime state and logs are ignored: `data/`, `logs/`, `venv/`, `.pytest_cache/`, `.claude/`.
-
-## Project layout
+## V3 architecture
 
 ```text
-polymarket-bot/
-├── run_full_loop.py              # Main dry-run/live loop
-├── src/
-│   ├── config.py                 # Env loading and live-trading guardrails
-│   ├── polymarket_client.py      # Polymarket Gamma/CLOB integration
-│   ├── forecast_scanner.py       # Weather forecast-vs-price scanner
-│   ├── weather_forecast.py       # Open-Meteo ensemble forecasts
-│   ├── edge_math.py              # Probability shrinkage, uncertainty, Kelly helpers
-│   ├── kelly.py                  # Kelly sizing and adaptive risk controls
-│   ├── portfolio.py              # Local position/P&L tracking
-│   ├── orderbook_utils.py        # Orderbook, spread, slippage helpers
-│   ├── btc_sniper.py             # BTC short-horizon signal logic
-│   ├── btc_straddle.py           # BTC straddle experiments
-│   └── whale_tracker.py          # Public-wallet signal scanner
-├── scripts/
-│   ├── pm-status.sh              # Local status helper
-│   ├── watchdog.sh               # Opt-in local watchdog helper
-│   └── daily_review.sh           # Dry-run local review helper
-├── tests/                        # Unit tests for math/risk logic
-└── .env.template                 # Safe local configuration template
+src/v3/
+├── api.py              # Official unified SDK adapter; lazy secure client
+├── config.py           # Strict live gate and account limits
+├── execution.py        # Risk-gated post-only GTD submission primitive
+├── ledger.py           # Append-only SQLite event ledger
+├── market_context.py   # Live ticks, minimums, fees, state, resolution rules
+├── math.py             # Decimal fee, VWAP, uncertainty, Kelly, complete sets
+├── orders.py           # Fill-aware/idempotent order aggregate
+├── reconciliation.py   # Read-only local-vs-remote comparison
+├── risk.py             # Capital, reserve, event, loss, drawdown limits
+├── simulation.py       # Queue-aware maker replay and shadow metrics
+├── streaming.py        # Durable event normalization/replay/reconnect state
+├── weather.py          # Forecast batching/backoff/calibration metrics
+└── strategies/
+    ├── weather.py      # Paper-only weather evaluator
+    └── complete_set.py # Paper-only executable two-book evaluator
 ```
 
-## Quick start
+### Order lifecycle invariant
+
+An accepted response with `live`, `matched`, or `delayed` status is an order,
+not inventory. Position quantity and cost change only after a unique trade event
+reaches `CONFIRMED`. Duplicate events are idempotent.
+
+### Capital invariant
+
+```text
+capital_base = min(real_account_equity, configured_max_capital)
+deployable   = capital_base × (1 - reserve_fraction)
+```
+
+Every order is then capped by order notional, event exposure, total deployed
+capital, fresh-quote age, short GTD lifetime, daily loss, drawdown, open orders,
+and open positions.
+
+### Current fee math
+
+For `C` shares at price `p` in a category with fee coefficient `r`:
+
+```text
+fee = C × r × p × (1 - p)
+```
+
+Complete-set research walks both ask books, computes full executable VWAP, sums
+this nonlinear fee at every consumed depth level, and requires positive net profit
+after all-in entry cost. It never submits either leg.
+
+### Weather uncertainty
+
+V3 does not treat 143 correlated ensemble members as 143 independent samples.
+It uses the cluster design effect:
+
+```text
+n_eff = n / (1 + (n - 1) × rho)
+```
+
+The decision threshold is the maximum of the base edge, probability standard
+error, half-spread, lead-time penalty, and tail penalty. Kelly uses fee-adjusted
+all-in price and a fractional multiplier.
+
+## Setup
 
 ```bash
-git clone <repo-url> polymarket-bot
-cd polymarket-bot
-
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
-
+pip install -r requirements-dev.txt
 cp .env.template .env
-# Edit .env locally. Keep PAPER_TRADING=true while testing.
-
-# Run tests
-python -m pytest tests -q
-
-# Start in dry-run mode; this does not place orders.
-python run_full_loop.py --budget 25
+chmod 600 .env
 ```
 
-## Configuration
-
-Key local `.env` variables:
-
-```dotenv
-ENABLE_LIVE_TRADING=false
-PAPER_TRADING=true
-POLY_PRIVATE_KEY=replace_me_with_local_private_key
-POLY_FUNDER_ADDRESS=replace_me_with_local_funder_address
-POLY_SIGNATURE_TYPE=1
-MAX_CAPITAL=25
-MAX_POSITION_SIZE=2
-EDGE_THRESHOLD=0.15
-LOG_LEVEL=INFO
-```
-
-For live trading, set credentials locally and change both safety flags:
-
-```dotenv
-ENABLE_LIVE_TRADING=true
-PAPER_TRADING=false
-```
-
-Then run with `--live` only after reviewing risk limits:
+## Non-running inspection commands
 
 ```bash
-python run_full_loop.py --live --budget 25
+python run_v3.py validate-config
+python run_v3.py architecture
+python run_v3.py shadow-report <resolved-candidates.jsonl>
+python run_v3.py replay-report <maker-events.jsonl>
+scripts/pm-status.sh
 ```
 
-## Public-repo hygiene
+These commands do not initialize an authenticated client or call market/account
+APIs.
 
-Before pushing changes publicly, run:
+`shadow-report` expects one resolved candidate per line. Decimal values should
+be encoded as strings:
+
+```json
+{"candidate_id":"candidate-1","expected_probability":"0.70","entry_price":"0.60","outcome":1,"filled_size":"2","fees_paid":"0.01"}
+```
+
+`replay-report` consumes point-in-time events in file order. A conservative maker
+fill occurs only when opposite-side prints at the exact quote price first consume
+the modeled queue ahead. Each quote's `queue_ahead` must include all size ahead
+of it, including earlier simulated quotes at the same level:
+
+```json
+{"event_type":"quote","quote_id":"quote-1","token_id":"token-1","side":"BUY","price":"0.40","size":"5","queue_ahead":"3"}
+{"event_type":"trade","token_id":"token-1","side":"SELL","price":"0.40","size":"4"}
+{"event_type":"cancel","quote_id":"quote-1"}
+```
+
+Runtime JSONL files belong under ignored local state such as `data/`; do not
+commit account-derived events or candidate records.
+
+## Tests
 
 ```bash
-git status --short
-git ls-files | grep -E '(^\.env$|^\.env\.|^data/|^logs/|^venv/|^\.claude/|__pycache__|\.pyc$)' || true
-git grep -n -I -E '(PRIVATE_KEY|API_KEY|SECRET|PASSWORD|TOKEN|MNEMONIC|Bearer)' -- . ':!*.md' || true
 python -m pytest tests -q
+python -m py_compile src/v3/*.py src/v3/strategies/*.py run_v3.py
 ```
 
-Expected sensitive-file result: only `.env.template` may appear, and it must contain placeholders only.
+V3 tests cover fee curves, depth-aware VWAP, complete-set net edge, correlated
+forecast uncertainty, fee-adjusted Kelly, dynamic ticks, fill-only accounting,
+idempotency, capital limits, loss/drawdown breakers, SQLite persistence,
+external-position protection, unified-SDK gating, reconciliation mapping,
+forecast batching/backoff, stream replay/reconnect behavior, queue-aware maker
+fills, fee-aware shadow metrics, and non-running entrypoint safety.
 
-## Notes
+## Live certification still required
 
-- Public APIs used by the project include Polymarket Gamma/CLOB endpoints and Open-Meteo ensemble forecasts.
-- Builder API credentials are optional and should never be committed.
-- The repository intentionally excludes local trade history and logs, because those can contain private wallet/activity information.
+Before any live command is added, V3 still needs:
+
+1. connect the authenticated user-stream processor to a separately reviewed,
+   read-only worker and prove recovery against recorded SDK events;
+2. reconcile against a real read-only account snapshot;
+3. collect real point-in-time books/trades for the queue-aware replay model;
+4. accumulate at least 30 days of shadow data and 100 resolved independent
+   candidates;
+5. explicitly review canary limits and manual-position acknowledgements.
+
+No LLM or cron job belongs in the execution loop. A future Hermes job may produce
+a read-only daily research summary after reliable paper data exists; it must not
+place orders or restart workers.
