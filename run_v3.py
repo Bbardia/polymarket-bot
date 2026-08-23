@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -22,6 +23,36 @@ from src.v3.simulation import (
 )
 
 ROOT = Path(__file__).resolve().parent
+
+PAPER_ENV_NAMES = frozenset({
+    "PAPER_TRADING",
+    "ENABLE_V3_LIVE_TRADING",
+    "ENABLE_V3_ACCOUNT_READS",
+    "V3_MAX_CAPITAL",
+    "V3_RESERVE_FRACTION",
+})
+
+
+def load_paper_environment(path: Path) -> None:
+    """Load only non-secret paper settings; never export wallet credentials."""
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line.removeprefix("export ").lstrip()
+        key, separator, remainder = line.partition("=")
+        key = key.strip()
+        if not separator or not (key in PAPER_ENV_NAMES or key.startswith("V3_PAPER_")):
+            continue
+        if key in os.environ:
+            continue
+        value = remainder.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"\"", "'"}:
+            value = value[1:-1]
+        os.environ[key] = value
 
 
 def validate_config() -> int:
@@ -90,14 +121,14 @@ def replay_report(path: Path) -> int:
 
 
 def paper_status_report() -> int:
-    load_dotenv(ROOT / ".env", override=False)
+    load_paper_environment(ROOT / ".env")
     settings = PaperSettings.from_env(ROOT)
     print(json.dumps(paper_status(settings), sort_keys=True, indent=2))
     return 0
 
 
 def paper_run(*, cycles: int, interval: float | None) -> int:
-    load_dotenv(ROOT / ".env", override=False)
+    load_paper_environment(ROOT / ".env")
     settings = PaperSettings.from_env(ROOT)
     if interval is not None:
         settings = replace(settings, scan_interval_seconds=interval)
