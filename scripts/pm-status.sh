@@ -7,17 +7,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-if [ -f .env ]; then
-  set -a
-  # shellcheck disable=SC1091
-  source .env
-  set +a
-fi
-
 venv/bin/python run_v3.py validate-config
+venv/bin/python run_v3.py paper-status
 
 if pgrep -f "[r]un_full_loop.py" >/dev/null; then
   echo "Legacy process: DETECTED (manual investigation required)"
 else
-  echo "Bot process: DOWN (expected; V3 execution is not enabled)"
+  echo "Legacy process: DOWN"
 fi

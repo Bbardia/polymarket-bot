@@ -13,6 +13,8 @@ __all__ = [
     "market_context",
     "math",
     "orders",
+    "paper",
+    "paper_weather",
     "reconciliation",
     "risk",
     "simulation",
