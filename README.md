@@ -41,6 +41,7 @@ src/v3/
 ├── math.py             # Decimal fee, VWAP, uncertainty, Kelly, complete sets
 ├── orders.py           # Fill-aware/idempotent order aggregate
 ├── paper.py            # Public-only continuous paper worker and state
+├── paper_weather.py    # Open-Meteo ensemble + tiny directional paper lane
 ├── reconciliation.py   # Read-only local-vs-remote comparison
 ├── risk.py             # Capital, reserve, event, loss, drawdown limits
 ├── simulation.py       # Queue-aware maker replay and shadow metrics
@@ -82,16 +83,19 @@ after all-in entry cost. It never submits either leg.
 
 ### Weather uncertainty
 
-V3 does not treat 143 correlated ensemble members as 143 independent samples.
-It uses the cluster design effect:
+V3 first gives ECMWF, GFS, ICON, and GEM equal model-family weight so a model
+with more ensemble members cannot dominate the probability. It then avoids
+treating correlated members as independent by using the cluster design effect:
 
 ```text
 n_eff = n / (1 + (n - 1) × rho)
 ```
 
 The decision threshold is the maximum of the base edge, probability standard
-error, half-spread, lead-time penalty, and tail penalty. Kelly uses fee-adjusted
-all-in price and a fractional multiplier.
+error, half-spread, lead-time penalty, and tail penalty. Fractional Kelly is
+recorded as diagnostic telemetry; paper entries deliberately use the CLOB
+minimum executable size and the stricter `1 pUSD` all-in cap until calibration
+history is available.
 
 ## Setup
 
@@ -103,7 +107,7 @@ cp .env.template .env
 chmod 600 .env
 ```
 
-## Non-running inspection commands
+## Paper and inspection commands
 
 ```bash
 python run_v3.py validate-config
@@ -120,15 +124,30 @@ scripts/pm-status.sh
 `replay-report` are network-free. `paper-run` calls only public market and order
 book APIs; it never initializes an authenticated client or calls account APIs.
 
-The paper worker starts with the configured capital reserve applied, scans a
-bounded set of liquid binary markets, evaluates fee-adjusted complete sets using
-executable depth, and records only simulated positions. Runtime state is written
-under ignored `data/v3-paper/` by default:
+The paper worker starts with the configured capital reserve applied and uses two
+separately labeled strategies:
+
+- **Complete sets:** broadens discovery past the most-liquid negative-risk
+  markets, walks executable depth on YES+NO, and still requires positive return
+  after fees. It never accepts a mathematically locked-in loss merely to create
+  activity.
+- **Directional weather:** discovers exact daily-high temperature buckets from
+  the public Weather tag and compares executable prices with the keyless
+  Open-Meteo ECMWF/GFS/ICON/GEM ensemble. It requires the contract's resolution
+  URL to identify the same airport station used for forecast coordinates. The
+  paper-only lane permits
+  negative-risk events only as a single directional token, uses a 3% base edge
+  plus spread/uncertainty/lead-time guards, limits each simulated order to
+  `1 pUSD`, and allows at most one bucket per city/date and five concurrent
+  weather positions.
+
+Runtime state is written under ignored `data/v3-paper/` by default:
 
 ```text
 status.json          current health and safety posture
 state.json           paper cash, open positions, and aggregate counts
 scans.jsonl          every evaluated public market/book snapshot
+weather_scans.jsonl  forecast, uncertainty, price, and edge telemetry
 candidates.jsonl     positive strategy candidates and cap decisions
 paper_trades.jsonl   simulated entries only
 settlements.jsonl    public-resolution paper settlements
@@ -168,7 +187,8 @@ idempotency, capital limits, loss/drawdown breakers, SQLite persistence,
 external-position protection, unified-SDK gating, reconciliation mapping,
 forecast batching/backoff, stream replay/reconnect behavior, queue-aware maker
 fills, fee-aware shadow metrics, public-only paper-worker safety, durable paper
-state, and non-live entrypoint safety.
+state, broadened discovery, weather parsing/forecast caching, directional
+settlement/Brier metrics, and non-live entrypoint safety.
 
 ## Live certification still required
 

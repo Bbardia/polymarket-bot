@@ -14,6 +14,7 @@ __all__ = [
     "math",
     "orders",
     "paper",
+    "paper_weather",
     "reconciliation",
     "risk",
     "simulation",

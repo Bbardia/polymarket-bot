@@ -30,6 +30,8 @@ class WeatherMarketInput:
     resolution_source_verified: bool
     prior_strength: Decimal = Decimal("10")
     fractional_kelly: Decimal = Decimal("0.10")
+    base_edge: Decimal = Decimal("0.05")
+    uncertainty_z: Decimal = ONE
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,8 @@ def evaluate_weather_market(market: WeatherMarketInput) -> WeatherDecision:
         spread=spread,
         lead_days=market.lead_days,
         price=market.best_ask,
+        base_edge=market.base_edge,
+        uncertainty_z=market.uncertainty_z,
     )
     net_edge = probability - market.best_ask - fee_per_share
     if net_edge < minimum_edge:

@@ -17,6 +17,13 @@ import polymarket
 from polymarket import AsyncPublicClient
 
 from .market_context import MarketContext
+from .paper_weather import (
+    ForecastProvider,
+    OpenMeteoEnsemble,
+    WeatherEvaluation,
+    WeatherPaperPolicy,
+    evaluate_weather_universe,
+)
 from .strategies.complete_set import CompleteSetDecision, evaluate_complete_set
 
 ZERO = Decimal("0")
@@ -44,20 +51,26 @@ class PaperSettings:
     paper_trading: bool = True
     live_enabled: bool = False
     account_reads_enabled: bool = False
-    scan_interval_seconds: float = 60.0
-    market_limit: int = 10
+    scan_interval_seconds: float = 300.0
+    market_limit: int = 25
+    discovery_max_markets: int = 2_000
     min_liquidity: Decimal = Decimal("1000")
     min_net_return: Decimal = Decimal("0.005")
     max_capital: Decimal = Decimal("50")
     reserve_fraction: Decimal = Decimal("0.25")
     max_order_notional: Decimal = Decimal("5")
     max_open_positions: int = 10
+    weather_policy: WeatherPaperPolicy = field(
+        default_factory=lambda: WeatherPaperPolicy(enabled=False)
+    )
 
     def __post_init__(self) -> None:
         if self.scan_interval_seconds <= 0:
             raise ValueError("paper scan interval must be positive")
         if self.market_limit < 1 or self.market_limit > 200:
             raise ValueError("paper market limit must be in [1, 200]")
+        if not (self.market_limit <= self.discovery_max_markets <= 5_000):
+            raise ValueError("paper discovery limit must be between market limit and 5000")
         if self.min_liquidity < ZERO:
             raise ValueError("paper minimum liquidity cannot be negative")
         if self.min_net_return < ZERO:
@@ -78,14 +91,31 @@ class PaperSettings:
             paper_trading=_env_bool("PAPER_TRADING", True),
             live_enabled=_env_bool("ENABLE_V3_LIVE_TRADING", False),
             account_reads_enabled=_env_bool("ENABLE_V3_ACCOUNT_READS", False),
-            scan_interval_seconds=float(os.getenv("V3_PAPER_SCAN_INTERVAL_SECONDS", "60")),
-            market_limit=int(os.getenv("V3_PAPER_MARKET_LIMIT", "10")),
+            scan_interval_seconds=float(os.getenv("V3_PAPER_SCAN_INTERVAL_SECONDS", "300")),
+            market_limit=int(os.getenv("V3_PAPER_MARKET_LIMIT", "25")),
+            discovery_max_markets=int(os.getenv("V3_PAPER_DISCOVERY_MAX_MARKETS", "2000")),
             min_liquidity=_decimal_env("V3_PAPER_MIN_LIQUIDITY", "1000"),
             min_net_return=_decimal_env("V3_PAPER_MIN_NET_RETURN", "0.005"),
             max_capital=_decimal_env("V3_MAX_CAPITAL", "50"),
             reserve_fraction=_decimal_env("V3_RESERVE_FRACTION", "0.25"),
             max_order_notional=_decimal_env("V3_PAPER_MAX_ORDER_NOTIONAL", "5"),
             max_open_positions=int(os.getenv("V3_PAPER_MAX_OPEN_POSITIONS", "10")),
+            weather_policy=WeatherPaperPolicy(
+                enabled=_env_bool("V3_PAPER_WEATHER_ENABLED", True),
+                horizon_days=int(os.getenv("V3_PAPER_WEATHER_HORIZON_DAYS", "3")),
+                discovery_limit=int(os.getenv("V3_PAPER_WEATHER_DISCOVERY_LIMIT", "1500")),
+                market_limit=int(os.getenv("V3_PAPER_WEATHER_MARKET_LIMIT", "100")),
+                min_liquidity=_decimal_env("V3_PAPER_WEATHER_MIN_LIQUIDITY", "1000"),
+                min_price=_decimal_env("V3_PAPER_WEATHER_MIN_PRICE", "0.03"),
+                max_price=_decimal_env("V3_PAPER_WEATHER_MAX_PRICE", "0.20"),
+                max_order_notional=_decimal_env("V3_PAPER_WEATHER_MAX_ORDER_NOTIONAL", "1"),
+                max_open_positions=int(os.getenv("V3_PAPER_WEATHER_MAX_OPEN_POSITIONS", "5")),
+                base_edge=_decimal_env("V3_PAPER_WEATHER_BASE_EDGE", "0.03"),
+                intraclass_correlation=_decimal_env("V3_PAPER_WEATHER_ICC", "0.05"),
+                prior_strength=_decimal_env("V3_PAPER_WEATHER_PRIOR_STRENGTH", "10"),
+                fractional_kelly=_decimal_env("V3_PAPER_WEATHER_FRACTIONAL_KELLY", "0.05"),
+                uncertainty_z=_decimal_env("V3_PAPER_WEATHER_UNCERTAINTY_Z", "1"),
+            ),
         )
 
     @property
@@ -114,6 +144,9 @@ class PaperState:
     realized_pnl: Decimal = ZERO
     open_positions: dict[str, dict[str, Any]] = field(default_factory=dict)
     traded_conditions: set[str] = field(default_factory=set)
+    traded_strategy_keys: set[str] = field(default_factory=set)
+    weather_resolved: int = 0
+    weather_brier_sum: Decimal = ZERO
 
     @classmethod
     def new(cls, initial_cash: Decimal) -> "PaperState":
@@ -131,6 +164,12 @@ class PaperState:
             realized_pnl=Decimal(str(payload.get("realized_pnl", "0"))),
             open_positions={str(key): dict(value) for key, value in payload.get("open_positions", {}).items()},
             traded_conditions={str(value) for value in payload.get("traded_conditions", [])},
+            traded_strategy_keys={
+                str(value)
+                for value in payload.get("traded_strategy_keys", payload.get("traded_conditions", []))
+            },
+            weather_resolved=int(payload.get("weather_resolved", 0)),
+            weather_brier_sum=Decimal(str(payload.get("weather_brier_sum", "0"))),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -144,6 +183,9 @@ class PaperState:
             "realized_pnl": str(self.realized_pnl),
             "open_positions": self.open_positions,
             "traded_conditions": sorted(self.traded_conditions),
+            "traded_strategy_keys": sorted(self.traded_strategy_keys),
+            "weather_resolved": self.weather_resolved,
+            "weather_brier_sum": str(self.weather_brier_sum),
         }
 
 
@@ -153,6 +195,7 @@ class PaperStore:
         self.state_path = self.data_dir / "state.json"
         self.status_path = self.data_dir / "status.json"
         self.scans_path = self.data_dir / "scans.jsonl"
+        self.weather_scans_path = self.data_dir / "weather_scans.jsonl"
         self.candidates_path = self.data_dir / "candidates.jsonl"
         self.trades_path = self.data_dir / "paper_trades.jsonl"
         self.settlements_path = self.data_dir / "settlements.jsonl"
@@ -255,7 +298,9 @@ class CycleSummary:
     cycle: int
     markets_discovered: int
     markets_scanned: int
+    weather_markets_scanned: int
     candidates: int
+    weather_candidates: int
     paper_trades: int
     settlements: int
     errors: int
@@ -264,6 +309,8 @@ class CycleSummary:
 
 
 class PaperPublicClient(Protocol):
+    async def get_tag(self, *, slug: str) -> Any: ...
+
     def list_markets(self, **kwargs: Any) -> Any: ...
 
     async def get_order_books(self, *, token_ids: list[str]) -> tuple[Any, ...]: ...
@@ -278,6 +325,7 @@ class PaperWorker:
         client: PaperPublicClient,
         settings: PaperSettings,
         store: PaperStore,
+        forecast: ForecastProvider | None = None,
     ) -> None:
         errors = settings.safety_errors()
         if errors:
@@ -286,6 +334,9 @@ class PaperWorker:
         self.settings = settings
         self.store = store
         self.state = store.load_state(settings.initial_cash)
+        self.forecast = forecast
+        if self.forecast is None and settings.weather_policy.enabled:
+            self.forecast = OpenMeteoEnsemble()
 
     async def _discover_markets(self) -> tuple[Any, ...]:
         markets: list[Any] = []
@@ -295,7 +346,7 @@ class PaperWorker:
             liquidity_num_min=float(self.settings.min_liquidity),
             order="liquidityNum",
             ascending=False,
-            page_size=max(20, self.settings.market_limit),
+            page_size=100,
         )
         async for market in paginator.iter_items():
             examined += 1
@@ -317,7 +368,7 @@ class PaperWorker:
                 markets.append(market)
             if len(markets) >= self.settings.market_limit:
                 break
-            if examined >= self.settings.market_limit * 20:
+            if examined >= self.settings.discovery_max_markets:
                 break
         return tuple(markets)
 
@@ -433,7 +484,10 @@ class PaperWorker:
                 paper_executed = True
                 self.state.cash -= all_in_cost
                 self.state.traded_conditions.add(condition_id)
+                self.state.traded_strategy_keys.add(condition_id)
                 self.state.open_positions[condition_id] = {
+                    "strategy": "complete_set",
+                    "event_key": condition_id,
                     "opened_at": scanned_at,
                     "market_id": market_id,
                     "condition_id": condition_id,
@@ -465,6 +519,185 @@ class PaperWorker:
         row.update({"paper_executed": paper_executed, "paper_reason": paper_reason})
         return row, True, paper_executed
 
+    @staticmethod
+    def _weather_row(evaluation: WeatherEvaluation, scanned_at: str) -> dict[str, Any]:
+        decision = evaluation.decision
+        forecast = evaluation.forecast
+        return {
+            "scanned_at": scanned_at,
+            "strategy": evaluation.strategy,
+            "event_key": evaluation.event_key,
+            "market_id": evaluation.market_id,
+            "condition_id": evaluation.condition_id,
+            "question": evaluation.question,
+            "city": evaluation.city,
+            "target_date": evaluation.target_date,
+            "target_c": str(evaluation.target_c),
+            "side": evaluation.side,
+            "token_id": evaluation.token_id,
+            "best_bid": str(evaluation.bid),
+            "best_ask": str(evaluation.ask),
+            "shares": str(evaluation.shares),
+            "fee": str(evaluation.fee),
+            "all_in_cost": str(evaluation.all_in_cost),
+            "raw_probability": str(evaluation.raw_probability),
+            "calibrated_probability": str(decision.calibrated_probability),
+            "ensemble_mean_c": str(forecast.ensemble_mean_c),
+            "ensemble_std_c": str(forecast.ensemble_std_c),
+            "n_members": forecast.n_members,
+            "model_count": forecast.model_count,
+            "effective_sample_size": str(decision.effective_sample_size),
+            "lead_days": forecast.lead_days,
+            "net_edge": str(decision.net_edge),
+            "minimum_edge": str(decision.minimum_edge),
+            "kelly_fraction": str(decision.kelly_fraction),
+            "tradeable": evaluation.paper_tradeable,
+            "reason": evaluation.paper_reason,
+            "negative_risk_directional_only": True,
+            "public_data_only": True,
+        }
+
+    async def _scan_weather(
+        self,
+        *,
+        now: datetime,
+        scanned_at: str,
+    ) -> tuple[int, int, int, int]:
+        if not self.settings.weather_policy.enabled:
+            return 0, 0, 0, 0
+        if self.forecast is None:
+            raise RuntimeError("weather forecast provider is not initialized")
+        try:
+            result = await evaluate_weather_universe(
+                client=self.client,
+                forecast=self.forecast,
+                policy=self.settings.weather_policy,
+                now=now,
+            )
+        except Exception as exc:
+            self.store.append_record(self.store.weather_scans_path, {
+                "scanned_at": scanned_at,
+                "status": "weather_discovery_error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "public_data_only": True,
+            })
+            return 0, 0, 0, 1
+
+        for error in result.errors:
+            self.store.append_record(self.store.weather_scans_path, {
+                "scanned_at": scanned_at,
+                "status": "weather_market_error",
+                "error": error,
+                "public_data_only": True,
+            })
+
+        selected: dict[str, WeatherEvaluation] = {}
+        for evaluation in result.evaluations:
+            if not evaluation.paper_tradeable:
+                continue
+            previous = selected.get(evaluation.event_key)
+            if previous is None or evaluation.decision.net_edge > previous.decision.net_edge:
+                selected[evaluation.event_key] = evaluation
+
+        ranked_selected = sorted(
+            selected.values(),
+            key=lambda item: item.decision.net_edge,
+            reverse=True,
+        )
+        selected_rank = {
+            id(evaluation): rank
+            for rank, evaluation in enumerate(ranked_selected)
+        }
+        ordered_evaluations = sorted(
+            result.evaluations,
+            key=lambda item: (
+                0 if id(item) in selected_rank else 1,
+                selected_rank.get(id(item), 0),
+            ),
+        )
+        paper_trades = 0
+        weather_open = sum(
+            1
+            for position in self.state.open_positions.values()
+            if position.get("strategy") == "weather_directional"
+        )
+        for evaluation in ordered_evaluations:
+            row = self._weather_row(evaluation, scanned_at)
+            chosen = selected.get(evaluation.event_key) is evaluation
+            if not chosen:
+                if evaluation.paper_tradeable:
+                    row.update({
+                        "tradeable": False,
+                        "reason": "correlated weather event candidate not selected",
+                    })
+                self.store.append_record(self.store.weather_scans_path, row)
+                continue
+
+            candidate = dict(row)
+            candidate["candidate_id"] = (
+                f"weather:{evaluation.condition_id}:{evaluation.side}:{scanned_at}"
+            )
+            paper_reason = "weather paper candidate"
+            paper_executed = False
+            if evaluation.event_key in self.state.traded_strategy_keys:
+                paper_reason = "weather event already paper traded"
+            elif weather_open >= self.settings.weather_policy.max_open_positions:
+                paper_reason = "weather paper position cap reached"
+            elif len(self.state.open_positions) >= self.settings.max_open_positions:
+                paper_reason = "paper open-position cap reached"
+            elif evaluation.all_in_cost > self.state.cash:
+                paper_reason = "insufficient paper cash"
+            else:
+                paper_executed = True
+                paper_trades += 1
+                weather_open += 1
+                self.state.cash -= evaluation.all_in_cost
+                self.state.traded_conditions.add(evaluation.condition_id)
+                self.state.traded_strategy_keys.add(evaluation.event_key)
+                self.state.open_positions[evaluation.condition_id] = {
+                    "strategy": evaluation.strategy,
+                    "event_key": evaluation.event_key,
+                    "opened_at": scanned_at,
+                    "market_id": evaluation.market_id,
+                    "condition_id": evaluation.condition_id,
+                    "question": evaluation.question,
+                    "side": evaluation.side,
+                    "token_id": evaluation.token_id,
+                    "shares": str(evaluation.shares),
+                    "entry_price": str(evaluation.ask),
+                    "all_in_cost": str(evaluation.all_in_cost),
+                    "model_probability": str(evaluation.decision.calibrated_probability),
+                    "raw_probability": str(evaluation.raw_probability),
+                    "city": evaluation.city,
+                    "target_date": evaluation.target_date,
+                }
+                self.state.total_paper_trades += 1
+                self.store.save_state(self.state)
+                trade = dict(candidate)
+                trade.update({
+                    "paper_executed": True,
+                    "paper_reason": paper_reason,
+                    "paper_cash_after": str(self.state.cash),
+                })
+                self.store.append_record(self.store.trades_path, trade)
+            candidate.update({
+                "paper_executed": paper_executed,
+                "paper_reason": paper_reason,
+                "paper_cash_after": str(self.state.cash),
+            })
+            self.store.append_record(self.store.candidates_path, candidate)
+            row.update({
+                "paper_executed": paper_executed,
+                "paper_reason": paper_reason,
+            })
+            self.store.append_record(self.store.weather_scans_path, row)
+        return (
+            result.markets_evaluated,
+            len(selected),
+            paper_trades,
+            len(result.errors),
+        )
+
     async def _settle_positions(self, settled_at: str) -> tuple[int, int]:
         settled = 0
         errors = 0
@@ -485,7 +718,22 @@ class PaperWorker:
                     continue
                 shares = Decimal(str(position["shares"]))
                 all_in_cost = Decimal(str(position["all_in_cost"]))
-                payout = shares
+                strategy = str(position.get("strategy", "complete_set"))
+                brier: Decimal | None = None
+                outcome: int | None = None
+                if strategy == "weather_directional":
+                    side = str(position["side"])
+                    winning_price = Decimal(str(
+                        yes_price if side == "YES" else no_price
+                    ))
+                    outcome = int(winning_price == ONE)
+                    payout = shares if outcome else ZERO
+                    probability = Decimal(str(position["model_probability"]))
+                    brier = (probability - Decimal(outcome)) ** 2
+                    self.state.weather_resolved += 1
+                    self.state.weather_brier_sum += brier
+                else:
+                    payout = shares
                 pnl = payout - all_in_cost
                 self.state.cash += payout
                 self.state.realized_pnl += pnl
@@ -497,8 +745,11 @@ class PaperWorker:
                     "settled_at": settled_at,
                     "condition_id": condition_id,
                     "market_id": str(position["market_id"]),
+                    "strategy": strategy,
                     "payout": str(payout),
                     "realized_pnl": str(pnl),
+                    "directional_outcome": outcome,
+                    "brier_score": None if brier is None else str(brier),
                     "paper_cash_after": str(self.state.cash),
                     "public_data_only": True,
                 })
@@ -515,8 +766,9 @@ class PaperWorker:
                 })
         return settled, errors
 
-    async def run_cycle(self) -> CycleSummary:
-        scanned_at = _utc_now()
+    async def run_cycle(self, *, now: datetime | None = None) -> CycleSummary:
+        now = now or datetime.now(timezone.utc)
+        scanned_at = now.isoformat()
         errors = 0
         candidates = 0
         paper_trades = 0
@@ -554,6 +806,13 @@ class PaperWorker:
                     "public_data_only": True,
                 })
 
+        weather_scanned, weather_candidates, weather_trades, weather_errors = (
+            await self._scan_weather(now=now, scanned_at=scanned_at)
+        )
+        candidates += weather_candidates
+        paper_trades += weather_trades
+        errors += weather_errors
+
         self.state.cycles += 1
         self.state.total_candidates += candidates
         self.store.save_state(self.state)
@@ -561,7 +820,9 @@ class PaperWorker:
             cycle=self.state.cycles,
             markets_discovered=len(markets),
             markets_scanned=scanned,
+            weather_markets_scanned=weather_scanned,
             candidates=candidates,
+            weather_candidates=weather_candidates,
             paper_trades=paper_trades,
             settlements=settlements,
             errors=errors,
@@ -576,13 +837,18 @@ class PaperWorker:
             "authenticated_client_initialized": False,
             "account_reads_enabled": False,
             "live_trading_enabled": False,
+            "weather_directional_enabled": self.settings.weather_policy.enabled,
+            "weather_order_cap": str(self.settings.weather_policy.max_order_notional),
+            "weather_position_cap": self.settings.weather_policy.max_open_positions,
             "sdk_version": polymarket.__version__,
             "started_at": self.state.started_at,
             "last_scan_at": scanned_at,
             "cycle": summary.cycle,
             "markets_discovered": summary.markets_discovered,
             "markets_scanned": summary.markets_scanned,
+            "weather_markets_scanned": summary.weather_markets_scanned,
             "candidates_this_cycle": summary.candidates,
+            "weather_candidates_this_cycle": summary.weather_candidates,
             "paper_trades_this_cycle": summary.paper_trades,
             "settlements_this_cycle": summary.settlements,
             "errors_this_cycle": summary.errors,
@@ -591,6 +857,12 @@ class PaperWorker:
             "total_candidates": self.state.total_candidates,
             "total_paper_trades": self.state.total_paper_trades,
             "realized_pnl": str(self.state.realized_pnl),
+            "weather_resolved": self.state.weather_resolved,
+            "weather_brier_score": (
+                None
+                if self.state.weather_resolved == 0
+                else str(self.state.weather_brier_sum / Decimal(self.state.weather_resolved))
+            ),
             "data_dir": str(self.store.data_dir),
         })
         return summary
@@ -630,7 +902,9 @@ async def run_paper(
             print(json.dumps({
                 "cycle": summary.cycle,
                 "markets_scanned": summary.markets_scanned,
+                "weather_markets_scanned": summary.weather_markets_scanned,
                 "candidates": summary.candidates,
+                "weather_candidates": summary.weather_candidates,
                 "paper_trades": summary.paper_trades,
                 "errors": summary.errors,
                 "paper_cash": str(summary.cash),
@@ -673,6 +947,7 @@ def paper_status(settings: PaperSettings) -> dict[str, Any]:
             "authenticated_client_initialized": False,
             "account_reads_enabled": False,
             "live_trading_enabled": False,
+            "weather_directional_enabled": settings.weather_policy.enabled,
             "data_dir": str(store.data_dir),
             "state": "not_started",
         }

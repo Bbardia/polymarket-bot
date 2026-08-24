@@ -96,6 +96,7 @@ def test_paper_env_loader_does_not_export_credentials(tmp_path, monkeypatch):
         "POLY_PRIVATE_KEY", "POLY_BUILDER_SECRET",
     ):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "inherited_secret_must_be_removed")
 
     run_v3.load_paper_environment(dotenv)
 

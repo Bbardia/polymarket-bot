@@ -31,10 +31,20 @@ PAPER_ENV_NAMES = frozenset({
     "V3_MAX_CAPITAL",
     "V3_RESERVE_FRACTION",
 })
+PAPER_FORBIDDEN_ENV_NAMES = frozenset({
+    "POLY_PRIVATE_KEY",
+    "POLY_FUNDER_ADDRESS",
+    "POLY_SIGNER_ADDRESS",
+    "POLY_BUILDER_API_KEY",
+    "POLY_BUILDER_SECRET",
+    "POLY_BUILDER_PASSPHRASE",
+})
 
 
 def load_paper_environment(path: Path) -> None:
     """Load only non-secret paper settings; never export wallet credentials."""
+    for name in PAPER_FORBIDDEN_ENV_NAMES:
+        os.environ.pop(name, None)
     if not path.is_file():
         return
     for raw_line in path.read_text(encoding="utf-8").splitlines():
