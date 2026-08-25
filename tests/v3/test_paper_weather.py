@@ -11,10 +11,14 @@ from src.v3.paper_weather import (
     EnsembleForecast,
     ForecastUnavailableError,
     HighTemperatureContract,
+    MetNoLocationForecast,
     NOAAStationObservations,
+    NWSGridForecast,
     ObservationBoundResult,
     ObservationUnavailableError,
     OpenMeteoEnsemble,
+    ProbabilityCalibration,
+    ResilientForecastEnsemble,
     StationObservation,
     WeatherPaperPolicy,
     apply_observation_bounds,
@@ -1411,3 +1415,127 @@ def test_parser_supported_city_without_verified_station_is_not_discoverable():
     ))
     assert result.markets_discovered == 0
     assert result.evaluations == ()
+
+
+def test_probability_calibration_persists_and_shrinks_with_resolved_outcomes(tmp_path):
+    path = tmp_path / "weather_calibration.json"
+    calibration = ProbabilityCalibration(path, min_samples=2)
+    for _ in range(2):
+        calibration.record("met-no", "singapore", 1, D("0.20"), 1)
+    adjusted = calibration.calibrate("met-no", "singapore", 1, D("0.20"))
+    assert adjusted > D("0.20")
+    reloaded = ProbabilityCalibration(path, min_samples=2)
+    assert reloaded.samples() == 2
+    assert reloaded.calibrate("met-no", "singapore", 1, D("0.20")) == adjusted
+
+
+def test_met_no_forecast_parses_target_local_date_and_returns_source_metadata():
+    def fetch_json(url, *, params, headers, timeout):
+        assert url.endswith("/compact")
+        assert params["lat"] == 1.3644
+        assert headers["User-Agent"]
+        return {
+            "properties": {
+                "timeseries": [
+                    {
+                        "time": "2026-08-25T00:00:00Z",
+                        "data": {"instant": {"details": {"air_temperature": 30.0}}},
+                    },
+                    {
+                        "time": "2026-08-25T06:00:00Z",
+                        "data": {"instant": {"details": {"air_temperature": 33.0}}},
+                    },
+                    {
+                        "time": "2026-08-26T00:00:00Z",
+                        "data": {"instant": {"details": {"air_temperature": 99.0}}},
+                    },
+                ],
+            },
+        }
+
+    contract = parse_exact_high_contract(
+        "Will the highest temperature in Singapore be 33°C on August 25?",
+        end_date=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
+    )
+    assert contract is not None
+    result = asyncio.run(MetNoLocationForecast(fetch_json=fetch_json).forecast(contract))
+    assert result.source == "met-no"
+    assert result.provider_names == ("met-no",)
+    assert result.ensemble_mean_c == D("33.0")
+
+
+def test_nws_forecast_parses_fahrenheit_hourly_grid_data():
+    def fetch_json(url, *, params, headers, timeout):
+        if "/points/" in url:
+            return {"properties": {"forecastHourly": "https://api.weather.gov/hourly"}}
+        return {
+            "properties": {
+                "periods": [
+                    {"startTime": "2026-08-25T12:00:00-04:00", "temperature": 86, "temperatureUnit": "F"},
+                    {"startTime": "2026-08-25T16:00:00-04:00", "temperature": 91, "temperatureUnit": "F"},
+                ],
+            },
+        }
+
+    contract = parse_exact_high_contract(
+        "Will the highest temperature in Chicago be 33°C on August 25?",
+        end_date=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
+    )
+    assert contract is not None
+    result = asyncio.run(NWSGridForecast(fetch_json=fetch_json).forecast(contract))
+    assert result.source == "nws"
+    assert result.ensemble_mean_c == D("32.77777777777778")
+
+
+def test_resilient_ensemble_uses_remaining_sources_when_one_provider_is_down():
+    contract = parse_exact_high_contract(
+        "Will the highest temperature in Singapore be 32°C on August 25?",
+        end_date=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
+    )
+    assert contract is not None
+    healthy = EnsembleForecast(
+        raw_probability=D("0.70"),
+        ensemble_mean_c=D("32"),
+        ensemble_std_c=D("1"),
+        n_members=20,
+        lead_days=1,
+        model_count=1,
+        source="met-no",
+    )
+
+    class Provider:
+        def __init__(self, name, result=None):
+            self.name = name
+            self.result = result
+
+        async def forecast(self, contract, *, now=None):
+            if self.result is None:
+                raise ForecastUnavailableError(f"{self.name} down", provider_global=True)
+            return self.result
+
+    result = asyncio.run(ResilientForecastEnsemble([
+        Provider("open-meteo"),
+        Provider("met-no", healthy),
+        Provider("nws", healthy),
+    ]).forecast(contract))
+    assert result.provider_count == 2
+    assert set(result.provider_names) == {"met-no", "nws"}
+    assert result.provider_failures[0][0] == "open-meteo"
+    assert D("0") < result.raw_probability < D("1")
+
+
+def test_resilient_ensemble_reports_total_outage():
+    contract = parse_exact_high_contract(
+        "Will the highest temperature in Singapore be 32°C on August 25?",
+        end_date=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
+    )
+
+    class Down:
+        name = "down"
+
+        async def forecast(self, contract, *, now=None):
+            raise ForecastUnavailableError("down", provider_global=True)
+
+    assert contract is not None
+    with pytest.raises(ForecastUnavailableError, match="all forecast providers unavailable"):
+        asyncio.run(ResilientForecastEnsemble([Down()]).forecast(contract))
