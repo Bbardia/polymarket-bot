@@ -38,15 +38,17 @@ src/v3/
 ├── execution.py        # Risk-gated post-only GTD submission primitive
 ├── ledger.py           # Append-only SQLite event ledger
 ├── market_context.py   # Live ticks, minimums, fees, state, resolution rules
+├── maker_shadow.py     # Honest unsubmitted passive-quote diagnostics
 ├── math.py             # Decimal fee, VWAP, uncertainty, Kelly, complete sets
 ├── orders.py           # Fill-aware/idempotent order aggregate
 ├── paper.py            # Public-only continuous paper worker and state
-├── paper_weather.py    # Open-Meteo ensemble + tiny directional paper lane
+├── paper_weather.py    # Resolver-aware weather paper research
 ├── reconciliation.py   # Read-only local-vs-remote comparison
 ├── risk.py             # Capital, reserve, event, loss, drawdown limits
 ├── simulation.py       # Queue-aware maker replay and shadow metrics
 ├── streaming.py        # Durable event normalization/replay/reconnect state
 ├── weather.py          # Forecast batching/backoff/calibration metrics
+├── weather_surface.py  # Complete-partition indicative basket analysis
 └── strategies/
     ├── weather.py      # Paper-only weather evaluator
     └── complete_set.py # Paper-only executable two-book evaluator
@@ -94,8 +96,8 @@ n_eff = n / (1 + (n - 1) × rho)
 The decision threshold is the maximum of the base edge, probability standard
 error, half-spread, lead-time penalty, and tail penalty. Fractional Kelly is
 recorded as diagnostic telemetry; paper entries deliberately use the CLOB
-minimum executable size and the stricter `1 pUSD` all-in cap until calibration
-history is available.
+minimum executable size and a paper-only `5 pUSD` all-in cap. Live execution
+remains separately blocked and unchanged.
 
 ## Setup
 
@@ -131,26 +133,29 @@ separately labeled strategies:
   markets, walks executable depth on YES+NO, and still requires positive return
   after fees. It never accepts a mathematically locked-in loss merely to create
   activity.
-- **Directional weather:** discovers exact daily-high temperature buckets from
-  the public Weather tag and compares executable prices with the keyless
-  Open-Meteo ECMWF/GFS/ICON/GEM ensemble. It requires the contract's resolution
-  URL to identify the same airport station used for forecast coordinates. The
-  paper-only lane permits
-  negative-risk events only as a single directional token, uses a 3% base edge
-  plus spread/uncertainty/lead-time guards, limits each simulated order to
-  `1 pUSD`, and allows at most one bucket per city/date and five concurrent
-  weather positions.
+- **Directional weather:** discovers exact, range, and tail daily-high buckets
+  from the public Weather tag and compares executable prices with the keyless
+  Open-Meteo ECMWF/GFS/ICON/GEM ensemble. Resolution URLs must identify the
+  modeled airport station. Same-day paper entries always fail closed unless a
+  successful public NOAA observation exists for that exact station and local
+  date. The paper-only lane uses a 3% base edge plus
+  spread/uncertainty/lead-time guards, caps each simulated order at `5 pUSD`,
+  and allows at most one bucket per city/date and five concurrent weather
+  positions. Maker quotes remain explicitly unsubmitted. Mechanically complete
+  city/date baskets are labeled unverified cross-market hypotheses until common
+  event membership is proven; they are never candidates and never change state.
 
-Runtime state is written under ignored `data/v3-paper/` by default:
+Runtime state is written under the configured ignored paper-data directory:
 
 ```text
 status.json          current health and safety posture
-state.json           paper cash, open positions, and aggregate counts
+state.json           paper cash, positions, pending audit outbox, aggregate counts
 scans.jsonl          every evaluated public market/book snapshot
-weather_scans.jsonl  forecast, uncertainty, price, and edge telemetry
+weather_scans.jsonl  forecast, observation, uncertainty, price, and edge telemetry
+weather_events.jsonl partition, violation, maker-shadow, and hypothesis telemetry
 candidates.jsonl     positive strategy candidates and cap decisions
-paper_trades.jsonl   simulated entries only
-settlements.jsonl    public-resolution paper settlements
+paper_trades.jsonl   idempotent simulated-entry audit records
+settlements.jsonl    idempotent public-resolution settlement audit records
 ```
 
 `shadow-report` expects one resolved candidate per line. Decimal values should

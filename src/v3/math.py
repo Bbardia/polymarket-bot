@@ -146,6 +146,8 @@ def shrink_probability(
             raise ValueError("probabilities must be in [0, 1]")
     if effective_sample_size < ZERO or prior_strength < ZERO:
         raise ValueError("sample and prior strength cannot be negative")
+    if prior_strength == ZERO:
+        return model_probability
     denominator = effective_sample_size + prior_strength
     if denominator == ZERO:
         return model_probability

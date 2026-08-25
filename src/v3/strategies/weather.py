@@ -28,6 +28,7 @@ class WeatherMarketInput:
     fee_rate: Decimal
     lead_days: int
     resolution_source_verified: bool
+    executable_fee_per_share: Decimal | None = None
     prior_strength: Decimal = Decimal("10")
     fractional_kelly: Decimal = Decimal("0.10")
     base_edge: Decimal = Decimal("0.05")
@@ -61,6 +62,11 @@ def evaluate_weather_market(market: WeatherMarketInput) -> WeatherDecision:
         )
     if not (ZERO < market.best_bid <= market.best_ask < ONE):
         raise ValueError("invalid executable book")
+    if (
+        market.executable_fee_per_share is not None
+        and market.executable_fee_per_share < ZERO
+    ):
+        raise ValueError("executable fee per share cannot be negative")
 
     n_eff = correlated_effective_sample_size(
         market.n_members,
@@ -72,10 +78,14 @@ def evaluate_weather_market(market: WeatherMarketInput) -> WeatherDecision:
         effective_sample_size=n_eff,
         prior_strength=market.prior_strength,
     )
-    fee_per_share = taker_fee(
-        shares=ONE,
-        price=market.best_ask,
-        fee_rate=market.fee_rate,
+    fee_per_share = (
+        market.executable_fee_per_share
+        if market.executable_fee_per_share is not None
+        else taker_fee(
+            shares=ONE,
+            price=market.best_ask,
+            fee_rate=market.fee_rate,
+        )
     )
     spread = market.best_ask - market.best_bid
     minimum_edge = dynamic_minimum_edge(

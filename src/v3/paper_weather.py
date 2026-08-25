@@ -7,23 +7,28 @@ import math
 import re
 import statistics
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from decimal import Decimal
+from datetime import date, datetime, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from statistics import NormalDist
 from typing import Any, Protocol
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 
 from .market_context import MarketContext
+from .maker_shadow import MakerShadowQuote, propose_buy_quote
 from .math import BookLevel, execution_fee, execution_vwap
 from .strategies.weather import WeatherDecision, WeatherMarketInput, evaluate_weather_market
+from .weather_surface import EventSurface, SurfaceBucket, analyze_event_surface
 
 ZERO = Decimal("0")
 ONE = Decimal("1")
+HALF = Decimal("0.5")
 OPEN_METEO_ENSEMBLE = "https://ensemble-api.open-meteo.com/v1/ensemble"
+NOAA_METAR = "https://aviationweather.gov/api/data/metar"
 ENSEMBLE_MODELS = "ecmwf_ifs025,gfs_seamless,icon_seamless,gem_global"
 MODEL_KEY_MARKERS: Mapping[str, str] = {
     "ecmwf": "ecmwf_ifs025",
@@ -131,6 +136,53 @@ CITY_STATIONS: Mapping[str, str] = {
     "guangzhou": "ZGGG",
 }
 
+CITY_TIMEZONES: Mapping[str, str] = {
+    "new york": "America/New_York",
+    "nyc": "America/New_York",
+    "chicago": "America/Chicago",
+    "seattle": "America/Los_Angeles",
+    "atlanta": "America/New_York",
+    "dallas": "America/Chicago",
+    "miami": "America/New_York",
+    "los angeles": "America/Los_Angeles",
+    "austin": "America/Chicago",
+    "houston": "America/Chicago",
+    "denver": "America/Denver",
+    "san francisco": "America/Los_Angeles",
+    "tokyo": "Asia/Tokyo",
+    "seoul": "Asia/Seoul",
+    "shanghai": "Asia/Shanghai",
+    "toronto": "America/Toronto",
+    "singapore": "Asia/Singapore",
+    "taipei": "Asia/Taipei",
+    "buenos aires": "America/Argentina/Buenos_Aires",
+    "sao paulo": "America/Sao_Paulo",
+    "ankara": "Europe/Istanbul",
+    "munich": "Europe/Berlin",
+    "tel aviv": "Asia/Jerusalem",
+    "milan": "Europe/Rome",
+    "madrid": "Europe/Madrid",
+    "warsaw": "Europe/Warsaw",
+    "wuhan": "Asia/Shanghai",
+    "lucknow": "Asia/Kolkata",
+    "mexico city": "America/Mexico_City",
+    "amsterdam": "Europe/Amsterdam",
+    "helsinki": "Europe/Helsinki",
+    "kuala lumpur": "Asia/Kuala_Lumpur",
+    "jakarta": "Asia/Jakarta",
+    "berlin": "Europe/Berlin",
+    "sydney": "Australia/Sydney",
+    "mumbai": "Asia/Kolkata",
+    "stockholm": "Europe/Stockholm",
+    "cape town": "Africa/Johannesburg",
+    "jeddah": "Asia/Riyadh",
+    "lagos": "Africa/Lagos",
+    "karachi": "Asia/Karachi",
+    "busan": "Asia/Seoul",
+    "qingdao": "Asia/Shanghai",
+    "guangzhou": "Asia/Shanghai",
+}
+
 # Keep known station/model mismatches out until resolved paper history proves calibration.
 AVOID_CITIES = frozenset({
     "beijing",
@@ -157,25 +209,145 @@ _MONTHS = {
     "november": 11,
     "december": 12,
 }
-_EXACT_HIGH_RE = re.compile(
-    r"^Will the highest temperature in (?P<city>.+?) be "
-    r"(?P<temperature>-?\d+(?:\.\d+)?)°(?P<unit>[CF]) on "
+_HIGH_QUESTION_RE = re.compile(
+    r"^Will the highest temperature in (?P<city>.+?) be (?P<outcome>.+?) on "
     r"(?P<month>[A-Za-z]+) (?P<day>\d{1,2})\?$",
+    re.IGNORECASE,
+)
+_EXACT_OUTCOME_RE = re.compile(
+    r"^(?P<temperature>-?\d+)°(?P<unit>[CF])$",
+    re.IGNORECASE,
+)
+_RANGE_OUTCOME_RE = re.compile(
+    r"^between (?P<lower>-?\d+)\s*-\s*(?P<upper>-?\d+)°(?P<unit>[CF])$",
+    re.IGNORECASE,
+)
+_TAIL_OUTCOME_RE = re.compile(
+    r"^(?P<temperature>-?\d+)°(?P<unit>[CF]) or (?P<tail>higher|below|lower)$",
     re.IGNORECASE,
 )
 
 
+def _display_to_c(value: Decimal, unit: str) -> Decimal:
+    if unit == "C":
+        return value
+    return (value - Decimal("32")) * Decimal("5") / Decimal("9")
+
+
 @dataclass(frozen=True)
-class ExactHighContract:
+class HighTemperatureContract:
+    """A whole-degree daily-high outcome in its display and model units."""
+
     city: str
     target_date: str
-    target_c: Decimal
     unit: str
-    display_temperature: Decimal
+    display_lower: Decimal | None
+    display_upper: Decimal | None
+    probability_lower_c: Decimal | None
+    probability_upper_c: Decimal | None
+
+    def __post_init__(self) -> None:
+        if self.unit not in {"C", "F"}:
+            raise ValueError("weather contract unit must be C or F")
+        if self.display_lower is None and self.display_upper is None:
+            raise ValueError("weather contract must have at least one display bound")
+        for bound in (self.display_lower, self.display_upper):
+            if bound is not None and (
+                not bound.is_finite() or bound != bound.to_integral_value()
+            ):
+                raise ValueError("weather contract display bounds must be finite whole degrees")
+        if (
+            self.display_lower is not None
+            and self.display_upper is not None
+            and self.display_lower > self.display_upper
+        ):
+            raise ValueError("weather contract display bounds are inverted")
+        expected_lower = (
+            None
+            if self.display_lower is None
+            else _display_to_c(self.display_lower - HALF, self.unit)
+        )
+        expected_upper = (
+            None
+            if self.display_upper is None
+            else _display_to_c(self.display_upper + HALF, self.unit)
+        )
+        for bound in (self.probability_lower_c, self.probability_upper_c):
+            if bound is not None and not bound.is_finite():
+                raise ValueError("weather probability bounds must be finite")
+        if (
+            self.probability_lower_c != expected_lower
+            or self.probability_upper_c != expected_upper
+        ):
+            raise ValueError("weather probability bounds must match display bounds and unit")
+        if (
+            self.probability_lower_c is not None
+            and self.probability_upper_c is not None
+            and self.probability_lower_c >= self.probability_upper_c
+        ):
+            raise ValueError("weather probability bounds must be ordered")
 
     @property
     def event_key(self) -> str:
         return f"weather:{self.city}:{self.target_date}"
+
+    @property
+    def is_exact(self) -> bool:
+        return self.display_lower is not None and self.display_lower == self.display_upper
+
+    @property
+    def contract_kind(self) -> str:
+        if self.is_exact:
+            return "exact"
+        if self.display_lower is None:
+            return "lower_tail"
+        if self.display_upper is None:
+            return "upper_tail"
+        return "range"
+
+    @property
+    def display_temperature(self) -> Decimal:
+        """Compatibility accessor for contracts returned by the exact parser."""
+        if not self.is_exact:
+            raise AttributeError("non-exact weather contract has no display_temperature")
+        assert self.display_lower is not None
+        return self.display_lower
+
+    @property
+    def target_c(self) -> Decimal:
+        """Compatibility accessor for contracts returned by the exact parser."""
+        return _display_to_c(self.display_temperature, self.unit)
+
+
+# Keep the public type name while using one generic frozen representation.
+ExactHighContract = HighTemperatureContract
+
+
+@dataclass(frozen=True)
+class StationObservation:
+    station_id: str
+    observed_at: datetime
+    temperature_c: Decimal
+    display_temperature: Decimal
+
+
+@dataclass(frozen=True)
+class ObservationBoundResult:
+    probability: Decimal
+    same_day_observation_available: bool
+    current_high_display: Decimal | None
+
+
+class ObservationUnavailableError(RuntimeError):
+    """A cached NOAA adapter failure is still inside its request backoff."""
+
+
+class ForecastUnavailableError(RuntimeError):
+    """Forecast data is unavailable without implying an empty candidate set."""
+
+    def __init__(self, message: str, *, provider_global: bool = False) -> None:
+        super().__init__(message)
+        self.provider_global = provider_global
 
 
 @dataclass(frozen=True)
@@ -186,6 +358,7 @@ class EnsembleForecast:
     n_members: int
     lead_days: int
     model_count: int = 4
+    distribution_probability: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -195,15 +368,16 @@ class WeatherPaperPolicy:
     discovery_limit: int = 1_500
     market_limit: int = 100
     min_liquidity: Decimal = Decimal("1000")
-    min_price: Decimal = Decimal("0.03")
-    max_price: Decimal = Decimal("0.20")
-    max_order_notional: Decimal = ONE
+    min_price: Decimal = Decimal("0.02")
+    max_price: Decimal = Decimal("0.98")
+    max_order_notional: Decimal = Decimal("5")
     max_open_positions: int = 5
     base_edge: Decimal = Decimal("0.03")
     intraclass_correlation: Decimal = Decimal("0.05")
     prior_strength: Decimal = Decimal("10")
     fractional_kelly: Decimal = Decimal("0.05")
     uncertainty_z: Decimal = ONE
+    observations_enabled: bool = False
 
     def __post_init__(self) -> None:
         if self.horizon_days < 1 or self.horizon_days > 14:
@@ -239,7 +413,11 @@ class WeatherEvaluation:
     token_id: str
     city: str
     target_date: str
-    target_c: Decimal
+    target_c: Decimal | None
+    unit: str
+    display_lower: Decimal | None
+    display_upper: Decimal | None
+    contract_kind: str
     bid: Decimal
     ask: Decimal
     shares: Decimal
@@ -250,6 +428,40 @@ class WeatherEvaluation:
     decision: WeatherDecision
     paper_tradeable: bool
     paper_reason: str
+    same_day_contract: bool = False
+    same_day_observation_available: bool = False
+    current_high_display: Decimal | None = None
+    observation_error: str | None = None
+    same_day_observation_status: str = "not_applicable"
+    maker_shadow: MakerShadowQuote | None = None
+
+
+@dataclass(frozen=True)
+class WeatherEventContract:
+    market_id: str
+    condition_id: str
+    question: str
+    yes_token_id: str
+    contract_kind: str
+    display_lower: Decimal | None
+    display_upper: Decimal | None
+    model_probability: Decimal | None
+    maker_shadow: MakerShadowQuote | None
+
+
+@dataclass(frozen=True)
+class WeatherEventEvaluation:
+    event_key: str
+    unit: str
+    contracts: tuple[WeatherEventContract, ...]
+    surface: EventSurface
+    negative_risk_verified: bool
+    resolution_station_verified: bool
+    unit_verified: bool = True
+    parsed_event_membership_verified: bool = True
+    event_membership_verified: bool = False
+    public_data_only: bool = True
+    execution_status: str = "not_executed"
 
 
 @dataclass(frozen=True)
@@ -258,6 +470,14 @@ class WeatherUniverseResult:
     markets_evaluated: int
     evaluations: tuple[WeatherEvaluation, ...]
     errors: tuple[str, ...] = field(default_factory=tuple)
+    events: tuple[WeatherEventEvaluation, ...] = field(default_factory=tuple)
+    observations_available: int = 0
+    observation_errors: int = 0
+    markets_forecast_unavailable: int = 0
+    markets_modeled: int = 0
+    markets_side_evaluable: int = 0
+    forecast_status: str = "not_requested"
+    forecast_errors: tuple[str, ...] = field(default_factory=tuple)
 
 
 class WeatherPublicClient(Protocol):
@@ -271,29 +491,26 @@ class WeatherPublicClient(Protocol):
 class ForecastProvider(Protocol):
     async def forecast(
         self,
-        contract: ExactHighContract,
+        contract: HighTemperatureContract,
         *,
         now: datetime | None = None,
     ) -> EnsembleForecast | None: ...
 
 
+class ObservationProvider(Protocol):
+    async def adjust_probability(
+        self,
+        contract: HighTemperatureContract,
+        base_probability: Decimal,
+        *,
+        station_id: str,
+    ) -> ObservationBoundResult: ...
+
+
 JsonFetcher = Callable[..., Mapping[str, Any]]
 
 
-def parse_exact_high_contract(
-    question: str | None,
-    *,
-    end_date: datetime | None,
-) -> ExactHighContract | None:
-    if not question or end_date is None:
-        return None
-    match = _EXACT_HIGH_RE.fullmatch(question.strip())
-    if match is None:
-        return None
-    city = match.group("city").strip().lower()
-    city = CITY_ALIASES.get(city, city)
-    if city in AVOID_CITIES or city not in CITY_COORDS:
-        return None
+def _contract_target_date(match: re.Match[str], end_date: datetime) -> date | None:
     month = _MONTHS.get(match.group("month").lower())
     if month is None:
         return None
@@ -301,7 +518,7 @@ def parse_exact_high_contract(
     candidates = []
     for year in (end_date.year - 1, end_date.year, end_date.year + 1):
         try:
-            candidates.append(datetime(year, month, day, tzinfo=timezone.utc).date())
+            candidates.append(date(year, month, day))
         except ValueError:
             continue
     if not candidates:
@@ -309,16 +526,88 @@ def parse_exact_high_contract(
     target = min(candidates, key=lambda value: abs((value - end_date.date()).days))
     if abs((target - end_date.date()).days) > 2:
         return None
-    display = Decimal(match.group("temperature"))
-    unit = match.group("unit").upper()
-    target_c = display if unit == "C" else (display - Decimal("32")) * Decimal("5") / Decimal("9")
-    return ExactHighContract(
+    return target
+
+
+def parse_high_temperature_contract(
+    question: str | None,
+    *,
+    end_date: datetime | None,
+) -> HighTemperatureContract | None:
+    """Parse modeled whole-degree daily-high exact, range, and tail outcomes."""
+    if not question or end_date is None:
+        return None
+    match = _HIGH_QUESTION_RE.fullmatch(question.strip())
+    if match is None:
+        return None
+    raw_city = match.group("city").strip().lower()
+    city = CITY_ALIASES.get(raw_city, raw_city)
+    if city in AVOID_CITIES or city not in CITY_COORDS:
+        return None
+    target = _contract_target_date(match, end_date)
+    if target is None:
+        return None
+
+    outcome = match.group("outcome").strip()
+    exact = _EXACT_OUTCOME_RE.fullmatch(outcome)
+    bounded = _RANGE_OUTCOME_RE.fullmatch(outcome)
+    tail = _TAIL_OUTCOME_RE.fullmatch(outcome)
+    unit: str
+    display_lower: Decimal | None
+    display_upper: Decimal | None
+    if exact is not None:
+        unit = exact.group("unit").upper()
+        display_lower = display_upper = Decimal(exact.group("temperature"))
+    elif bounded is not None:
+        unit = bounded.group("unit").upper()
+        display_lower = Decimal(bounded.group("lower"))
+        display_upper = Decimal(bounded.group("upper"))
+        if display_lower >= display_upper:
+            return None
+    elif tail is not None:
+        unit = tail.group("unit").upper()
+        threshold = Decimal(tail.group("temperature"))
+        if tail.group("tail").lower() == "higher":
+            display_lower, display_upper = threshold, None
+        else:
+            display_lower, display_upper = None, threshold
+    else:
+        return None
+
+    probability_lower_c = (
+        _display_to_c(display_lower - HALF, unit)
+        if display_lower is not None
+        else None
+    )
+    probability_upper_c = (
+        _display_to_c(display_upper + HALF, unit)
+        if display_upper is not None
+        else None
+    )
+    return HighTemperatureContract(
         city=city,
         target_date=target.isoformat(),
-        target_c=target_c,
         unit=unit,
-        display_temperature=display,
+        display_lower=display_lower,
+        display_upper=display_upper,
+        probability_lower_c=probability_lower_c,
+        probability_upper_c=probability_upper_c,
     )
+
+
+def parse_exact_high_contract(
+    question: str | None,
+    *,
+    end_date: datetime | None,
+) -> ExactHighContract | None:
+    """Compatibility wrapper that intentionally accepts exact outcomes only."""
+    contract = parse_high_temperature_contract(question, end_date=end_date)
+    if contract is None or not contract.is_exact:
+        return None
+    match = _HIGH_QUESTION_RE.fullmatch((question or "").strip())
+    if match is None or _EXACT_OUTCOME_RE.fullmatch(match.group("outcome").strip()) is None:
+        return None
+    return contract
 
 
 def _default_fetch_json(url: str, *, params: Mapping[str, Any], timeout: float) -> Mapping[str, Any]:
@@ -330,15 +619,257 @@ def _default_fetch_json(url: str, *, params: Mapping[str, Any], timeout: float) 
     return payload
 
 
-def _resolution_station_matches(contract: ExactHighContract, source: str | None) -> bool:
+ObservationJsonFetcher = Callable[..., Any]
+
+
+def _default_noaa_fetch_json(
+    url: str,
+    *,
+    params: Mapping[str, Any],
+    headers: Mapping[str, str],
+    timeout: float,
+) -> Any:
+    response = requests.get(url, params=params, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def _parse_report_time(raw_value: Any) -> datetime:
+    if not isinstance(raw_value, str):
+        raise ValueError("NOAA METAR reportTime must be an ISO timestamp")
+    try:
+        observed_at = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("NOAA METAR reportTime must be an ISO timestamp") from exc
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise ValueError("NOAA METAR reportTime must include a timezone")
+    return observed_at
+
+
+def _round_display_temperature(temperature_c: Decimal, unit: str) -> Decimal:
+    display = (
+        temperature_c
+        if unit == "C"
+        else temperature_c * Decimal("9") / Decimal("5") + Decimal("32")
+    )
+    return display.quantize(ONE, rounding=ROUND_HALF_UP)
+
+
+def apply_observation_bounds(
+    contract: HighTemperatureContract,
+    base_probability: Decimal,
+    observations: Sequence[StationObservation] | None,
+) -> ObservationBoundResult:
+    """Apply only resolver-certain implications of an observed running high."""
+    if not ZERO <= base_probability <= ONE:
+        raise ValueError("base weather probability must be in [0, 1]")
+    if not observations:
+        return ObservationBoundResult(base_probability, False, None)
+
+    current_high = max(item.display_temperature for item in observations)
+    if contract.display_upper is not None and current_high > contract.display_upper:
+        probability = ZERO
+    elif (
+        contract.display_upper is None
+        and contract.display_lower is not None
+        and current_high >= contract.display_lower
+    ):
+        probability = ONE
+    else:
+        probability = base_probability
+    return ObservationBoundResult(probability, True, current_high)
+
+
+class NOAAStationObservations:
+    """Cached public METAR readings for a resolver-verified station.
+
+    ``observations`` returns a (possibly empty) validated tuple on a successful
+    NOAA response and raises on adapter/request failure. During failure backoff it
+    raises ``ObservationUnavailableError`` rather than returning an ambiguous
+    ``None``. Concurrent callers for the same station/date/unit share one request.
+    """
+
+    def __init__(
+        self,
+        *,
+        fetch_json: ObservationJsonFetcher = _default_noaa_fetch_json,
+        hours: int = 24,
+        user_agent: str = "polymarket-bot-weather-research/4.0",
+        cache_seconds: float = 300,
+        timeout_seconds: float = 20,
+        failure_backoff_seconds: float = 300,
+    ) -> None:
+        if not 1 <= hours <= 24:
+            raise ValueError("NOAA METAR hours must be in [1, 24]")
+        if not user_agent.strip():
+            raise ValueError("NOAA METAR user agent cannot be empty")
+        if cache_seconds <= 0 or timeout_seconds <= 0 or failure_backoff_seconds <= 0:
+            raise ValueError("invalid NOAA METAR client settings")
+        self._fetch_json = fetch_json
+        self._hours = hours
+        self._user_agent = user_agent
+        self._cache_seconds = cache_seconds
+        self._timeout_seconds = timeout_seconds
+        self._failure_backoff_seconds = failure_backoff_seconds
+        self._cache: dict[
+            tuple[str, str, str],
+            tuple[float, tuple[StationObservation, ...]],
+        ] = {}
+        self._failure_until: dict[tuple[str, str, str], float] = {}
+        self._failure_messages: dict[tuple[str, str, str], str] = {}
+        self._inflight: dict[
+            tuple[str, str, str],
+            asyncio.Task[tuple[StationObservation, ...]],
+        ] = {}
+
+    def _prune_expired(self, monotonic_now: float) -> None:
+        for key, (expires_at, _observations) in tuple(self._cache.items()):
+            if expires_at <= monotonic_now:
+                self._cache.pop(key, None)
+        for key, expires_at in tuple(self._failure_until.items()):
+            if expires_at <= monotonic_now:
+                self._failure_until.pop(key, None)
+                self._failure_messages.pop(key, None)
+
+    async def _request_observations(
+        self,
+        contract: HighTemperatureContract,
+        *,
+        station_id: str,
+        timezone_name: str,
+        cache_key: tuple[str, str, str],
+    ) -> tuple[StationObservation, ...]:
+        try:
+            payload = await asyncio.to_thread(
+                self._fetch_json,
+                NOAA_METAR,
+                params={"ids": station_id, "format": "json", "hours": self._hours},
+                headers={"User-Agent": self._user_agent},
+                timeout=self._timeout_seconds,
+            )
+            if not isinstance(payload, list):
+                raise ValueError("NOAA METAR response must be a JSON list")
+            target_date = date.fromisoformat(contract.target_date)
+            local_timezone = ZoneInfo(timezone_name)
+            parsed: list[StationObservation] = []
+            for raw in payload:
+                if not isinstance(raw, dict):
+                    raise ValueError("NOAA METAR observation must be an object")
+                raw_station = raw.get("icaoId")
+                if not isinstance(raw_station, str) or raw_station.upper() != station_id:
+                    raise ValueError("NOAA METAR observation station does not match request")
+                observed_at = _parse_report_time(raw.get("reportTime"))
+                raw_temperature = raw.get("temp")
+                if (
+                    isinstance(raw_temperature, bool)
+                    or not isinstance(raw_temperature, (int, float, Decimal))
+                ):
+                    raise ValueError("NOAA METAR temp must be numeric Celsius")
+                try:
+                    temperature_c = Decimal(str(raw_temperature))
+                except Exception as exc:
+                    raise ValueError("NOAA METAR temp must be numeric Celsius") from exc
+                if not temperature_c.is_finite():
+                    raise ValueError("NOAA METAR temp must be finite Celsius")
+                if observed_at.astimezone(local_timezone).date() != target_date:
+                    continue
+                parsed.append(StationObservation(
+                    station_id=station_id,
+                    observed_at=observed_at,
+                    temperature_c=temperature_c,
+                    display_temperature=_round_display_temperature(temperature_c, contract.unit),
+                ))
+        except Exception as exc:
+            self._failure_until[cache_key] = (
+                time.monotonic() + self._failure_backoff_seconds
+            )
+            self._failure_messages[cache_key] = f"{type(exc).__name__}: {exc}"
+            raise
+
+        observations = tuple(sorted(parsed, key=lambda item: item.observed_at))
+        self._failure_until.pop(cache_key, None)
+        self._failure_messages.pop(cache_key, None)
+        self._cache[cache_key] = (
+            time.monotonic() + self._cache_seconds,
+            observations,
+        )
+        return observations
+
+    async def observations(
+        self,
+        contract: HighTemperatureContract,
+        *,
+        station_id: str,
+    ) -> tuple[StationObservation, ...]:
+        expected_station = CITY_STATIONS.get(contract.city)
+        timezone_name = CITY_TIMEZONES.get(contract.city)
+        verified_station = station_id.strip().upper()
+        if (
+            expected_station is None
+            or timezone_name is None
+            or verified_station != expected_station
+        ):
+            raise ValueError("NOAA observations require the resolver-verified station identity")
+
+        cache_key = (verified_station, contract.target_date, contract.unit)
+        monotonic_now = time.monotonic()
+        self._prune_expired(monotonic_now)
+        if monotonic_now < self._failure_until.get(cache_key, 0):
+            detail = self._failure_messages.get(cache_key, "prior request failed")
+            raise ObservationUnavailableError(
+                f"NOAA observation request backoff active: {detail}"
+            )
+        cached = self._cache.get(cache_key)
+        if cached is not None and monotonic_now < cached[0]:
+            return cached[1]
+
+        task = self._inflight.get(cache_key)
+        if task is None:
+            task = asyncio.create_task(self._request_observations(
+                contract,
+                station_id=verified_station,
+                timezone_name=timezone_name,
+                cache_key=cache_key,
+            ))
+            self._inflight[cache_key] = task
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done() and self._inflight.get(cache_key) is task:
+                self._inflight.pop(cache_key, None)
+
+    async def adjust_probability(
+        self,
+        contract: HighTemperatureContract,
+        base_probability: Decimal,
+        *,
+        station_id: str,
+    ) -> ObservationBoundResult:
+        observations = await self.observations(contract, station_id=station_id)
+        return apply_observation_bounds(contract, base_probability, observations)
+
+
+def _verified_resolution_station(
+    contract: HighTemperatureContract,
+    source: str | None,
+) -> str | None:
     expected = CITY_STATIONS.get(contract.city)
     if not expected or not source:
-        return False
+        return None
     parsed = urlparse(source)
     if parsed.scheme != "https" or parsed.hostname != "www.weather.gov":
-        return False
+        return None
     sites = parse_qs(parsed.query).get("site", ())
-    return bool(sites and sites[0].upper() == expected)
+    if not sites or sites[0].upper() != expected:
+        return None
+    return expected
+
+
+def _resolution_station_matches(
+    contract: HighTemperatureContract,
+    source: str | None,
+) -> bool:
+    return _verified_resolution_station(contract, source) is not None
 
 
 class OpenMeteoEnsemble:
@@ -350,12 +881,14 @@ class OpenMeteoEnsemble:
         cache_seconds: float = 1_800,
         timeout_seconds: float = 20,
         failure_backoff_seconds: float = 300,
+        rate_limit_backoff_seconds: float = 21_600,
     ) -> None:
         if (
             min_members < 2
             or cache_seconds <= 0
             or timeout_seconds <= 0
             or failure_backoff_seconds <= 0
+            or rate_limit_backoff_seconds <= 0
         ):
             raise ValueError("invalid Open-Meteo client settings")
         self._fetch_json = fetch_json
@@ -363,20 +896,45 @@ class OpenMeteoEnsemble:
         self._cache_seconds = cache_seconds
         self._timeout_seconds = timeout_seconds
         self._failure_backoff_seconds = failure_backoff_seconds
+        self._rate_limit_backoff_seconds = rate_limit_backoff_seconds
         self._cache: dict[
             tuple[str, str],
             tuple[float, tuple[tuple[float, ...], ...]],
         ] = {}
         self._failure_until: dict[tuple[str, str], float] = {}
+        self._failure_messages: dict[tuple[str, str], str] = {}
+        self._rate_limit_until = 0.0
+        self._rate_limit_message = "prior rate-limit response"
+
+    def _prune_expired(self, monotonic_now: float) -> None:
+        for key, (expires_at, _members) in tuple(self._cache.items()):
+            if expires_at <= monotonic_now:
+                self._cache.pop(key, None)
+        for key, expires_at in tuple(self._failure_until.items()):
+            if expires_at <= monotonic_now:
+                self._failure_until.pop(key, None)
+                self._failure_messages.pop(key, None)
+        if self._rate_limit_until <= monotonic_now:
+            self._rate_limit_until = 0.0
+            self._rate_limit_message = "prior rate-limit response"
 
     @staticmethod
     def _probability(
-        contract: ExactHighContract,
+        contract: HighTemperatureContract,
         model_members: tuple[tuple[float, ...], ...],
         lead_days: int,
     ) -> EnsembleForecast:
         inflation = 1.05 + 0.15 * max(0, lead_days)
-        half_width = 0.5 if contract.unit == "C" else 5 / 18
+        lower_c = (
+            float(contract.probability_lower_c)
+            if contract.probability_lower_c is not None
+            else None
+        )
+        upper_c = (
+            float(contract.probability_upper_c)
+            if contract.probability_upper_c is not None
+            else None
+        )
         model_probabilities: list[float] = []
         model_means: list[float] = []
         model_variances: list[float] = []
@@ -385,13 +943,21 @@ class OpenMeteoEnsemble:
             model_std = statistics.stdev(members)
             sigma = max(model_std * inflation, 0.5)
             distribution = NormalDist(mu=model_mean, sigma=sigma)
-            probability = distribution.cdf(float(contract.target_c) + half_width)
-            probability -= distribution.cdf(float(contract.target_c) - half_width)
+            if lower_c is None:
+                assert upper_c is not None
+                probability = distribution.cdf(upper_c)
+            elif upper_c is None:
+                probability = 1 - distribution.cdf(lower_c)
+            else:
+                probability = distribution.cdf(upper_c) - distribution.cdf(lower_c)
             model_probabilities.append(probability)
             model_means.append(model_mean)
             model_variances.append(model_std ** 2)
-        probability = statistics.mean(model_probabilities)
-        probability = min(0.999, max(0.001, probability))
+        distribution_probability = statistics.mean(model_probabilities)
+        directional_probability = min(
+            0.999,
+            max(0.001, distribution_probability),
+        )
         mean = statistics.mean(model_means)
         mixture_second_moment = statistics.mean(
             variance + model_mean ** 2
@@ -399,29 +965,43 @@ class OpenMeteoEnsemble:
         )
         raw_std = math.sqrt(max(0, mixture_second_moment - mean ** 2))
         return EnsembleForecast(
-            raw_probability=Decimal(str(probability)),
+            raw_probability=Decimal(str(directional_probability)),
             ensemble_mean_c=Decimal(str(mean)),
             ensemble_std_c=Decimal(str(raw_std)),
             n_members=sum(len(members) for members in model_members),
             lead_days=lead_days,
             model_count=len(model_members),
+            distribution_probability=Decimal(str(distribution_probability)),
         )
 
     async def forecast(
         self,
-        contract: ExactHighContract,
+        contract: HighTemperatureContract,
         *,
         now: datetime | None = None,
     ) -> EnsembleForecast | None:
         now = now or datetime.now(timezone.utc)
         cache_key = (contract.city, contract.target_date)
-        cached = self._cache.get(cache_key)
         monotonic_now = time.monotonic()
-        if monotonic_now < self._failure_until.get(cache_key, 0):
-            return None
+        self._prune_expired(monotonic_now)
+        cached = self._cache.get(cache_key)
         if cached is not None and monotonic_now < cached[0]:
             model_members = cached[1]
         else:
+            # A provider-wide 429 is not specific to one city. Open one global
+            # circuit so the rest of the event universe does not amplify a
+            # daily quota failure into dozens of immediate requests.
+            if monotonic_now < self._rate_limit_until:
+                raise ForecastUnavailableError(
+                    "Open-Meteo global rate-limit backoff active: "
+                    + self._rate_limit_message,
+                    provider_global=True,
+                )
+            if monotonic_now < self._failure_until.get(cache_key, 0):
+                detail = self._failure_messages.get(cache_key, "prior request failed")
+                raise ForecastUnavailableError(
+                    f"Open-Meteo forecast backoff active for {contract.event_key}: {detail}"
+                )
             latitude, longitude = CITY_COORDS[contract.city]
             try:
                 payload = await asyncio.to_thread(
@@ -472,14 +1052,36 @@ class OpenMeteoEnsemble:
                 total_members = sum(len(values) for values in groups.values())
                 if total_members < self._min_members:
                     raise ValueError(f"Open-Meteo returned only {total_members} ensemble members")
-            except Exception:
-                self._failure_until[cache_key] = monotonic_now + self._failure_backoff_seconds
-                raise
+            except Exception as exc:
+                response = getattr(exc, "response", None)
+                detail = f"{type(exc).__name__}: {exc}"
+                if getattr(response, "status_code", None) == 429:
+                    self._rate_limit_until = (
+                        monotonic_now + self._rate_limit_backoff_seconds
+                    )
+                    self._rate_limit_message = detail
+                    raise ForecastUnavailableError(
+                        f"Open-Meteo forecast unavailable: {detail}",
+                        provider_global=True,
+                    ) from exc
+                else:
+                    self._failure_until[cache_key] = (
+                        monotonic_now + self._failure_backoff_seconds
+                    )
+                    self._failure_messages[cache_key] = detail
+                    raise ForecastUnavailableError(
+                        f"Open-Meteo forecast unavailable for {contract.event_key}: {detail}"
+                    ) from exc
             model_members = tuple(tuple(groups[name]) for name in MODEL_KEY_MARKERS)
             self._failure_until.pop(cache_key, None)
+            self._failure_messages.pop(cache_key, None)
             self._cache[cache_key] = (monotonic_now + self._cache_seconds, model_members)
         target = datetime.fromisoformat(contract.target_date).date()
-        lead_days = max(0, (target - now.date()).days)
+        timezone_name = CITY_TIMEZONES.get(contract.city)
+        if timezone_name is None:
+            raise ValueError(f"no resolver timezone for {contract.city}")
+        resolver_today = now.astimezone(ZoneInfo(timezone_name)).date()
+        lead_days = max(0, (target - resolver_today).days)
         return self._probability(contract, model_members, lead_days)
 
 
@@ -490,22 +1092,63 @@ def _best_price(levels: Any, *, ask: bool) -> Decimal | None:
     return min(prices) if ask else max(prices)
 
 
+def _book_levels(levels: Any) -> tuple[BookLevel, ...]:
+    return tuple(
+        BookLevel(Decimal(str(level.price)), Decimal(str(level.size)))
+        for level in levels
+    )
+
+
+def _maker_shadow(
+    *,
+    book: Any,
+    context: MarketContext,
+    size: Decimal,
+    expected_probability: Decimal,
+) -> MakerShadowQuote | None:
+    try:
+        return propose_buy_quote(
+            bids=_book_levels(book.bids),
+            asks=_book_levels(book.asks),
+            tick_size=context.tick_size,
+            size=size,
+            expected_probability=expected_probability,
+        )
+    except ValueError:
+        return None
+
+
+def _same_day_at_resolver(contract: HighTemperatureContract, now: datetime) -> bool:
+    timezone_name = CITY_TIMEZONES.get(contract.city)
+    if timezone_name is None:
+        return False
+    return (
+        date.fromisoformat(contract.target_date)
+        == now.astimezone(ZoneInfo(timezone_name)).date()
+    )
+
+
 def _side_evaluation(
     *,
     market: Any,
-    contract: ExactHighContract,
+    contract: HighTemperatureContract,
     forecast: EnsembleForecast,
+    yes_probability: Decimal,
     side: str,
     book: Any,
     context: MarketContext,
     policy: WeatherPaperPolicy,
+    same_day_contract: bool,
+    observation: ObservationBoundResult,
+    observation_error: str | None,
+    observation_status: str,
+    trade_block_reason: str | None,
 ) -> WeatherEvaluation | None:
+    if not context.accepting_orders or context.fee_rate is None:
+        return None
     bid = _best_price(book.bids, ask=False)
     shares = Decimal(str(book.min_order_size))
-    ask_levels = tuple(
-        BookLevel(Decimal(str(level.price)), Decimal(str(level.size)))
-        for level in book.asks
-    )
+    ask_levels = _book_levels(book.asks)
     if bid is None or not ask_levels:
         return None
     try:
@@ -515,9 +1158,15 @@ def _side_evaluation(
     ask = executable.vwap
     if not (policy.min_price <= ask <= policy.max_price):
         return None
-    raw_probability = forecast.raw_probability if side == "YES" else ONE - forecast.raw_probability
+    raw_probability = yes_probability if side == "YES" else ONE - yes_probability
+    resolver_certain = (
+        observation.same_day_observation_available
+        and observation.current_high_display is not None
+        and yes_probability in {ZERO, ONE}
+    )
     outcome = market.outcomes.yes if side == "YES" else market.outcomes.no
     anchor = Decimal(str(outcome.price if outcome.price is not None else ask))
+    fee = execution_fee(ask_levels, shares, context.fee_rate)
     decision = evaluate_weather_market(WeatherMarketInput(
         raw_probability=raw_probability,
         anchor_probability=anchor,
@@ -525,18 +1174,26 @@ def _side_evaluation(
         intraclass_correlation=policy.intraclass_correlation,
         best_bid=bid,
         best_ask=ask,
-        fee_rate=context.fee_rate or ZERO,
+        fee_rate=context.fee_rate,
+        executable_fee_per_share=fee / shares,
         lead_days=forecast.lead_days,
         resolution_source_verified=context.rules_verified,
-        prior_strength=policy.prior_strength,
+        # A resolver-certain running-high implication is a hard logical bound,
+        # not a noisy ensemble estimate. Do not shrink it back toward the book.
+        prior_strength=ZERO if resolver_certain else policy.prior_strength,
         fractional_kelly=policy.fractional_kelly,
         base_edge=policy.base_edge,
         uncertainty_z=policy.uncertainty_z,
     ))
-    fee = execution_fee(ask_levels, shares, context.fee_rate or ZERO)
     all_in_cost = executable.notional + fee
-    tradeable = bool(decision.tradeable and all_in_cost <= policy.max_order_notional)
-    if not decision.tradeable:
+    tradeable = bool(
+        decision.tradeable
+        and all_in_cost <= policy.max_order_notional
+        and trade_block_reason is None
+    )
+    if trade_block_reason is not None:
+        reason = trade_block_reason
+    elif not decision.tradeable:
         reason = decision.reason
     elif all_in_cost > policy.max_order_notional:
         reason = "weather paper order cap exceeded"
@@ -552,7 +1209,11 @@ def _side_evaluation(
         token_id=str(book.token_id),
         city=contract.city,
         target_date=contract.target_date,
-        target_c=contract.target_c,
+        target_c=contract.target_c if contract.is_exact else None,
+        unit=contract.unit,
+        display_lower=contract.display_lower,
+        display_upper=contract.display_upper,
+        contract_kind=contract.contract_kind,
         bid=bid,
         ask=ask,
         shares=shares,
@@ -563,7 +1224,160 @@ def _side_evaluation(
         decision=decision,
         paper_tradeable=tradeable,
         paper_reason=reason,
+        same_day_contract=same_day_contract,
+        same_day_observation_available=observation.same_day_observation_available,
+        current_high_display=observation.current_high_display,
+        observation_error=observation_error,
+        same_day_observation_status=observation_status,
+        maker_shadow=_maker_shadow(
+            book=book,
+            context=context,
+            size=shares,
+            expected_probability=raw_probability,
+        ),
     )
+
+
+@dataclass(frozen=True)
+class _SurfaceComponent:
+    market: Any
+    contract: HighTemperatureContract
+    forecast: EnsembleForecast
+    yes_book: Any
+    context: MarketContext
+
+
+def _unavailable_surface(
+    *,
+    event_key: str,
+    unit: str,
+    bucket_count: int,
+    probability_sum: Decimal,
+    reason: str,
+) -> EventSurface:
+    return EventSurface(
+        event_key=event_key,
+        unit=unit,
+        bucket_count=bucket_count,
+        complete_partition=False,
+        executable=False,
+        tradeable=False,
+        common_shares=ZERO,
+        model_probability_sum=probability_sum,
+        model_probability_residual=ONE - probability_sum,
+        gross_cost=ZERO,
+        fees=ZERO,
+        payout=ZERO,
+        net_profit=ZERO,
+        reason=reason,
+    )
+
+
+def _build_event_evaluations(
+    discovered: Mapping[
+        tuple[str, str],
+        Sequence[tuple[Any, HighTemperatureContract, str]],
+    ],
+    components: Mapping[str, _SurfaceComponent],
+) -> tuple[WeatherEventEvaluation, ...]:
+    events: list[WeatherEventEvaluation] = []
+    for (event_key, unit), entries in sorted(discovered.items()):
+        ordered_entries = sorted(
+            entries,
+            key=lambda item: (
+                item[1].display_lower is not None,
+                ZERO if item[1].display_lower is None else item[1].display_lower,
+                str(item[0].id),
+            ),
+        )
+        contracts: list[WeatherEventContract] = []
+        buckets: list[SurfaceBucket] = []
+        complete_data = True
+        probability_sum = ZERO
+        for market, contract, _station_id in ordered_entries:
+            component = components.get(str(market.id))
+            probability: Decimal | None = None
+            maker: MakerShadowQuote | None = None
+            if component is not None:
+                probability = (
+                    component.forecast.distribution_probability
+                    if component.forecast.distribution_probability is not None
+                    else component.forecast.raw_probability
+                )
+                probability_sum += probability
+                minimum_size = Decimal(str(component.yes_book.min_order_size))
+                maker = _maker_shadow(
+                    book=component.yes_book,
+                    context=component.context,
+                    size=minimum_size,
+                    expected_probability=probability,
+                )
+                asks = _book_levels(component.yes_book.asks)
+                if asks and component.context.fee_rate is not None:
+                    buckets.append(SurfaceBucket(
+                        key=str(market.condition_id),
+                        lower_display=contract.display_lower,
+                        upper_display=contract.display_upper,
+                        model_probability=probability,
+                        yes_asks=asks,
+                        minimum_size=minimum_size,
+                        fee_rate=component.context.fee_rate,
+                    ))
+                else:
+                    complete_data = False
+            else:
+                complete_data = False
+            contracts.append(WeatherEventContract(
+                market_id=str(market.id),
+                condition_id=str(market.condition_id),
+                question=str(market.question),
+                yes_token_id=str(market.outcomes.yes.token_id),
+                contract_kind=contract.contract_kind,
+                display_lower=contract.display_lower,
+                display_upper=contract.display_upper,
+                model_probability=probability,
+                maker_shadow=maker,
+            ))
+
+        negative_risk_verified = all(
+            bool(getattr(market.state, "neg_risk", False))
+            for market, _contract, _station in ordered_entries
+        )
+        resolution_station_verified = all(
+            _verified_resolution_station(
+                contract,
+                getattr(market.resolution, "source", None),
+            ) == station_id
+            for market, contract, station_id in ordered_entries
+        )
+        if (
+            complete_data
+            and negative_risk_verified
+            and resolution_station_verified
+            and len(buckets) == len(ordered_entries)
+        ):
+            surface = analyze_event_surface(
+                event_key=event_key,
+                unit=unit,
+                buckets=tuple(buckets),
+            )
+        else:
+            surface = _unavailable_surface(
+                event_key=event_key,
+                unit=unit,
+                bucket_count=len(ordered_entries),
+                probability_sum=probability_sum,
+                reason="event market data or resolver verification incomplete",
+            )
+        events.append(WeatherEventEvaluation(
+            event_key=event_key,
+            unit=unit,
+            contracts=tuple(contracts),
+            surface=surface,
+            negative_risk_verified=negative_risk_verified,
+            resolution_station_verified=resolution_station_verified,
+        ))
+    return tuple(events)
 
 
 async def evaluate_weather_universe(
@@ -571,13 +1385,14 @@ async def evaluate_weather_universe(
     client: WeatherPublicClient,
     forecast: ForecastProvider,
     policy: WeatherPaperPolicy,
+    observation_provider: ObservationProvider | None = None,
     now: datetime | None = None,
 ) -> WeatherUniverseResult:
     if not policy.enabled:
         return WeatherUniverseResult(0, 0, ())
     now = now or datetime.now(timezone.utc)
     tag = await client.get_tag(slug="weather")
-    markets: list[tuple[Any, ExactHighContract]] = []
+    markets: list[tuple[Any, HighTemperatureContract, str]] = []
     examined = 0
     paginator = client.list_markets(
         closed=False,
@@ -589,25 +1404,18 @@ async def evaluate_weather_universe(
     )
     async for market in paginator.iter_items():
         examined += 1
-        contract = parse_exact_high_contract(
+        contract = parse_high_temperature_contract(
             getattr(market, "question", None),
             end_date=getattr(market.state, "end_date", None),
         )
         source = getattr(market.resolution, "source", None)
+        station_id = (
+            _verified_resolution_station(contract, source)
+            if contract is not None
+            else None
+        )
         yes_token = getattr(market.outcomes.yes, "token_id", None)
         no_token = getattr(market.outcomes.no, "token_id", None)
-        reference_prices = tuple(
-            Decimal(str(value))
-            for value in (
-                getattr(market.outcomes.yes, "price", None),
-                getattr(market.outcomes.no, "price", None),
-            )
-            if value is not None
-        )
-        price_in_range = any(
-            policy.min_price <= price <= policy.max_price
-            for price in reference_prices
-        )
         end_date = getattr(market.state, "end_date", None)
         liquidity = Decimal(str(getattr(market.metrics, "liquidity_num", 0) or 0))
         within_horizon = bool(
@@ -617,28 +1425,116 @@ async def evaluate_weather_universe(
         )
         if (
             contract is not None
+            and station_id is not None
             and within_horizon
             and bool(getattr(market.state, "active", False))
             and not bool(getattr(market.state, "closed", False))
             and bool(getattr(market.state, "accepting_orders", False))
             and bool(getattr(market.state, "neg_risk", False))
-            and _resolution_station_matches(contract, source)
             and yes_token
             and no_token
-            and price_in_range
             and liquidity >= policy.min_liquidity
         ):
-            markets.append((market, contract))
+            markets.append((market, contract, station_id))
         if len(markets) >= policy.market_limit or examined >= policy.discovery_limit:
             break
 
+    discovered_events: dict[
+        tuple[str, str],
+        list[tuple[Any, HighTemperatureContract, str]],
+    ] = {}
+    for item in markets:
+        discovered_events.setdefault((item[1].event_key, item[1].unit), []).append(item)
+
     evaluations: list[WeatherEvaluation] = []
     errors: list[str] = []
-    for market, contract in markets:
+    forecast_errors: list[str] = []
+    forecast_error_keys: set[str] = set()
+    components: dict[str, _SurfaceComponent] = {}
+    observations_available = 0
+    observation_errors = 0
+    markets_forecast_unavailable = 0
+    markets_modeled = 0
+    markets_side_evaluable = 0
+    for market, contract, station_id in markets:
         try:
-            point_forecast = await forecast.forecast(contract, now=now)
-            if point_forecast is None:
+            try:
+                point_forecast = await forecast.forecast(contract, now=now)
+            except ForecastUnavailableError as exc:
+                markets_forecast_unavailable += 1
+                error_key = "provider-global" if exc.provider_global else contract.event_key
+                if error_key not in forecast_error_keys:
+                    forecast_error_keys.add(error_key)
+                    message = f"forecast unavailable: {exc}"
+                    forecast_errors.append(message)
+                    errors.append(message)
                 continue
+            except Exception as exc:
+                markets_forecast_unavailable += 1
+                error_key = f"market:{getattr(market, 'id', '')}"
+                if error_key not in forecast_error_keys:
+                    forecast_error_keys.add(error_key)
+                    message = (
+                        f"{getattr(market, 'id', '')}: forecast error: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    forecast_errors.append(message)
+                    errors.append(message)
+                continue
+            if point_forecast is None:
+                markets_forecast_unavailable += 1
+                error_key = "provider-empty"
+                if error_key not in forecast_error_keys:
+                    forecast_error_keys.add(error_key)
+                    message = "forecast provider returned no forecast data"
+                    forecast_errors.append(message)
+                    errors.append(message)
+                continue
+            markets_modeled += 1
+            same_day_contract = _same_day_at_resolver(contract, now)
+            observation = ObservationBoundResult(
+                point_forecast.raw_probability,
+                False,
+                None,
+            )
+            observation_error: str | None = None
+            observation_status = "not_applicable"
+            trade_block_reason: str | None = None
+            if same_day_contract:
+                if not policy.observations_enabled:
+                    observation_status = "disabled"
+                    trade_block_reason = "same-day station observations are disabled"
+                elif observation_provider is None:
+                    observation_status = "provider_unavailable"
+                    trade_block_reason = (
+                        "same-day station observation provider unavailable"
+                    )
+                else:
+                    try:
+                        observation = await observation_provider.adjust_probability(
+                            contract,
+                            point_forecast.raw_probability,
+                            station_id=station_id,
+                        )
+                    except Exception as exc:
+                        observation_errors += 1
+                        observation_status = "error"
+                        observation_error = f"{type(exc).__name__}: {exc}"
+                        errors.append(
+                            f"{getattr(market, 'id', '')}: observation error: "
+                            f"{observation_error}"
+                        )
+                        trade_block_reason = "same-day station observation error"
+                    else:
+                        if observation.same_day_observation_available:
+                            observation_status = "available"
+                            observations_available += 1
+                        else:
+                            observation_status = "unavailable"
+                            trade_block_reason = (
+                                "required same-day station observation unavailable"
+                            )
+
             yes_token = str(market.outcomes.yes.token_id)
             no_token = str(market.outcomes.no.token_id)
             books = await client.get_order_books(token_ids=[yes_token, no_token])
@@ -648,33 +1544,76 @@ async def evaluate_weather_universe(
             context = MarketContext.from_sdk(market, by_token[yes_token])
             if not context.negative_risk:
                 continue
+            if (
+                context.accepting_orders
+                and context.rules_verified
+                and context.fee_rate is not None
+            ):
+                components[str(market.id)] = _SurfaceComponent(
+                    market=market,
+                    contract=contract,
+                    forecast=point_forecast,
+                    yes_book=by_token[yes_token],
+                    context=context,
+                )
             options = tuple(filter(None, (
                 _side_evaluation(
                     market=market,
                     contract=contract,
                     forecast=point_forecast,
+                    yes_probability=observation.probability,
                     side="YES",
                     book=by_token[yes_token],
                     context=context,
                     policy=policy,
+                    same_day_contract=same_day_contract,
+                    observation=observation,
+                    observation_error=observation_error,
+                    observation_status=observation_status,
+                    trade_block_reason=trade_block_reason,
                 ),
                 _side_evaluation(
                     market=market,
                     contract=contract,
                     forecast=point_forecast,
+                    yes_probability=observation.probability,
                     side="NO",
                     book=by_token[no_token],
                     context=context,
                     policy=policy,
+                    same_day_contract=same_day_contract,
+                    observation=observation,
+                    observation_error=observation_error,
+                    observation_status=observation_status,
+                    trade_block_reason=trade_block_reason,
                 ),
             )))
             if options:
+                markets_side_evaluable += 1
                 evaluations.append(max(options, key=lambda item: item.decision.net_edge))
         except Exception as exc:
             errors.append(f"{getattr(market, 'id', '')}: {type(exc).__name__}: {exc}")
+
+    if not markets:
+        forecast_status = "not_requested"
+    elif markets_forecast_unavailable == len(markets):
+        forecast_status = "unavailable"
+    elif markets_forecast_unavailable:
+        forecast_status = "degraded"
+    else:
+        forecast_status = "available"
+    events = _build_event_evaluations(discovered_events, components)
     return WeatherUniverseResult(
         markets_discovered=len(markets),
-        markets_evaluated=len(evaluations),
+        markets_evaluated=len(markets),
         evaluations=tuple(evaluations),
         errors=tuple(errors),
+        events=events,
+        observations_available=observations_available,
+        observation_errors=observation_errors,
+        markets_forecast_unavailable=markets_forecast_unavailable,
+        markets_modeled=markets_modeled,
+        markets_side_evaluable=markets_side_evaluable,
+        forecast_status=forecast_status,
+        forecast_errors=tuple(forecast_errors),
     )

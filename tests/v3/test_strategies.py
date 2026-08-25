@@ -51,6 +51,31 @@ def test_weather_evaluator_requires_verified_resolution_source():
     assert "resolution source" in decision.reason
 
 
+def test_weather_evaluator_uses_executable_depth_fee_override_for_edge_and_kelly():
+    depth_fee_per_share = D("0.0132")
+    decision = evaluate_weather_market(
+        WeatherMarketInput(
+            raw_probability=D("0.80"),
+            anchor_probability=D("0.50"),
+            n_members=100,
+            intraclass_correlation=D("0.01"),
+            best_bid=D("0.10"),
+            best_ask=D("0.28"),
+            fee_rate=D("0.05"),
+            executable_fee_per_share=depth_fee_per_share,
+            lead_days=1,
+            resolution_source_verified=True,
+            prior_strength=D("0"),
+            base_edge=D("0"),
+            uncertainty_z=D("0"),
+        )
+    )
+
+    assert decision.fee_per_share == depth_fee_per_share
+    assert decision.net_edge == D("0.80") - D("0.28") - depth_fee_per_share
+    assert decision.kelly_fraction > D("0")
+
+
 def test_complete_set_research_requires_same_standard_market_and_net_edge():
     yes_book = SimpleNamespace(
         condition_id="condition",
