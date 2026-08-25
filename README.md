@@ -13,6 +13,10 @@ research compatibility; its live path is permanently disabled.
 - `paper-run` is a public-data-only worker with durable local scans, candidates,
   simulated positions, and settlement records. It refuses to run if account
   reads or live trading are enabled.
+- V4 weather paper research combines Open-Meteo, MET Norway, and NWS hourly
+  forecasts when coverage exists. A provider outage is recorded as degraded
+  telemetry; remaining sources continue with wider uncertainty. Resolved paper
+  outcomes update a persistent, conservative per-source/city/horizon calibrator.
 - Authenticated account reads and live-capable client construction are lazy and
   use separate gates; reconciliation can run while paper mode remains enabled.
 - User/market stream events can be normalized, durably replayed, deduplicated,
@@ -153,6 +157,7 @@ state.json           paper cash, positions, pending audit outbox, aggregate coun
 scans.jsonl          every evaluated public market/book snapshot
 weather_scans.jsonl  forecast, observation, uncertainty, price, and edge telemetry
 weather_events.jsonl partition, violation, maker-shadow, and hypothesis telemetry
+weather_calibration.json persistent paper-only source/city/horizon probability calibration
 candidates.jsonl     positive strategy candidates and cap decisions
 paper_trades.jsonl   idempotent simulated-entry audit records
 settlements.jsonl    idempotent public-resolution settlement audit records

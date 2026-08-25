@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import re
 import statistics
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
+from pathlib import Path
 from statistics import NormalDist
 from typing import Any, Protocol
 from urllib.parse import parse_qs, urlparse
@@ -345,9 +347,16 @@ class ObservationUnavailableError(RuntimeError):
 class ForecastUnavailableError(RuntimeError):
     """Forecast data is unavailable without implying an empty candidate set."""
 
-    def __init__(self, message: str, *, provider_global: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider_global: bool = False,
+        provider_covered: bool = True,
+    ) -> None:
         super().__init__(message)
         self.provider_global = provider_global
+        self.provider_covered = provider_covered
 
 
 @dataclass(frozen=True)
@@ -359,6 +368,94 @@ class EnsembleForecast:
     lead_days: int
     model_count: int = 4
     distribution_probability: Decimal | None = None
+    source: str = "open-meteo"
+    provider_count: int = 1
+    provider_names: tuple[str, ...] = ()
+    provider_probabilities: tuple[tuple[str, Decimal], ...] = ()
+    provider_failures: tuple[tuple[str, str], ...] = ()
+    calibration_samples: int = 0
+
+
+class ProbabilityCalibration:
+    """Small, persistent, shrinkage calibrator for resolved paper forecasts.
+
+    Calibration is deliberately conservative: until a source/city/horizon bucket
+    has 20 resolved outcomes, its empirical rate is blended only partially with
+    the raw model probability. This makes outages safe and prevents a handful of
+    paper outcomes from overfitting the next forecast.
+    """
+
+    def __init__(self, path: Path | None = None, *, min_samples: int = 20) -> None:
+        if min_samples < 1:
+            raise ValueError("calibration minimum samples must be positive")
+        self.path = path
+        self.min_samples = min_samples
+        self._bins: dict[str, dict[str, int]] = {}
+        if path is not None and path.is_file():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                payload = {}
+            if isinstance(payload, dict):
+                for key, value in payload.items():
+                    if isinstance(value, dict):
+                        try:
+                            self._bins[str(key)] = {
+                                "successes": int(value.get("successes", 0)),
+                                "total": int(value.get("total", 0)),
+                            }
+                        except (TypeError, ValueError):
+                            continue
+
+    @staticmethod
+    def _bucket(probability: Decimal) -> int:
+        return min(9, max(0, int(probability * Decimal("10"))))
+
+    def _key(self, source: str, city: str, lead_days: int, probability: Decimal) -> str:
+        return f"{source}:{city}:{lead_days}:{self._bucket(probability)}"
+
+    def calibrate(
+        self,
+        source: str,
+        city: str,
+        lead_days: int,
+        probability: Decimal,
+    ) -> Decimal:
+        if not ZERO <= probability <= ONE:
+            raise ValueError("forecast probability must be in [0, 1]")
+        bucket = self._bins.get(self._key(source, city, lead_days, probability))
+        if not bucket or bucket["total"] <= 0:
+            return probability
+        total = bucket["total"]
+        empirical = Decimal(bucket["successes"] + 1) / Decimal(total + 2)
+        blend = min(ONE, Decimal(total) / Decimal(self.min_samples))
+        return min(ONE, max(ZERO, probability * (ONE - blend) + empirical * blend))
+
+    def record(
+        self,
+        source: str,
+        city: str,
+        lead_days: int,
+        probability: Decimal,
+        outcome: int,
+    ) -> None:
+        if outcome not in {0, 1} or not ZERO <= probability <= ONE:
+            raise ValueError("invalid calibration observation")
+        key = self._key(source, city, lead_days, probability)
+        bucket = self._bins.setdefault(key, {"successes": 0, "total": 0})
+        bucket["successes"] += outcome
+        bucket["total"] += 1
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(self._bins, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(self.path)
+
+    def samples(self) -> int:
+        return sum(item["total"] for item in self._bins.values())
 
 
 @dataclass(frozen=True)
@@ -478,6 +575,8 @@ class WeatherUniverseResult:
     markets_side_evaluable: int = 0
     forecast_status: str = "not_requested"
     forecast_errors: tuple[str, ...] = field(default_factory=tuple)
+    provider_names: tuple[str, ...] = field(default_factory=tuple)
+    provider_failures: tuple[tuple[str, str], ...] = field(default_factory=tuple)
 
 
 class WeatherPublicClient(Protocol):
@@ -873,6 +972,8 @@ def _resolution_station_matches(
 
 
 class OpenMeteoEnsemble:
+    name = "open-meteo"
+
     def __init__(
         self,
         *,
@@ -940,7 +1041,7 @@ class OpenMeteoEnsemble:
         model_variances: list[float] = []
         for members in model_members:
             model_mean = statistics.mean(members)
-            model_std = statistics.stdev(members)
+            model_std = statistics.stdev(members) if len(members) >= 2 else 0.0
             sigma = max(model_std * inflation, 0.5)
             distribution = NormalDist(mu=model_mean, sigma=sigma)
             if lower_c is None:
@@ -1083,6 +1184,363 @@ class OpenMeteoEnsemble:
         resolver_today = now.astimezone(ZoneInfo(timezone_name)).date()
         lead_days = max(0, (target - resolver_today).days)
         return self._probability(contract, model_members, lead_days)
+
+
+class MetNoLocationForecast:
+    """JSON forecast adapter for the independent MET Norway service."""
+
+    name = "met-no"
+
+    def __init__(
+        self,
+        *,
+        fetch_json: Callable[..., Mapping[str, Any]] = _default_noaa_fetch_json,
+        cache_seconds: float = 1_800,
+        timeout_seconds: float = 20,
+        user_agent: str = "polymarket-bot-weather-research/4.1",
+    ) -> None:
+        if cache_seconds <= 0 or timeout_seconds <= 0 or not user_agent.strip():
+            raise ValueError("invalid MET Norway client settings")
+        self._fetch_json = fetch_json
+        self._cache_seconds = cache_seconds
+        self._timeout_seconds = timeout_seconds
+        self._user_agent = user_agent
+        self._cache: dict[tuple[str, str], tuple[float, float]] = {}
+
+    async def forecast(
+        self,
+        contract: HighTemperatureContract,
+        *,
+        now: datetime | None = None,
+    ) -> EnsembleForecast:
+        now = now or datetime.now(timezone.utc)
+        key = (contract.city, contract.target_date)
+        cached = self._cache.get(key)
+        if cached is not None and cached[0] > time.monotonic():
+            maximum = cached[1]
+        else:
+            latitude, longitude = CITY_COORDS[contract.city]
+            try:
+                payload = await asyncio.to_thread(
+                    self._fetch_json,
+                    "https://api.met.no/weatherapi/locationforecast/2.0/compact",
+                    params={"lat": latitude, "lon": longitude},
+                    headers={
+                        "User-Agent": self._user_agent,
+                        "Accept": "application/json",
+                    },
+                    timeout=self._timeout_seconds,
+                )
+                series = payload.get("properties", {}).get("timeseries")
+                if not isinstance(series, list):
+                    raise ValueError("MET Norway response has no timeseries")
+                timezone_name = CITY_TIMEZONES.get(contract.city)
+                if timezone_name is None:
+                    raise ValueError(f"no resolver timezone for {contract.city}")
+                target = date.fromisoformat(contract.target_date)
+                values: list[float] = []
+                for item in series:
+                    if not isinstance(item, dict):
+                        continue
+                    raw_time = item.get("time")
+                    details = item.get("data", {}).get("instant", {}).get("details", {})
+                    raw_temperature = details.get("air_temperature")
+                    if not isinstance(raw_time, str) or raw_temperature is None:
+                        continue
+                    observed_at = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+                    if observed_at.astimezone(ZoneInfo(timezone_name)).date() == target:
+                        value = float(raw_temperature)
+                        if math.isfinite(value):
+                            values.append(value)
+                if not values:
+                    raise ValueError("MET Norway response has no target-date temperatures")
+                maximum = max(values)
+            except Exception as exc:
+                response = getattr(exc, "response", None)
+                detail = f"{type(exc).__name__}: {exc}"
+                raise ForecastUnavailableError(
+                    f"MET Norway forecast unavailable for {contract.event_key}: {detail}",
+                    provider_global=getattr(response, "status_code", None) == 429,
+                ) from exc
+            self._cache[key] = (time.monotonic() + self._cache_seconds, maximum)
+        return _deterministic_forecast(
+            contract,
+            maximum,
+            now=now,
+            source=self.name,
+        )
+
+
+class NWSGridForecast:
+    """US-only NWS hourly grid forecast adapter with no credentials."""
+
+    name = "nws"
+    covered_cities = frozenset({
+        "new york", "nyc", "chicago", "seattle", "atlanta", "dallas", "miami",
+        "los angeles", "austin", "houston", "denver", "san francisco",
+    })
+
+    def __init__(
+        self,
+        *,
+        fetch_json: Callable[..., Mapping[str, Any]] = _default_noaa_fetch_json,
+        cache_seconds: float = 1_800,
+        timeout_seconds: float = 20,
+        user_agent: str = "polymarket-bot-weather-research/4.1",
+    ) -> None:
+        if cache_seconds <= 0 or timeout_seconds <= 0 or not user_agent.strip():
+            raise ValueError("invalid NWS client settings")
+        self._fetch_json = fetch_json
+        self._cache_seconds = cache_seconds
+        self._timeout_seconds = timeout_seconds
+        self._user_agent = user_agent
+        self._cache: dict[tuple[str, str], tuple[float, float]] = {}
+
+    async def forecast(
+        self,
+        contract: HighTemperatureContract,
+        *,
+        now: datetime | None = None,
+    ) -> EnsembleForecast:
+        now = now or datetime.now(timezone.utc)
+        if contract.city not in self.covered_cities:
+            raise ForecastUnavailableError(
+                f"NWS has no configured coverage for {contract.city}",
+                provider_covered=False,
+            )
+        key = (contract.city, contract.target_date)
+        cached = self._cache.get(key)
+        if cached is not None and cached[0] > time.monotonic():
+            maximum = cached[1]
+        else:
+            latitude, longitude = CITY_COORDS[contract.city]
+            headers = {
+                "User-Agent": self._user_agent,
+                "Accept": "application/geo+json, application/json",
+            }
+            try:
+                point = await asyncio.to_thread(
+                    self._fetch_json,
+                    f"https://api.weather.gov/points/{latitude:.4f},{longitude:.4f}",
+                    params={},
+                    headers=headers,
+                    timeout=self._timeout_seconds,
+                )
+                forecast_url = point.get("properties", {}).get("forecastHourly")
+                if not isinstance(forecast_url, str) or not forecast_url:
+                    raise ValueError("NWS points response has no forecastHourly URL")
+                payload = await asyncio.to_thread(
+                    self._fetch_json,
+                    forecast_url,
+                    params={},
+                    headers=headers,
+                    timeout=self._timeout_seconds,
+                )
+                periods = payload.get("properties", {}).get("periods")
+                if not isinstance(periods, list):
+                    raise ValueError("NWS hourly response has no periods")
+                target = date.fromisoformat(contract.target_date)
+                timezone_name = CITY_TIMEZONES[contract.city]
+                values: list[float] = []
+                for period in periods:
+                    if not isinstance(period, dict):
+                        continue
+                    raw_start = period.get("startTime")
+                    raw_temperature = period.get("temperature")
+                    if not isinstance(raw_start, str) or raw_temperature is None:
+                        continue
+                    start = datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
+                    if start.astimezone(ZoneInfo(timezone_name)).date() != target:
+                        continue
+                    value = float(raw_temperature)
+                    if str(period.get("temperatureUnit", "F")).upper() == "F":
+                        value = (value - 32.0) * 5.0 / 9.0
+                    if math.isfinite(value):
+                        values.append(value)
+                if not values:
+                    raise ValueError("NWS response has no target-date temperatures")
+                maximum = max(values)
+            except Exception as exc:
+                response = getattr(exc, "response", None)
+                detail = f"{type(exc).__name__}: {exc}"
+                raise ForecastUnavailableError(
+                    f"NWS forecast unavailable for {contract.event_key}: {detail}",
+                    provider_global=getattr(response, "status_code", None) == 429,
+                ) from exc
+            self._cache[key] = (time.monotonic() + self._cache_seconds, maximum)
+        return _deterministic_forecast(
+            contract,
+            maximum,
+            now=now,
+            source=self.name,
+        )
+
+
+def _deterministic_forecast(
+    contract: HighTemperatureContract,
+    maximum_c: float,
+    *,
+    now: datetime,
+    source: str,
+) -> EnsembleForecast:
+    timezone_name = CITY_TIMEZONES.get(contract.city)
+    if timezone_name is None:
+        raise ValueError(f"no resolver timezone for {contract.city}")
+    target = date.fromisoformat(contract.target_date)
+    resolver_today = now.astimezone(ZoneInfo(timezone_name)).date()
+    lead_days = max(0, (target - resolver_today).days)
+    result = OpenMeteoEnsemble._probability(
+        contract,
+        ((maximum_c,),),
+        lead_days,
+    )
+    return replace(
+        result,
+        source=source,
+        provider_count=1,
+        provider_names=(source,),
+        provider_probabilities=((source, result.raw_probability),),
+    )
+
+
+class ResilientForecastEnsemble:
+    """Combine independent providers and continue with available sources."""
+
+    name = "ensemble"
+
+    def __init__(
+        self,
+        providers: Sequence[ForecastProvider],
+        *,
+        weights: Mapping[str, Decimal] | None = None,
+        calibrator: ProbabilityCalibration | None = None,
+        failure_backoff_seconds: float = 300,
+    ) -> None:
+        if not providers:
+            raise ValueError("at least one forecast provider is required")
+        if failure_backoff_seconds <= 0:
+            raise ValueError("forecast failure backoff must be positive")
+        self.providers = tuple(providers)
+        self.weights = dict(weights or {
+            "open-meteo": Decimal("0.45"),
+            "met-no": Decimal("0.30"),
+            "nws": Decimal("0.25"),
+        })
+        self.calibrator = calibrator or ProbabilityCalibration()
+        self._failure_backoff_seconds = failure_backoff_seconds
+        self._failure_until: dict[str, float] = {}
+        self._failure_messages: dict[str, str] = {}
+
+    async def forecast(
+        self,
+        contract: HighTemperatureContract,
+        *,
+        now: datetime | None = None,
+    ) -> EnsembleForecast:
+        successful: list[tuple[str, EnsembleForecast]] = []
+        failures: list[tuple[str, str]] = []
+        for provider in self.providers:
+            name = str(getattr(provider, "name", type(provider).__name__.lower()))
+            monotonic_now = time.monotonic()
+            failure_until = self._failure_until.get(name, 0.0)
+            if monotonic_now < failure_until:
+                failures.append((name, self._failure_messages.get(name, "provider backoff active")))
+                continue
+            try:
+                result = await provider.forecast(contract, now=now)
+            except ForecastUnavailableError as exc:
+                if exc.provider_covered:
+                    message = f"{type(exc).__name__}: {exc}"
+                    self._failure_until[name] = monotonic_now + self._failure_backoff_seconds
+                    self._failure_messages[name] = message
+                    failures.append((name, message))
+                continue
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                self._failure_until[name] = monotonic_now + self._failure_backoff_seconds
+                self._failure_messages[name] = message
+                failures.append((name, message))
+                continue
+            self._failure_until.pop(name, None)
+            self._failure_messages.pop(name, None)
+            if result is not None:
+                successful.append((name, result))
+        if not successful:
+            detail = "; ".join(f"{name}: {message}" for name, message in failures)
+            raise ForecastUnavailableError(
+                f"all forecast providers unavailable for {contract.event_key}: {detail}",
+                provider_global=True,
+            )
+
+        values: list[tuple[str, EnsembleForecast, Decimal, Decimal]] = []
+        for name, result in successful:
+            calibrated = self.calibrator.calibrate(
+                name,
+                contract.city,
+                result.lead_days,
+                result.raw_probability,
+            )
+            weight = self.weights.get(name, ONE)
+            if weight > ZERO:
+                values.append((name, result, calibrated, weight))
+        if not values:
+            raise ForecastUnavailableError("all forecast provider weights are zero")
+        total_weight = sum(item[3] for item in values)
+        weighted_probability = sum(
+            (
+                probability * weight / total_weight
+                for (_name, _result, probability, weight) in values
+            ),
+            ZERO,
+        )
+        weighted_mean = sum(
+            (
+                result.ensemble_mean_c * weight / total_weight
+                for (_name, result, _probability, weight) in values
+            ),
+            ZERO,
+        )
+        second_moment = sum(
+            (
+                (result.ensemble_std_c ** 2 + result.ensemble_mean_c ** 2)
+                * weight / total_weight
+                for (_name, result, _probability, weight) in values
+            ),
+            ZERO,
+        )
+        spread = (second_moment - weighted_mean ** 2).sqrt() if second_moment > weighted_mean ** 2 else ZERO
+        if len(values) == 1:
+            spread *= Decimal("1.35")
+        first = values[0][1]
+        return EnsembleForecast(
+            raw_probability=min(ONE, max(ZERO, weighted_probability)),
+            ensemble_mean_c=weighted_mean,
+            ensemble_std_c=spread,
+            n_members=sum(result.n_members for _name, result, _p, _w in values),
+            lead_days=first.lead_days,
+            model_count=sum(result.model_count for _name, result, _p, _w in values),
+            distribution_probability=min(ONE, max(ZERO, weighted_probability)),
+            source=self.name,
+            provider_count=len(values),
+            provider_names=tuple(name for name, _result, _p, _w in values),
+            provider_probabilities=tuple(
+                (name, result.raw_probability)
+                for name, result, _calibrated, _weight in values
+            ),
+            provider_failures=tuple(failures),
+            calibration_samples=self.calibrator.samples(),
+        )
+
+    def record_outcome(
+        self,
+        *,
+        city: str,
+        lead_days: int,
+        outcome: int,
+        provider_probabilities: Sequence[tuple[str, Decimal]],
+    ) -> None:
+        for source, probability in provider_probabilities:
+            self.calibrator.record(source, city, lead_days, probability, outcome)
 
 
 def _best_price(levels: Any, *, ask: bool) -> Decimal | None:
@@ -1456,6 +1914,8 @@ async def evaluate_weather_universe(
     markets_forecast_unavailable = 0
     markets_modeled = 0
     markets_side_evaluable = 0
+    provider_names: set[str] = set()
+    provider_failures: dict[str, str] = {}
     for market, contract, station_id in markets:
         try:
             try:
@@ -1490,6 +1950,8 @@ async def evaluate_weather_universe(
                     forecast_errors.append(message)
                     errors.append(message)
                 continue
+            provider_names.update(point_forecast.provider_names)
+            provider_failures.update(dict(point_forecast.provider_failures))
             markets_modeled += 1
             same_day_contract = _same_day_at_resolver(contract, now)
             observation = ObservationBoundResult(
@@ -1600,6 +2062,8 @@ async def evaluate_weather_universe(
         forecast_status = "unavailable"
     elif markets_forecast_unavailable:
         forecast_status = "degraded"
+    elif provider_failures:
+        forecast_status = "degraded"
     else:
         forecast_status = "available"
     events = _build_event_evaluations(discovered_events, components)
@@ -1616,4 +2080,6 @@ async def evaluate_weather_universe(
         markets_side_evaluable=markets_side_evaluable,
         forecast_status=forecast_status,
         forecast_errors=tuple(forecast_errors),
+        provider_names=tuple(sorted(provider_names)),
+        provider_failures=tuple(sorted(provider_failures.items())),
     )

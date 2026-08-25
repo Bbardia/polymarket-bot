@@ -21,9 +21,13 @@ from polymarket import AsyncPublicClient
 from .market_context import MarketContext
 from .paper_weather import (
     ForecastProvider,
+    MetNoLocationForecast,
     NOAAStationObservations,
+    NWSGridForecast,
     ObservationProvider,
     OpenMeteoEnsemble,
+    ProbabilityCalibration,
+    ResilientForecastEnsemble,
     WeatherEventEvaluation,
     WeatherEvaluation,
     WeatherPaperPolicy,
@@ -485,6 +489,8 @@ class _WeatherScanSummary:
     side_evaluable: int = 0
     forecast_status: str = "not_requested"
     forecast_errors: int = 0
+    provider_names: tuple[str, ...] = ()
+    provider_failures: tuple[tuple[str, str], ...] = ()
     candidates: int = 0
     paper_trades: int = 0
     errors: int = 0
@@ -526,7 +532,15 @@ class PaperWorker:
         self.store.flush_pending_audits(self.state)
         self.forecast = forecast
         if self.forecast is None and settings.weather_policy.enabled:
-            self.forecast = OpenMeteoEnsemble()
+            calibrator = ProbabilityCalibration(store.data_dir / "weather_calibration.json")
+            self.forecast = ResilientForecastEnsemble(
+                (
+                    OpenMeteoEnsemble(),
+                    MetNoLocationForecast(),
+                    NWSGridForecast(),
+                ),
+                calibrator=calibrator,
+            )
         self.observation_provider = observation_provider
         if (
             self.observation_provider is None
@@ -772,6 +786,18 @@ class PaperWorker:
             "ensemble_std_c": str(forecast.ensemble_std_c),
             "n_members": forecast.n_members,
             "model_count": forecast.model_count,
+            "forecast_source": forecast.source,
+            "provider_count": forecast.provider_count,
+            "provider_names": list(forecast.provider_names),
+            "provider_probabilities": {
+                source: str(probability)
+                for source, probability in forecast.provider_probabilities
+            },
+            "provider_failures": {
+                source: message
+                for source, message in forecast.provider_failures
+            },
+            "calibration_samples": forecast.calibration_samples,
             "effective_sample_size": str(decision.effective_sample_size),
             "lead_days": forecast.lead_days,
             "net_edge": str(decision.net_edge),
@@ -904,6 +930,15 @@ class PaperWorker:
                 "error": error,
                 "public_data_only": True,
             })
+        for source, message in result.provider_failures:
+            self.store.append_record(self.store.weather_scans_path, {
+                "scanned_at": scanned_at,
+                "status": "weather_provider_degraded",
+                "provider": source,
+                "error": message,
+                "provider_fallback_active": True,
+                "public_data_only": True,
+            })
 
         prospective_cycle = self.state.cycles + 1
         for event in result.events:
@@ -998,6 +1033,11 @@ class PaperWorker:
                     "all_in_cost": str(evaluation.all_in_cost),
                     "model_probability": str(evaluation.decision.calibrated_probability),
                     "raw_probability": str(evaluation.raw_probability),
+                    "provider_probabilities": {
+                        source: str(probability)
+                        for source, probability in evaluation.forecast.provider_probabilities
+                    },
+                    "lead_days": evaluation.forecast.lead_days,
                     "city": evaluation.city,
                     "target_date": evaluation.target_date,
                 }
@@ -1033,6 +1073,8 @@ class PaperWorker:
             side_evaluable=result.markets_side_evaluable,
             forecast_status=result.forecast_status,
             forecast_errors=len(result.forecast_errors),
+            provider_names=result.provider_names,
+            provider_failures=result.provider_failures,
             candidates=len(selected),
             paper_trades=paper_trades,
             errors=len(result.errors),
@@ -1082,6 +1124,24 @@ class PaperWorker:
                     brier = (probability - Decimal(outcome)) ** 2
                     self.state.weather_resolved += 1
                     self.state.weather_brier_sum += brier
+                    record_outcome = getattr(self.forecast, "record_outcome", None)
+                    if callable(record_outcome):
+                        provider_probabilities = tuple(
+                            (
+                                str(source),
+                                Decimal(str(probability)),
+                            )
+                            for source, probability in dict(
+                                position.get("provider_probabilities", {})
+                            ).items()
+                        )
+                        if provider_probabilities:
+                            record_outcome(
+                                city=str(position.get("city", "")),
+                                lead_days=int(position.get("lead_days", 0)),
+                                outcome=outcome,
+                                provider_probabilities=provider_probabilities,
+                            )
                 else:
                     payout = shares
                 pnl = payout - all_in_cost
@@ -1218,6 +1278,11 @@ class PaperWorker:
             "weather_side_evaluable_this_cycle": summary.weather_side_evaluable,
             "weather_forecast_status": summary.weather_forecast_status,
             "weather_forecast_errors_this_cycle": weather.forecast_errors,
+            "weather_provider_names_this_cycle": list(weather.provider_names),
+            "weather_provider_failures_this_cycle": {
+                source: message
+                for source, message in weather.provider_failures
+            },
             "candidates_this_cycle": summary.candidates,
             "weather_candidates_this_cycle": summary.weather_candidates,
             "weather_events_observed_this_cycle": summary.weather_events_observed,
