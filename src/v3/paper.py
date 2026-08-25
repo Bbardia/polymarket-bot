@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import signal
+import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -19,7 +21,10 @@ from polymarket import AsyncPublicClient
 from .market_context import MarketContext
 from .paper_weather import (
     ForecastProvider,
+    NOAAStationObservations,
+    ObservationProvider,
     OpenMeteoEnsemble,
+    WeatherEventEvaluation,
     WeatherEvaluation,
     WeatherPaperPolicy,
     evaluate_weather_universe,
@@ -106,15 +111,19 @@ class PaperSettings:
                 discovery_limit=int(os.getenv("V3_PAPER_WEATHER_DISCOVERY_LIMIT", "1500")),
                 market_limit=int(os.getenv("V3_PAPER_WEATHER_MARKET_LIMIT", "100")),
                 min_liquidity=_decimal_env("V3_PAPER_WEATHER_MIN_LIQUIDITY", "1000"),
-                min_price=_decimal_env("V3_PAPER_WEATHER_MIN_PRICE", "0.03"),
-                max_price=_decimal_env("V3_PAPER_WEATHER_MAX_PRICE", "0.20"),
-                max_order_notional=_decimal_env("V3_PAPER_WEATHER_MAX_ORDER_NOTIONAL", "1"),
+                min_price=_decimal_env("V3_PAPER_WEATHER_MIN_PRICE", "0.02"),
+                max_price=_decimal_env("V3_PAPER_WEATHER_MAX_PRICE", "0.98"),
+                max_order_notional=_decimal_env("V3_PAPER_WEATHER_MAX_ORDER_NOTIONAL", "5"),
                 max_open_positions=int(os.getenv("V3_PAPER_WEATHER_MAX_OPEN_POSITIONS", "5")),
                 base_edge=_decimal_env("V3_PAPER_WEATHER_BASE_EDGE", "0.03"),
                 intraclass_correlation=_decimal_env("V3_PAPER_WEATHER_ICC", "0.05"),
                 prior_strength=_decimal_env("V3_PAPER_WEATHER_PRIOR_STRENGTH", "10"),
                 fractional_kelly=_decimal_env("V3_PAPER_WEATHER_FRACTIONAL_KELLY", "0.05"),
                 uncertainty_z=_decimal_env("V3_PAPER_WEATHER_UNCERTAINTY_Z", "1"),
+                observations_enabled=_env_bool(
+                    "V3_PAPER_WEATHER_OBSERVATIONS_ENABLED",
+                    True,
+                ),
             ),
         )
 
@@ -147,6 +156,7 @@ class PaperState:
     traded_strategy_keys: set[str] = field(default_factory=set)
     weather_resolved: int = 0
     weather_brier_sum: Decimal = ZERO
+    pending_audits: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @classmethod
     def new(cls, initial_cash: Decimal) -> "PaperState":
@@ -170,6 +180,10 @@ class PaperState:
             },
             weather_resolved=int(payload.get("weather_resolved", 0)),
             weather_brier_sum=Decimal(str(payload.get("weather_brier_sum", "0"))),
+            pending_audits={
+                str(key): dict(value)
+                for key, value in payload.get("pending_audits", {}).items()
+            },
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -186,6 +200,7 @@ class PaperState:
             "traded_strategy_keys": sorted(self.traded_strategy_keys),
             "weather_resolved": self.weather_resolved,
             "weather_brier_sum": str(self.weather_brier_sum),
+            "pending_audits": self.pending_audits,
         }
 
 
@@ -196,10 +211,12 @@ class PaperStore:
         self.status_path = self.data_dir / "status.json"
         self.scans_path = self.data_dir / "scans.jsonl"
         self.weather_scans_path = self.data_dir / "weather_scans.jsonl"
+        self.weather_events_path = self.data_dir / "weather_events.jsonl"
         self.candidates_path = self.data_dir / "candidates.jsonl"
         self.trades_path = self.data_dir / "paper_trades.jsonl"
         self.settlements_path = self.data_dir / "settlements.jsonl"
         self.pid_path = self.data_dir / "worker.pid"
+        self._unique_ids: dict[tuple[Path, str], set[str]] = {}
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
@@ -210,26 +227,106 @@ class PaperStore:
 
     def _write_json(self, path: Path, payload: Mapping[str, Any]) -> None:
         temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(payload, sort_keys=True, indent=2, default=self._json_default) + "\n",
-            encoding="utf-8",
+        serialized = (
+            json.dumps(payload, sort_keys=True, indent=2, default=self._json_default)
+            + "\n"
         )
-        temporary.replace(path)
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
     def append_record(self, path: Path, payload: Mapping[str, Any]) -> None:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True, default=self._json_default) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        for (indexed_path, id_field), ids in self._unique_ids.items():
+            if indexed_path == path and id_field in payload:
+                ids.add(str(payload[id_field]))
+
+    def append_unique_record(
+        self,
+        path: Path,
+        payload: Mapping[str, Any],
+        *,
+        id_field: str,
+    ) -> bool:
+        record_id = str(payload[id_field])
+        index_key = (path, id_field)
+        existing_ids = self._unique_ids.get(index_key)
+        if existing_ids is None:
+            existing_ids = {
+                str(row[id_field])
+                for row in self.read_records(path)
+                if id_field in row
+            }
+            self._unique_ids[index_key] = existing_ids
+        if record_id in existing_ids:
+            return False
+        self.append_record(path, payload)
+        existing_ids.add(record_id)
+        return True
 
     def read_records(self, path: Path) -> tuple[dict[str, Any], ...]:
         if not path.is_file():
             return ()
         rows: list[dict[str, Any]] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
+        raw = path.read_bytes()
+        lines = raw.splitlines(keepends=True)
+        for index, raw_line in enumerate(lines):
+            if not raw_line.strip():
+                continue
+            try:
+                line = raw_line.decode("utf-8")
                 value = json.loads(line)
-                if not isinstance(value, dict):
-                    raise ValueError(f"paper record must be an object: {path}")
-                rows.append(value)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                final_unterminated = (
+                    index == len(lines) - 1
+                    and not raw_line.endswith((b"\n", b"\r"))
+                )
+                if not final_unterminated:
+                    raise ValueError(
+                        f"corrupt paper JSONL record at {path}:{index + 1}"
+                    ) from exc
+                # A crash can tear only the final append. Preserve that tail
+                # for diagnosis, truncate it durably, then let the state outbox
+                # replay the missing audit idempotently.
+                quarantine = path.with_suffix(path.suffix + ".torn")
+                with quarantine.open("ab") as handle:
+                    handle.write(raw_line)
+                    handle.write(b"\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                temporary = path.with_suffix(path.suffix + ".repair.tmp")
+                with temporary.open("wb") as handle:
+                    handle.write(b"".join(lines[:index]))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, path)
+                directory_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+                break
+            if not isinstance(value, dict):
+                raise ValueError(f"paper record must be an object: {path}")
+            rows.append(value)
+            if index == len(lines) - 1 and not raw_line.endswith((b"\n", b"\r")):
+                # The JSON object reached disk but its record delimiter did
+                # not. Repair the boundary durably before a future append can
+                # concatenate another object onto this valid one.
+                with path.open("ab") as handle:
+                    handle.write(b"\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
         return tuple(rows)
 
     def load_state(self, initial_cash: Decimal = ZERO) -> PaperState:
@@ -242,6 +339,67 @@ class PaperStore:
 
     def save_state(self, state: PaperState) -> None:
         self._write_json(self.state_path, state.to_json())
+
+    def _audit_path(self, stream: str) -> Path:
+        paths = {
+            "paper_trades": self.trades_path,
+            "settlements": self.settlements_path,
+        }
+        try:
+            return paths[stream]
+        except KeyError as exc:
+            raise ValueError(f"unknown paper audit stream: {stream}") from exc
+
+    def flush_pending_audits(self, state: PaperState) -> None:
+        if not state.pending_audits:
+            return
+        pending = {
+            audit_id: dict(record)
+            for audit_id, record in state.pending_audits.items()
+        }
+        for audit_id in sorted(pending):
+            record = pending[audit_id]
+            stream = str(record.get("stream", ""))
+            raw_payload = record.get("payload")
+            if not isinstance(raw_payload, dict):
+                raise ValueError(f"pending audit {audit_id} has no object payload")
+            payload = dict(raw_payload)
+            if str(payload.get("audit_id", "")) != audit_id:
+                raise ValueError(f"pending audit {audit_id} has a mismatched payload id")
+            self.append_unique_record(
+                self._audit_path(stream),
+                payload,
+                id_field="audit_id",
+            )
+
+        state.pending_audits = {}
+        try:
+            self.save_state(state)
+        except Exception:
+            state.pending_audits = pending
+            raise
+
+    def commit_with_audit(
+        self,
+        state: PaperState,
+        *,
+        audit_id: str,
+        stream: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        if not audit_id:
+            raise ValueError("paper audit id is required")
+        audit_payload = dict(payload)
+        audit_payload["audit_id"] = audit_id
+        pending_record = {"stream": stream, "payload": audit_payload}
+        existing = state.pending_audits.get(audit_id)
+        if existing is not None and existing != pending_record:
+            raise ValueError(f"paper audit id collision: {audit_id}")
+        state.pending_audits[audit_id] = pending_record
+        # The business mutation and its pending audit are durable together.
+        self.save_state(state)
+        # JSONL append is fsync'd and idempotent before the outbox is cleared.
+        self.flush_pending_audits(state)
 
     def write_status(self, payload: Mapping[str, Any]) -> None:
         self._write_json(self.status_path, payload)
@@ -299,13 +457,42 @@ class CycleSummary:
     markets_discovered: int
     markets_scanned: int
     weather_markets_scanned: int
+    weather_markets_discovered: int
+    weather_forecast_unavailable: int
+    weather_markets_modeled: int
+    weather_side_evaluable: int
+    weather_forecast_status: str
     candidates: int
     weather_candidates: int
+    weather_events_observed: int
+    weather_complete_partitions: int
+    weather_indicative_profitable_baskets: int
+    weather_observations_available: int
+    weather_observation_errors: int
     paper_trades: int
     settlements: int
     errors: int
     cash: Decimal
     open_positions: int
+
+
+@dataclass(frozen=True)
+class _WeatherScanSummary:
+    markets_evaluated: int = 0
+    markets_discovered: int = 0
+    forecast_unavailable: int = 0
+    markets_modeled: int = 0
+    side_evaluable: int = 0
+    forecast_status: str = "not_requested"
+    forecast_errors: int = 0
+    candidates: int = 0
+    paper_trades: int = 0
+    errors: int = 0
+    events_observed: int = 0
+    complete_partitions: int = 0
+    indicative_profitable_baskets: int = 0
+    observations_available: int = 0
+    observation_errors: int = 0
 
 
 class PaperPublicClient(Protocol):
@@ -326,6 +513,7 @@ class PaperWorker:
         settings: PaperSettings,
         store: PaperStore,
         forecast: ForecastProvider | None = None,
+        observation_provider: ObservationProvider | None = None,
     ) -> None:
         errors = settings.safety_errors()
         if errors:
@@ -334,9 +522,18 @@ class PaperWorker:
         self.settings = settings
         self.store = store
         self.state = store.load_state(settings.initial_cash)
+        # Finish any state-first audit writes left by a prior crash before work.
+        self.store.flush_pending_audits(self.state)
         self.forecast = forecast
         if self.forecast is None and settings.weather_policy.enabled:
             self.forecast = OpenMeteoEnsemble()
+        self.observation_provider = observation_provider
+        if (
+            self.observation_provider is None
+            and settings.weather_policy.enabled
+            and settings.weather_policy.observations_enabled
+        ):
+            self.observation_provider = NOAAStationObservations()
 
     async def _discover_markets(self) -> tuple[Any, ...]:
         markets: list[Any] = []
@@ -500,16 +697,18 @@ class PaperWorker:
                     "no_token_id": no_token,
                 }
                 self.state.total_paper_trades += 1
-                # Persist the position before its audit record so a crash can
-                # never cause the same condition to be paper-traded twice.
-                self.store.save_state(self.state)
                 trade = dict(candidate)
                 trade.update({
                     "paper_executed": True,
                     "paper_reason": paper_reason,
                     "paper_cash_after": str(self.state.cash),
                 })
-                self.store.append_record(self.store.trades_path, trade)
+                self.store.commit_with_audit(
+                    self.state,
+                    audit_id=str(candidate["candidate_id"]),
+                    stream="paper_trades",
+                    payload=trade,
+                )
         candidate.update({
             "paper_executed": paper_executed,
             "paper_reason": paper_reason,
@@ -518,6 +717,25 @@ class PaperWorker:
         self.store.append_record(self.store.candidates_path, candidate)
         row.update({"paper_executed": paper_executed, "paper_reason": paper_reason})
         return row, True, paper_executed
+
+    @staticmethod
+    def _maker_shadow_payload(quote: Any) -> dict[str, Any] | None:
+        if quote is None:
+            return None
+        return {
+            "side": quote.side,
+            "price": str(quote.price),
+            "size": str(quote.size),
+            "queue_ahead": str(quote.queue_ahead),
+            "expected_probability": str(quote.expected_probability),
+            "expected_edge": str(quote.expected_edge),
+            "best_bid": str(quote.best_bid),
+            "best_ask": str(quote.best_ask),
+            "fill_status": quote.fill_status,
+            "execution_status": quote.execution_status,
+            "cash_delta": str(quote.cash_delta),
+            "inventory_delta": str(quote.inventory_delta),
+        }
 
     @staticmethod
     def _weather_row(evaluation: WeatherEvaluation, scanned_at: str) -> dict[str, Any]:
@@ -532,7 +750,15 @@ class PaperWorker:
             "question": evaluation.question,
             "city": evaluation.city,
             "target_date": evaluation.target_date,
-            "target_c": str(evaluation.target_c),
+            "target_c": None if evaluation.target_c is None else str(evaluation.target_c),
+            "unit": evaluation.unit,
+            "display_lower": (
+                None if evaluation.display_lower is None else str(evaluation.display_lower)
+            ),
+            "display_upper": (
+                None if evaluation.display_upper is None else str(evaluation.display_upper)
+            ),
+            "contract_kind": evaluation.contract_kind,
             "side": evaluation.side,
             "token_id": evaluation.token_id,
             "best_bid": str(evaluation.bid),
@@ -551,10 +777,92 @@ class PaperWorker:
             "net_edge": str(decision.net_edge),
             "minimum_edge": str(decision.minimum_edge),
             "kelly_fraction": str(decision.kelly_fraction),
+            "same_day_contract": evaluation.same_day_contract,
+            "same_day_observation_available": (
+                evaluation.same_day_observation_available
+            ),
+            "current_high_display": (
+                None
+                if evaluation.current_high_display is None
+                else str(evaluation.current_high_display)
+            ),
+            "observation_error": evaluation.observation_error,
+            "same_day_observation_status": evaluation.same_day_observation_status,
+            "maker_shadow": PaperWorker._maker_shadow_payload(evaluation.maker_shadow),
             "tradeable": evaluation.paper_tradeable,
             "reason": evaluation.paper_reason,
             "negative_risk_directional_only": True,
             "public_data_only": True,
+        }
+
+    @staticmethod
+    def _weather_event_row(
+        event: WeatherEventEvaluation,
+        *,
+        event_id: str,
+        scanned_at: str,
+    ) -> dict[str, Any]:
+        surface = event.surface
+        contracts = []
+        maker_shadows = []
+        for contract in event.contracts:
+            maker = PaperWorker._maker_shadow_payload(contract.maker_shadow)
+            contracts.append({
+                "market_id": contract.market_id,
+                "condition_id": contract.condition_id,
+                "question": contract.question,
+                "yes_token_id": contract.yes_token_id,
+                "contract_kind": contract.contract_kind,
+                "display_lower": (
+                    None if contract.display_lower is None else str(contract.display_lower)
+                ),
+                "display_upper": (
+                    None if contract.display_upper is None else str(contract.display_upper)
+                ),
+                "model_probability": (
+                    None
+                    if contract.model_probability is None
+                    else str(contract.model_probability)
+                ),
+                "maker_shadow": maker,
+            })
+            if maker is not None:
+                maker_shadows.append(maker)
+        return {
+            "event_id": event_id,
+            "scanned_at": scanned_at,
+            "event_key": event.event_key,
+            "unit": event.unit,
+            "contracts": contracts,
+            "model_probability_sum": str(surface.model_probability_sum),
+            "model_probability_residual": str(surface.model_probability_residual),
+            "bucket_count": surface.bucket_count,
+            "complete_partition": surface.complete_partition,
+            "partition_reason": surface.reason,
+            "partition_violations": list(surface.partition_violations),
+            "monotonic_violations": list(surface.monotonic_violations),
+            "common_shares": str(surface.common_shares),
+            "basket_executable": surface.executable,
+            "basket_gross_cost": str(surface.gross_cost),
+            "basket_fees": str(surface.fees),
+            "basket_payout": str(surface.payout),
+            "basket_net_profit": str(surface.net_profit),
+            "indicative_profitable_basket": bool(
+                surface.tradeable and event.event_membership_verified
+            ),
+            "unverified_cross_market_hypothesis": bool(
+                surface.tradeable and not event.event_membership_verified
+            ),
+            "maker_shadows": maker_shadows,
+            "negative_risk_verified": event.negative_risk_verified,
+            "resolution_station_verified": event.resolution_station_verified,
+            "unit_verified": event.unit_verified,
+            "parsed_event_membership_verified": event.parsed_event_membership_verified,
+            "event_membership_verified": event.event_membership_verified,
+            "public_data_only": event.public_data_only,
+            "execution_status": event.execution_status,
+            "cash_delta": "0",
+            "inventory_delta": "0",
         }
 
     async def _scan_weather(
@@ -562,9 +870,9 @@ class PaperWorker:
         *,
         now: datetime,
         scanned_at: str,
-    ) -> tuple[int, int, int, int]:
+    ) -> _WeatherScanSummary:
         if not self.settings.weather_policy.enabled:
-            return 0, 0, 0, 0
+            return _WeatherScanSummary()
         if self.forecast is None:
             raise RuntimeError("weather forecast provider is not initialized")
         try:
@@ -572,6 +880,7 @@ class PaperWorker:
                 client=self.client,
                 forecast=self.forecast,
                 policy=self.settings.weather_policy,
+                observation_provider=self.observation_provider,
                 now=now,
             )
         except Exception as exc:
@@ -581,15 +890,36 @@ class PaperWorker:
                 "error": f"{type(exc).__name__}: {exc}",
                 "public_data_only": True,
             })
-            return 0, 0, 0, 1
+            return _WeatherScanSummary(errors=1)
 
+        forecast_errors = set(result.forecast_errors)
         for error in result.errors:
             self.store.append_record(self.store.weather_scans_path, {
                 "scanned_at": scanned_at,
-                "status": "weather_market_error",
+                "status": (
+                    "weather_forecast_error"
+                    if error in forecast_errors
+                    else "weather_market_error"
+                ),
                 "error": error,
                 "public_data_only": True,
             })
+
+        prospective_cycle = self.state.cycles + 1
+        for event in result.events:
+            event_id = (
+                f"{self.state.started_at}:{prospective_cycle}:"
+                f"{event.event_key}:{event.unit}"
+            )
+            self.store.append_unique_record(
+                self.store.weather_events_path,
+                self._weather_event_row(
+                    event,
+                    event_id=event_id,
+                    scanned_at=scanned_at,
+                ),
+                id_field="event_id",
+            )
 
         selected: dict[str, WeatherEvaluation] = {}
         for evaluation in result.evaluations:
@@ -672,14 +1002,18 @@ class PaperWorker:
                     "target_date": evaluation.target_date,
                 }
                 self.state.total_paper_trades += 1
-                self.store.save_state(self.state)
                 trade = dict(candidate)
                 trade.update({
                     "paper_executed": True,
                     "paper_reason": paper_reason,
                     "paper_cash_after": str(self.state.cash),
                 })
-                self.store.append_record(self.store.trades_path, trade)
+                self.store.commit_with_audit(
+                    self.state,
+                    audit_id=str(candidate["candidate_id"]),
+                    stream="paper_trades",
+                    payload=trade,
+                )
             candidate.update({
                 "paper_executed": paper_executed,
                 "paper_reason": paper_reason,
@@ -691,11 +1025,27 @@ class PaperWorker:
                 "paper_reason": paper_reason,
             })
             self.store.append_record(self.store.weather_scans_path, row)
-        return (
-            result.markets_evaluated,
-            len(selected),
-            paper_trades,
-            len(result.errors),
+        return _WeatherScanSummary(
+            markets_evaluated=result.markets_evaluated,
+            markets_discovered=result.markets_discovered,
+            forecast_unavailable=result.markets_forecast_unavailable,
+            markets_modeled=result.markets_modeled,
+            side_evaluable=result.markets_side_evaluable,
+            forecast_status=result.forecast_status,
+            forecast_errors=len(result.forecast_errors),
+            candidates=len(selected),
+            paper_trades=paper_trades,
+            errors=len(result.errors),
+            events_observed=len(result.events),
+            complete_partitions=sum(
+                event.surface.complete_partition for event in result.events
+            ),
+            indicative_profitable_baskets=sum(
+                event.surface.tradeable and event.event_membership_verified
+                for event in result.events
+            ),
+            observations_available=result.observations_available,
+            observation_errors=result.observation_errors,
         )
 
     async def _settle_positions(self, settled_at: str) -> tuple[int, int]:
@@ -738,10 +1088,7 @@ class PaperWorker:
                 self.state.cash += payout
                 self.state.realized_pnl += pnl
                 del self.state.open_positions[condition_id]
-                # Persist removal before the settlement record so restart
-                # cannot credit the same payout twice.
-                self.store.save_state(self.state)
-                self.store.append_record(self.store.settlements_path, {
+                settlement = {
                     "settled_at": settled_at,
                     "condition_id": condition_id,
                     "market_id": str(position["market_id"]),
@@ -752,7 +1099,13 @@ class PaperWorker:
                     "brier_score": None if brier is None else str(brier),
                     "paper_cash_after": str(self.state.cash),
                     "public_data_only": True,
-                })
+                }
+                self.store.commit_with_audit(
+                    self.state,
+                    audit_id=f"settlement:{condition_id}",
+                    stream="settlements",
+                    payload=settlement,
+                )
                 settled += 1
             except Exception as exc:
                 errors += 1
@@ -806,12 +1159,10 @@ class PaperWorker:
                     "public_data_only": True,
                 })
 
-        weather_scanned, weather_candidates, weather_trades, weather_errors = (
-            await self._scan_weather(now=now, scanned_at=scanned_at)
-        )
-        candidates += weather_candidates
-        paper_trades += weather_trades
-        errors += weather_errors
+        weather = await self._scan_weather(now=now, scanned_at=scanned_at)
+        candidates += weather.candidates
+        paper_trades += weather.paper_trades
+        errors += weather.errors
 
         self.state.cycles += 1
         self.state.total_candidates += candidates
@@ -820,9 +1171,21 @@ class PaperWorker:
             cycle=self.state.cycles,
             markets_discovered=len(markets),
             markets_scanned=scanned,
-            weather_markets_scanned=weather_scanned,
+            weather_markets_scanned=weather.markets_evaluated,
+            weather_markets_discovered=weather.markets_discovered,
+            weather_forecast_unavailable=weather.forecast_unavailable,
+            weather_markets_modeled=weather.markets_modeled,
+            weather_side_evaluable=weather.side_evaluable,
+            weather_forecast_status=weather.forecast_status,
             candidates=candidates,
-            weather_candidates=weather_candidates,
+            weather_candidates=weather.candidates,
+            weather_events_observed=weather.events_observed,
+            weather_complete_partitions=weather.complete_partitions,
+            weather_indicative_profitable_baskets=(
+                weather.indicative_profitable_baskets
+            ),
+            weather_observations_available=weather.observations_available,
+            weather_observation_errors=weather.observation_errors,
             paper_trades=paper_trades,
             settlements=settlements,
             errors=errors,
@@ -847,8 +1210,29 @@ class PaperWorker:
             "markets_discovered": summary.markets_discovered,
             "markets_scanned": summary.markets_scanned,
             "weather_markets_scanned": summary.weather_markets_scanned,
+            "weather_markets_discovered": summary.weather_markets_discovered,
+            "weather_forecast_unavailable_this_cycle": (
+                summary.weather_forecast_unavailable
+            ),
+            "weather_markets_modeled_this_cycle": summary.weather_markets_modeled,
+            "weather_side_evaluable_this_cycle": summary.weather_side_evaluable,
+            "weather_forecast_status": summary.weather_forecast_status,
+            "weather_forecast_errors_this_cycle": weather.forecast_errors,
             "candidates_this_cycle": summary.candidates,
             "weather_candidates_this_cycle": summary.weather_candidates,
+            "weather_events_observed_this_cycle": summary.weather_events_observed,
+            "weather_complete_partitions_this_cycle": (
+                summary.weather_complete_partitions
+            ),
+            "weather_indicative_profitable_baskets_this_cycle": (
+                summary.weather_indicative_profitable_baskets
+            ),
+            "weather_observations_available_this_cycle": (
+                summary.weather_observations_available
+            ),
+            "weather_observation_errors_this_cycle": (
+                summary.weather_observation_errors
+            ),
             "paper_trades_this_cycle": summary.paper_trades,
             "settlements_this_cycle": summary.settlements,
             "errors_this_cycle": summary.errors,
@@ -885,6 +1269,7 @@ async def run_paper(
 
     store = PaperStore(settings.data_dir)
     store.acquire()
+    client: PaperPublicClient | None = None
     try:
         client = client_factory()
         worker = PaperWorker(client=client, settings=settings, store=store)
@@ -928,10 +1313,36 @@ async def run_paper(
         store.write_status(status)
         raise
     finally:
-        store.release()
-        status = store.read_status()
-        status.update({"running": False, "stopped_at": _utc_now()})
-        store.write_status(status)
+        active_exception = sys.exc_info()[0] is not None
+        close_error: Exception | None = None
+        try:
+            if client is not None:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+        except Exception as exc:
+            close_error = exc
+        finally:
+            try:
+                status = store.read_status()
+                status.update({"running": False, "stopped_at": _utc_now()})
+                if close_error is not None:
+                    status.update({
+                        "healthy": False,
+                        "last_error": (
+                            f"public client cleanup failed: "
+                            f"{type(close_error).__name__}: {close_error}"
+                        ),
+                    })
+                store.write_status(status)
+            finally:
+                # Publish final status while still owning the PID lock so an
+                # exiting worker cannot overwrite a replacement worker.
+                store.release()
+        if close_error is not None and not active_exception:
+            raise close_error
 
 
 def paper_status(settings: PaperSettings) -> dict[str, Any]:
