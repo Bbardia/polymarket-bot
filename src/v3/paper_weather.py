@@ -469,7 +469,7 @@ class WeatherPaperPolicy:
     min_price: Decimal = Decimal("0.02")
     max_price: Decimal = Decimal("0.98")
     max_order_notional: Decimal = Decimal("5")
-    max_open_positions: int = 5
+    max_open_positions: int = 15
     base_edge: Decimal = Decimal("0.03")
     intraclass_correlation: Decimal = Decimal("0.05")
     prior_strength: Decimal = Decimal("10")
@@ -488,8 +488,8 @@ class WeatherPaperPolicy:
             raise ValueError("weather price range must be inside (0, 1)")
         if self.max_order_notional <= ZERO:
             raise ValueError("weather paper order cap must be positive")
-        if not (1 <= self.max_open_positions <= 5):
-            raise ValueError("weather paper position cap must be in [1, 5]")
+        if not (1 <= self.max_open_positions <= 15):
+            raise ValueError("weather paper position cap must be in [1, 15]")
         if self.base_edge < ZERO or self.uncertainty_z < ZERO:
             raise ValueError("weather edge and uncertainty settings cannot be negative")
         if not (ZERO <= self.intraclass_correlation < ONE):

@@ -463,7 +463,8 @@ def test_open_meteo_rejects_wrong_response_date_and_units():
 
 def test_weather_policy_caps_discovery_positions_and_kelly_inputs():
     with pytest.raises(ValueError, match="position cap"):
-        WeatherPaperPolicy(max_open_positions=6)
+        WeatherPaperPolicy(max_open_positions=16)
+    assert WeatherPaperPolicy(max_open_positions=15).max_open_positions == 15
     with pytest.raises(ValueError, match="discovery limit"):
         WeatherPaperPolicy(discovery_limit=5_001)
     with pytest.raises(ValueError, match="fractional Kelly"):
