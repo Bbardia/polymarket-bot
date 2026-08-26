@@ -17,6 +17,9 @@ research compatibility; its live path is permanently disabled.
   forecasts when coverage exists. A provider outage is recorded as degraded
   telemetry; remaining sources continue with wider uncertainty. Resolved paper
   outcomes update a persistent, conservative per-source/city/horizon calibrator.
+- Weather market discovery uses read-only Gamma offset pagination because the
+  official SDK's Weather-tag keyset continuation is currently Cloudflare-blocked;
+  successive pages are deduplicated and bounded by the existing scan limits.
 - Authenticated account reads and live-capable client construction are lazy and
   use separate gates; reconciliation can run while paper mode remains enabled.
 - User/market stream events can be normalized, durably replayed, deduplicated,

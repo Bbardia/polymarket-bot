@@ -25,6 +25,7 @@ from .paper_weather import (
     NOAAStationObservations,
     NWSGridForecast,
     ObservationProvider,
+    OffsetWeatherPublicClient,
     OpenMeteoEnsemble,
     ProbabilityCalibration,
     ResilientForecastEnsemble,
@@ -520,11 +521,13 @@ class PaperWorker:
         store: PaperStore,
         forecast: ForecastProvider | None = None,
         observation_provider: ObservationProvider | None = None,
+        weather_client: Any | None = None,
     ) -> None:
         errors = settings.safety_errors()
         if errors:
             raise RuntimeError("Paper worker refused: " + "; ".join(errors))
         self.client = client
+        self.weather_client = weather_client or client
         self.settings = settings
         self.store = store
         self.state = store.load_state(settings.initial_cash)
@@ -903,7 +906,7 @@ class PaperWorker:
             raise RuntimeError("weather forecast provider is not initialized")
         try:
             result = await evaluate_weather_universe(
-                client=self.client,
+                client=self.weather_client,
                 forecast=self.forecast,
                 policy=self.settings.weather_policy,
                 observation_provider=self.observation_provider,
@@ -1337,7 +1340,12 @@ async def run_paper(
     client: PaperPublicClient | None = None
     try:
         client = client_factory()
-        worker = PaperWorker(client=client, settings=settings, store=store)
+        worker = PaperWorker(
+            client=client,
+            settings=settings,
+            store=store,
+            weather_client=OffsetWeatherPublicClient(client),
+        )
         stop_event = asyncio.Event()
         loop = asyncio.get_running_loop()
         for signum in (signal.SIGINT, signal.SIGTERM):

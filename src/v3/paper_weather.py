@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
+from polymarket.models.gamma.market import Market
 
 from .market_context import MarketContext
 from .maker_shadow import MakerShadowQuote, propose_buy_quote
@@ -585,6 +586,128 @@ class WeatherPublicClient(Protocol):
     def list_markets(self, **kwargs: Any) -> Any: ...
 
     async def get_order_books(self, *, token_ids: list[str]) -> tuple[Any, ...]: ...
+
+
+GammaJsonFetcher = Callable[..., Any]
+
+
+def _default_gamma_fetch_json(
+    url: str,
+    *,
+    params: Mapping[str, Any],
+    headers: Mapping[str, str],
+    timeout: float,
+) -> Any:
+    response = requests.get(url, params=params, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+class _OffsetMarketPaginator:
+    def __init__(
+        self,
+        *,
+        fetch_json: GammaJsonFetcher,
+        params: Mapping[str, Any],
+        page_size: int,
+        timeout_seconds: float,
+        user_agent: str,
+    ) -> None:
+        self._fetch_json = fetch_json
+        self._params = dict(params)
+        self._page_size = page_size
+        self._timeout_seconds = timeout_seconds
+        self._user_agent = user_agent
+
+    def iter_items(self):
+        async def iterate():
+            offset = 0
+            seen_ids: set[str] = set()
+            while True:
+                params = dict(self._params)
+                params.update({"limit": self._page_size, "offset": offset})
+                payload = await asyncio.to_thread(
+                    self._fetch_json,
+                    "https://gamma-api.polymarket.com/markets",
+                    params=params,
+                    headers={
+                        "User-Agent": self._user_agent,
+                        "Accept": "application/json",
+                    },
+                    timeout=self._timeout_seconds,
+                )
+                markets = Market.parse_response_list(payload)
+                if not markets:
+                    return
+                yielded = 0
+                for market in markets:
+                    market_id = str(getattr(market, "id", ""))
+                    if market_id and market_id in seen_ids:
+                        continue
+                    if market_id:
+                        seen_ids.add(market_id)
+                    yielded += 1
+                    yield market
+                offset += len(markets)
+                if len(markets) < self._page_size or yielded == 0:
+                    return
+
+        return iterate()
+
+
+class OffsetWeatherPublicClient:
+    """Read-only weather market client using Gamma offset pagination.
+
+    The official SDK's market paginator uses Gamma keyset cursors. Gamma's
+    Weather-tag cursor continuation is currently rejected by Cloudflare, while
+    the offset endpoint remains available. This adapter changes only the weather
+    discovery route; tags and order books still use the official public client.
+    """
+
+    def __init__(
+        self,
+        public_client: WeatherPublicClient,
+        *,
+        fetch_json: GammaJsonFetcher = _default_gamma_fetch_json,
+        page_size: int = 100,
+        timeout_seconds: float = 20,
+        user_agent: str = "polymarket-bot-weather-research/4.1",
+    ) -> None:
+        if not 1 <= page_size <= 100:
+            raise ValueError("Gamma offset page size must be in [1, 100]")
+        if timeout_seconds <= 0 or not user_agent.strip():
+            raise ValueError("invalid Gamma offset client settings")
+        self._public_client = public_client
+        self._fetch_json = fetch_json
+        self._page_size = page_size
+        self._timeout_seconds = timeout_seconds
+        self._user_agent = user_agent
+
+    async def get_tag(self, *, slug: str) -> Any:
+        return await self._public_client.get_tag(slug=slug)
+
+    async def get_order_books(self, *, token_ids: list[str]) -> tuple[Any, ...]:
+        return await self._public_client.get_order_books(token_ids=token_ids)
+
+    def list_markets(self, **kwargs: Any) -> _OffsetMarketPaginator:
+        page_size = int(kwargs.pop("page_size", self._page_size))
+        if not 1 <= page_size <= 100:
+            raise ValueError("Gamma offset page size must be in [1, 100]")
+        params: dict[str, Any] = {}
+        for key, value in kwargs.items():
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                params[key] = "true" if value else "false"
+            else:
+                params[key] = value.isoformat() if isinstance(value, datetime) else value
+        return _OffsetMarketPaginator(
+            fetch_json=self._fetch_json,
+            params=params,
+            page_size=page_size,
+            timeout_seconds=self._timeout_seconds,
+            user_agent=self._user_agent,
+        )
 
 
 class ForecastProvider(Protocol):

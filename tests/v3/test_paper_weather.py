@@ -16,6 +16,7 @@ from src.v3.paper_weather import (
     NWSGridForecast,
     ObservationBoundResult,
     ObservationUnavailableError,
+    OffsetWeatherPublicClient,
     OpenMeteoEnsemble,
     ProbabilityCalibration,
     ResilientForecastEnsemble,
@@ -1539,3 +1540,41 @@ def test_resilient_ensemble_reports_total_outage():
     assert contract is not None
     with pytest.raises(ForecastUnavailableError, match="all forecast providers unavailable"):
         asyncio.run(ResilientForecastEnsemble([Down()]).forecast(contract))
+
+
+def test_offset_weather_client_traverses_following_pages(monkeypatch):
+    calls = []
+    payloads = {
+        0: [{"id": "weather-1"}, {"id": "weather-2"}],
+        2: [{"id": "weather-3"}],
+    }
+
+    def fetch_json(url, *, params, headers, timeout):
+        assert url == "https://gamma-api.polymarket.com/markets"
+        calls.append(dict(params))
+        return payloads.get(int(params["offset"]), [])
+
+    def parse_response_list(cls, data):
+        return tuple(SimpleNamespace(id=item["id"]) for item in data)
+
+    monkeypatch.setattr(
+        "src.v3.paper_weather.Market.parse_response_list",
+        classmethod(parse_response_list),
+    )
+    wrapper = OffsetWeatherPublicClient(
+        SimpleNamespace(),
+        fetch_json=fetch_json,
+        page_size=2,
+    )
+
+    async def collect():
+        return [item.id async for item in wrapper.list_markets(
+            tag_id=84,
+            closed=False,
+            page_size=2,
+        ).iter_items()]
+
+    assert asyncio.run(collect()) == ["weather-1", "weather-2", "weather-3"]
+    assert [call["offset"] for call in calls] == [0, 2]
+    assert all(call["tag_id"] == 84 for call in calls)
+    assert all(call["closed"] == "false" for call in calls)
