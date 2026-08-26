@@ -147,7 +147,7 @@ separately labeled strategies:
   successful public NOAA observation exists for that exact station and local
   date. The paper-only lane uses a 3% base edge plus
   spread/uncertainty/lead-time guards, caps each simulated order at `5 pUSD`,
-  and allows at most one bucket per city/date and five concurrent weather
+  and allows at most one bucket per city/date and fifteen concurrent weather
   positions. Maker quotes remain explicitly unsubmitted. Mechanically complete
   city/date baskets are labeled unverified cross-market hypotheses until common
   event membership is proven; they are never candidates and never change state.

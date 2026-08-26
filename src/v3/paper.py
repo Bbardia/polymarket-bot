@@ -119,7 +119,7 @@ class PaperSettings:
                 min_price=_decimal_env("V3_PAPER_WEATHER_MIN_PRICE", "0.02"),
                 max_price=_decimal_env("V3_PAPER_WEATHER_MAX_PRICE", "0.98"),
                 max_order_notional=_decimal_env("V3_PAPER_WEATHER_MAX_ORDER_NOTIONAL", "5"),
-                max_open_positions=int(os.getenv("V3_PAPER_WEATHER_MAX_OPEN_POSITIONS", "5")),
+                max_open_positions=int(os.getenv("V3_PAPER_WEATHER_MAX_OPEN_POSITIONS", "15")),
                 base_edge=_decimal_env("V3_PAPER_WEATHER_BASE_EDGE", "0.03"),
                 intraclass_correlation=_decimal_env("V3_PAPER_WEATHER_ICC", "0.05"),
                 prior_strength=_decimal_env("V3_PAPER_WEATHER_PRIOR_STRENGTH", "10"),
