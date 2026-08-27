@@ -17,7 +17,7 @@ from src.v3.paper_weather import (
     ObservationBoundResult,
     ObservationUnavailableError,
     OffsetWeatherPublicClient,
-    OpenMeteoEnsemble,
+    _ensemble_probability,
     ProbabilityCalibration,
     ResilientForecastEnsemble,
     StationObservation,
@@ -181,284 +181,6 @@ def test_weather_discovery_rejects_a_resolution_station_mismatch():
     ))
     assert result.markets_discovered == 0
     assert result.evaluations == ()
-
-
-def test_open_meteo_forecast_uses_public_ensemble_members_and_cache():
-    calls = []
-
-    def fetch_json(url, *, params, timeout):
-        calls.append((url, params, timeout))
-        temperatures = {
-            "temperature_2m_max_ecmwf_ifs025_ensemble": [31.5],
-            "temperature_2m_max_member01_ecmwf_ifs025_ensemble": [32.0],
-            "temperature_2m_max_ncep_gefs_seamless": [31.8],
-            "temperature_2m_max_member01_ncep_gefs_seamless": [32.2],
-            "temperature_2m_max_icon_seamless_eps": [31.7],
-            "temperature_2m_max_member01_icon_seamless_eps": [32.3],
-            "temperature_2m_max_gem_global_ensemble": [31.6],
-            "temperature_2m_max_member01_gem_global_ensemble": [32.4],
-        }
-        return {
-            "daily": {"time": ["2026-08-25"], **temperatures},
-            "daily_units": {
-                "time": "iso8601",
-                **{key: "°C" for key in temperatures},
-            },
-        }
-
-    contract = parse_exact_high_contract(
-        "Will the highest temperature in Singapore be 32°C on August 25?",
-        end_date=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
-    )
-    assert contract is not None
-    client = OpenMeteoEnsemble(fetch_json=fetch_json, min_members=8)
-    first = asyncio.run(client.forecast(contract, now=datetime(2026, 8, 24, tzinfo=timezone.utc)))
-    second = asyncio.run(client.forecast(contract, now=datetime(2026, 8, 24, tzinfo=timezone.utc)))
-
-    assert first is not None
-    assert D("0") < first.raw_probability < D("1")
-    assert first.n_members == 8
-    assert first.model_count == 4
-    assert first.lead_days == 1
-    assert second == first
-    assert len(calls) == 1
-    assert calls[0][1]["models"] == "ecmwf_ifs025,gfs_seamless,icon_seamless,gem_global"
-    assert calls[0][1]["timezone"] == "auto"
-
-
-def test_open_meteo_failure_backoff_prevents_request_storm():
-    calls = 0
-
-    def fail(*_args, **_kwargs):
-        nonlocal calls
-        calls += 1
-        raise ConnectionError("forecast unavailable")
-
-    contract = parse_exact_high_contract(
-        "Will the highest temperature in Singapore be 32°C on August 25?",
-        end_date=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
-    )
-    assert contract is not None
-    client = OpenMeteoEnsemble(fetch_json=fail, min_members=3)
-    with pytest.raises(ForecastUnavailableError, match="forecast unavailable") as first:
-        asyncio.run(client.forecast(contract))
-    assert not first.value.provider_global
-    with pytest.raises(ForecastUnavailableError, match="backoff active") as second:
-        asyncio.run(client.forecast(contract))
-    assert not second.value.provider_global
-    assert calls == 1
-
-
-def test_open_meteo_prunes_expired_cache_and_failure_entries():
-    contract = parse_exact_high_contract(
-        "Will the highest temperature in Singapore be 32°C on August 25?",
-        end_date=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
-    )
-    assert contract is not None
-    client = OpenMeteoEnsemble(
-        fetch_json=lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            ConnectionError("current failure")
-        )
-    )
-    stale = ("stale-city", "2020-01-01")
-    client._cache[stale] = (time.monotonic() - 1, ())
-    client._failure_until[stale] = time.monotonic() - 1
-    client._failure_messages[stale] = "stale failure"
-
-    with pytest.raises(ForecastUnavailableError, match="current failure"):
-        asyncio.run(client.forecast(contract))
-
-    assert stale not in client._cache
-    assert stale not in client._failure_until
-    assert stale not in client._failure_messages
-
-
-def test_open_meteo_rate_limit_opens_a_global_circuit_breaker_across_cities():
-    calls = 0
-
-    def rate_limited(*_args, **_kwargs):
-        nonlocal calls
-        calls += 1
-        response = requests.Response()
-        response.status_code = 429
-        response._content = b'{"reason":"Daily API request limit exceeded","error":true}'
-        raise requests.HTTPError("daily limit", response=response)
-
-    singapore = parse_exact_high_contract(
-        "Will the highest temperature in Singapore be 32°C on August 25?",
-        end_date=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
-    )
-    tokyo = parse_exact_high_contract(
-        "Will the highest temperature in Tokyo be 32°C on August 25?",
-        end_date=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
-    )
-    assert singapore is not None and tokyo is not None
-    client = OpenMeteoEnsemble(fetch_json=rate_limited)
-
-    with pytest.raises(ForecastUnavailableError, match="daily limit") as first:
-        asyncio.run(client.forecast(singapore))
-    assert first.value.provider_global
-    with pytest.raises(ForecastUnavailableError, match="global rate-limit backoff") as second:
-        asyncio.run(client.forecast(tokyo))
-    assert second.value.provider_global
-    assert calls == 1
-
-
-def test_open_meteo_global_breaker_preserves_a_valid_cached_forecast():
-    calls = 0
-
-    def fetch_json(_url, *, params, timeout):
-        nonlocal calls
-        calls += 1
-        if params["latitude"] != 1.3644:
-            response = requests.Response()
-            response.status_code = 429
-            raise requests.HTTPError("daily limit", response=response)
-        temperatures = {
-            "temperature_2m_max_ecmwf_ifs025_ensemble": [31.5],
-            "temperature_2m_max_member01_ecmwf_ifs025_ensemble": [32.0],
-            "temperature_2m_max_ncep_gefs_seamless": [31.8],
-            "temperature_2m_max_member01_ncep_gefs_seamless": [32.2],
-            "temperature_2m_max_icon_seamless_eps": [31.7],
-            "temperature_2m_max_member01_icon_seamless_eps": [32.3],
-            "temperature_2m_max_gem_global_ensemble": [31.6],
-            "temperature_2m_max_member01_gem_global_ensemble": [32.4],
-        }
-        return {
-            "daily": {"time": ["2026-08-25"], **temperatures},
-            "daily_units": {
-                "time": "iso8601",
-                **{key: "°C" for key in temperatures},
-            },
-        }
-
-    end = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
-    singapore = parse_exact_high_contract(
-        "Will the highest temperature in Singapore be 32°C on August 25?",
-        end_date=end,
-    )
-    tokyo = parse_exact_high_contract(
-        "Will the highest temperature in Tokyo be 32°C on August 25?",
-        end_date=end,
-    )
-    assert singapore is not None and tokyo is not None
-    client = OpenMeteoEnsemble(fetch_json=fetch_json, min_members=8)
-
-    cached = asyncio.run(client.forecast(singapore, now=end))
-    with pytest.raises(ForecastUnavailableError) as unavailable:
-        asyncio.run(client.forecast(tokyo, now=end))
-    assert unavailable.value.provider_global
-    assert asyncio.run(client.forecast(singapore, now=end)) == cached
-    assert calls == 2
-
-
-def test_open_meteo_cache_is_shared_across_bucket_shapes_for_one_event():
-    calls = 0
-
-    def fetch_json(*_args, **_kwargs):
-        nonlocal calls
-        calls += 1
-        temperatures = {
-            "temperature_2m_max_ecmwf_ifs025_ensemble": [30.0],
-            "temperature_2m_max_member01_ecmwf_ifs025_ensemble": [31.0],
-            "temperature_2m_max_ncep_gefs_seamless": [30.0],
-            "temperature_2m_max_member01_ncep_gefs_seamless": [31.0],
-            "temperature_2m_max_icon_seamless_eps": [30.0],
-            "temperature_2m_max_member01_icon_seamless_eps": [31.0],
-            "temperature_2m_max_gem_global_ensemble": [30.0],
-            "temperature_2m_max_member01_gem_global_ensemble": [31.0],
-        }
-        return {
-            "daily": {"time": ["2026-08-25"], **temperatures},
-            "daily_units": {
-                "time": "iso8601",
-                **{key: "°C" for key in temperatures},
-            },
-        }
-
-    end = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
-    lower = parse_high_temperature_contract(
-        "Will the highest temperature in Singapore be 29°C or below on August 25?",
-        end_date=end,
-    )
-    upper = parse_high_temperature_contract(
-        "Will the highest temperature in Singapore be 30°C or higher on August 25?",
-        end_date=end,
-    )
-    assert lower is not None and upper is not None
-    client = OpenMeteoEnsemble(fetch_json=fetch_json, min_members=8)
-
-    lower_forecast = asyncio.run(client.forecast(lower, now=end))
-    upper_forecast = asyncio.run(client.forecast(upper, now=end))
-
-    assert lower_forecast is not None and upper_forecast is not None
-    assert calls == 1
-    assert lower_forecast.distribution_probability is not None
-    assert upper_forecast.distribution_probability is not None
-    assert abs(
-        lower_forecast.distribution_probability
-        + upper_forecast.distribution_probability
-        - D("1")
-    ) < D("0.000000000001")
-
-
-def test_open_meteo_lead_day_uses_the_resolver_station_local_date():
-    def fetch_json(*_args, **_kwargs):
-        temperatures = {
-            "temperature_2m_max_ecmwf_ifs025_ensemble": [31.5],
-            "temperature_2m_max_member01_ecmwf_ifs025_ensemble": [32.0],
-            "temperature_2m_max_ncep_gefs_seamless": [31.8],
-            "temperature_2m_max_member01_ncep_gefs_seamless": [32.2],
-            "temperature_2m_max_icon_seamless_eps": [31.7],
-            "temperature_2m_max_member01_icon_seamless_eps": [32.3],
-            "temperature_2m_max_gem_global_ensemble": [31.6],
-            "temperature_2m_max_member01_gem_global_ensemble": [32.4],
-        }
-        return {
-            "daily": {"time": ["2026-08-25"], **temperatures},
-            "daily_units": {
-                "time": "iso8601",
-                **{key: "°C" for key in temperatures},
-            },
-        }
-
-    contract = parse_exact_high_contract(
-        "Will the highest temperature in Singapore be 32°C on August 25?",
-        end_date=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
-    )
-    assert contract is not None
-    forecast = asyncio.run(OpenMeteoEnsemble(
-        fetch_json=fetch_json,
-        min_members=8,
-    ).forecast(
-        contract,
-        # Singapore is already on August 25 at this UTC instant.
-        now=datetime(2026, 8, 24, 20, tzinfo=timezone.utc),
-    ))
-    assert forecast is not None
-    assert forecast.lead_days == 0
-
-
-def test_open_meteo_rejects_wrong_response_date_and_units():
-    def wrong_date(*_args, **_kwargs):
-        return {
-            "daily": {
-                "time": ["2026-08-26"],
-                "temperature_2m_max_ecmwf_ifs025_ensemble": [32],
-            },
-            "daily_units": {
-                "time": "iso8601",
-                "temperature_2m_max_ecmwf_ifs025_ensemble": "°F",
-            },
-        }
-
-    contract = parse_exact_high_contract(
-        "Will the highest temperature in Singapore be 32°C on August 25?",
-        end_date=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
-    )
-    assert contract is not None
-    with pytest.raises(ForecastUnavailableError, match="date does not match"):
-        asyncio.run(OpenMeteoEnsemble(fetch_json=wrong_date).forecast(contract))
 
 
 def test_weather_policy_caps_discovery_positions_and_kelly_inputs():
@@ -780,10 +502,10 @@ def test_open_meteo_probability_supports_bounded_and_one_sided_contracts():
         return parsed
 
     members = tuple((30.0, 31.0, 32.0, 33.0) for _ in range(4))
-    exact = OpenMeteoEnsemble._probability(contract("32°C"), members, 0)
-    bounded = OpenMeteoEnsemble._probability(contract("between 31-32°C"), members, 0)
-    higher = OpenMeteoEnsemble._probability(contract("32°C or higher"), members, 0)
-    below = OpenMeteoEnsemble._probability(contract("31°C or below"), members, 0)
+    exact = _ensemble_probability(contract("32°C"), members, 0)
+    bounded = _ensemble_probability(contract("between 31-32°C"), members, 0)
+    higher = _ensemble_probability(contract("32°C or higher"), members, 0)
+    below = _ensemble_probability(contract("31°C or below"), members, 0)
 
     assert bounded.raw_probability > exact.raw_probability
     assert abs((higher.raw_probability + below.raw_probability) - D("1")) < D("0.000000000001")
@@ -1516,13 +1238,13 @@ def test_resilient_ensemble_uses_remaining_sources_when_one_provider_is_down():
             return self.result
 
     result = asyncio.run(ResilientForecastEnsemble([
-        Provider("open-meteo"),
+        Provider("down"),
         Provider("met-no", healthy),
         Provider("nws", healthy),
     ]).forecast(contract))
     assert result.provider_count == 2
     assert set(result.provider_names) == {"met-no", "nws"}
-    assert result.provider_failures[0][0] == "open-meteo"
+    assert result.provider_failures[0][0] == "down"
     assert D("0") < result.raw_probability < D("1")
 
 

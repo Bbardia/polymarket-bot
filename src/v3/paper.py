@@ -26,7 +26,6 @@ from .paper_weather import (
     NWSGridForecast,
     ObservationProvider,
     OffsetWeatherPublicClient,
-    OpenMeteoEnsemble,
     ProbabilityCalibration,
     ResilientForecastEnsemble,
     WeatherEventEvaluation,
@@ -538,7 +537,6 @@ class PaperWorker:
             calibrator = ProbabilityCalibration(store.data_dir / "weather_calibration.json")
             self.forecast = ResilientForecastEnsemble(
                 (
-                    OpenMeteoEnsemble(),
                     MetNoLocationForecast(),
                     NWSGridForecast(),
                 ),

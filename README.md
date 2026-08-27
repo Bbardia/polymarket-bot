@@ -13,9 +13,9 @@ research compatibility; its live path is permanently disabled.
 - `paper-run` is a public-data-only worker with durable local scans, candidates,
   simulated positions, and settlement records. It refuses to run if account
   reads or live trading are enabled.
-- V4 weather paper research combines Open-Meteo, MET Norway, and NWS hourly
-  forecasts when coverage exists. A provider outage is recorded as degraded
-  telemetry; remaining sources continue with wider uncertainty. Resolved paper
+- V4 weather paper research combines MET Norway and NWS hourly forecasts when
+  coverage exists. A provider outage is recorded as degraded telemetry;
+  remaining sources continue with wider uncertainty. Resolved paper
   outcomes update a persistent, conservative per-source/city/horizon calibrator.
 - Weather market discovery uses read-only Gamma offset pagination because the
   official SDK's Weather-tag keyset continuation is currently Cloudflare-blocked;
@@ -140,9 +140,9 @@ separately labeled strategies:
   markets, walks executable depth on YES+NO, and still requires positive return
   after fees. It never accepts a mathematically locked-in loss merely to create
   activity.
-- **Directional weather:** discovers exact, range, and tail daily-high buckets
-  from the public Weather tag and compares executable prices with the keyless
-  Open-Meteo ECMWF/GFS/ICON/GEM ensemble. Resolution URLs must identify the
+- Directional weather: discovers exact, range, and tail daily-high buckets
+  from the public Weather tag and compares executable prices with MET Norway
+  and NWS forecasts. Resolution URLs must identify the
   modeled airport station. Same-day paper entries always fail closed unless a
   successful public NOAA observation exists for that exact station and local
   date. The paper-only lane uses a 3% base edge plus

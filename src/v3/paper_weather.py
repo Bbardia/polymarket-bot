@@ -30,15 +30,7 @@ from .weather_surface import EventSurface, SurfaceBucket, analyze_event_surface
 ZERO = Decimal("0")
 ONE = Decimal("1")
 HALF = Decimal("0.5")
-OPEN_METEO_ENSEMBLE = "https://ensemble-api.open-meteo.com/v1/ensemble"
 NOAA_METAR = "https://aviationweather.gov/api/data/metar"
-ENSEMBLE_MODELS = "ecmwf_ifs025,gfs_seamless,icon_seamless,gem_global"
-MODEL_KEY_MARKERS: Mapping[str, str] = {
-    "ecmwf": "ecmwf_ifs025",
-    "gfs": "ncep_gefs_seamless",
-    "icon": "icon_seamless",
-    "gem": "gem_global",
-}
 
 # Airport/station coordinates matching the locations used by weather contracts.
 CITY_COORDS: Mapping[str, tuple[float, float]] = {
@@ -369,7 +361,7 @@ class EnsembleForecast:
     lead_days: int
     model_count: int = 4
     distribution_probability: Decimal | None = None
-    source: str = "open-meteo"
+    source: str = "provider"
     provider_count: int = 1
     provider_names: tuple[str, ...] = ()
     provider_probabilities: tuple[tuple[str, Decimal], ...] = ()
@@ -729,9 +721,6 @@ class ObservationProvider(Protocol):
     ) -> ObservationBoundResult: ...
 
 
-JsonFetcher = Callable[..., Mapping[str, Any]]
-
-
 def _contract_target_date(match: re.Match[str], end_date: datetime) -> date | None:
     month = _MONTHS.get(match.group("month").lower())
     if month is None:
@@ -830,15 +819,6 @@ def parse_exact_high_contract(
     if match is None or _EXACT_OUTCOME_RE.fullmatch(match.group("outcome").strip()) is None:
         return None
     return contract
-
-
-def _default_fetch_json(url: str, *, params: Mapping[str, Any], timeout: float) -> Mapping[str, Any]:
-    response = requests.get(url, params=params, timeout=timeout)
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise ValueError("Open-Meteo response must be an object")
-    return payload
 
 
 ObservationJsonFetcher = Callable[..., Any]
@@ -1094,219 +1074,60 @@ def _resolution_station_matches(
     return _verified_resolution_station(contract, source) is not None
 
 
-class OpenMeteoEnsemble:
-    name = "open-meteo"
-
-    def __init__(
-        self,
-        *,
-        fetch_json: JsonFetcher = _default_fetch_json,
-        min_members: int = 10,
-        cache_seconds: float = 1_800,
-        timeout_seconds: float = 20,
-        failure_backoff_seconds: float = 300,
-        rate_limit_backoff_seconds: float = 21_600,
-    ) -> None:
-        if (
-            min_members < 2
-            or cache_seconds <= 0
-            or timeout_seconds <= 0
-            or failure_backoff_seconds <= 0
-            or rate_limit_backoff_seconds <= 0
-        ):
-            raise ValueError("invalid Open-Meteo client settings")
-        self._fetch_json = fetch_json
-        self._min_members = min_members
-        self._cache_seconds = cache_seconds
-        self._timeout_seconds = timeout_seconds
-        self._failure_backoff_seconds = failure_backoff_seconds
-        self._rate_limit_backoff_seconds = rate_limit_backoff_seconds
-        self._cache: dict[
-            tuple[str, str],
-            tuple[float, tuple[tuple[float, ...], ...]],
-        ] = {}
-        self._failure_until: dict[tuple[str, str], float] = {}
-        self._failure_messages: dict[tuple[str, str], str] = {}
-        self._rate_limit_until = 0.0
-        self._rate_limit_message = "prior rate-limit response"
-
-    def _prune_expired(self, monotonic_now: float) -> None:
-        for key, (expires_at, _members) in tuple(self._cache.items()):
-            if expires_at <= monotonic_now:
-                self._cache.pop(key, None)
-        for key, expires_at in tuple(self._failure_until.items()):
-            if expires_at <= monotonic_now:
-                self._failure_until.pop(key, None)
-                self._failure_messages.pop(key, None)
-        if self._rate_limit_until <= monotonic_now:
-            self._rate_limit_until = 0.0
-            self._rate_limit_message = "prior rate-limit response"
-
-    @staticmethod
-    def _probability(
-        contract: HighTemperatureContract,
-        model_members: tuple[tuple[float, ...], ...],
-        lead_days: int,
-    ) -> EnsembleForecast:
-        inflation = 1.05 + 0.15 * max(0, lead_days)
-        lower_c = (
-            float(contract.probability_lower_c)
-            if contract.probability_lower_c is not None
-            else None
-        )
-        upper_c = (
-            float(contract.probability_upper_c)
-            if contract.probability_upper_c is not None
-            else None
-        )
-        model_probabilities: list[float] = []
-        model_means: list[float] = []
-        model_variances: list[float] = []
-        for members in model_members:
-            model_mean = statistics.mean(members)
-            model_std = statistics.stdev(members) if len(members) >= 2 else 0.0
-            sigma = max(model_std * inflation, 0.5)
-            distribution = NormalDist(mu=model_mean, sigma=sigma)
-            if lower_c is None:
-                assert upper_c is not None
-                probability = distribution.cdf(upper_c)
-            elif upper_c is None:
-                probability = 1 - distribution.cdf(lower_c)
-            else:
-                probability = distribution.cdf(upper_c) - distribution.cdf(lower_c)
-            model_probabilities.append(probability)
-            model_means.append(model_mean)
-            model_variances.append(model_std ** 2)
-        distribution_probability = statistics.mean(model_probabilities)
-        directional_probability = min(
-            0.999,
-            max(0.001, distribution_probability),
-        )
-        mean = statistics.mean(model_means)
-        mixture_second_moment = statistics.mean(
-            variance + model_mean ** 2
-            for variance, model_mean in zip(model_variances, model_means, strict=True)
-        )
-        raw_std = math.sqrt(max(0, mixture_second_moment - mean ** 2))
-        return EnsembleForecast(
-            raw_probability=Decimal(str(directional_probability)),
-            ensemble_mean_c=Decimal(str(mean)),
-            ensemble_std_c=Decimal(str(raw_std)),
-            n_members=sum(len(members) for members in model_members),
-            lead_days=lead_days,
-            model_count=len(model_members),
-            distribution_probability=Decimal(str(distribution_probability)),
-        )
-
-    async def forecast(
-        self,
-        contract: HighTemperatureContract,
-        *,
-        now: datetime | None = None,
-    ) -> EnsembleForecast | None:
-        now = now or datetime.now(timezone.utc)
-        cache_key = (contract.city, contract.target_date)
-        monotonic_now = time.monotonic()
-        self._prune_expired(monotonic_now)
-        cached = self._cache.get(cache_key)
-        if cached is not None and monotonic_now < cached[0]:
-            model_members = cached[1]
+def _ensemble_probability(
+    contract: HighTemperatureContract,
+    model_members: tuple[tuple[float, ...], ...],
+    lead_days: int,
+) -> EnsembleForecast:
+    inflation = 1.05 + 0.15 * max(0, lead_days)
+    lower_c = (
+        float(contract.probability_lower_c)
+        if contract.probability_lower_c is not None
+        else None
+    )
+    upper_c = (
+        float(contract.probability_upper_c)
+        if contract.probability_upper_c is not None
+        else None
+    )
+    model_probabilities: list[float] = []
+    model_means: list[float] = []
+    model_variances: list[float] = []
+    for members in model_members:
+        model_mean = statistics.mean(members)
+        model_std = statistics.stdev(members) if len(members) >= 2 else 0.0
+        sigma = max(model_std * inflation, 0.5)
+        distribution = NormalDist(mu=model_mean, sigma=sigma)
+        if lower_c is None:
+            assert upper_c is not None
+            probability = distribution.cdf(upper_c)
+        elif upper_c is None:
+            probability = 1 - distribution.cdf(lower_c)
         else:
-            # A provider-wide 429 is not specific to one city. Open one global
-            # circuit so the rest of the event universe does not amplify a
-            # daily quota failure into dozens of immediate requests.
-            if monotonic_now < self._rate_limit_until:
-                raise ForecastUnavailableError(
-                    "Open-Meteo global rate-limit backoff active: "
-                    + self._rate_limit_message,
-                    provider_global=True,
-                )
-            if monotonic_now < self._failure_until.get(cache_key, 0):
-                detail = self._failure_messages.get(cache_key, "prior request failed")
-                raise ForecastUnavailableError(
-                    f"Open-Meteo forecast backoff active for {contract.event_key}: {detail}"
-                )
-            latitude, longitude = CITY_COORDS[contract.city]
-            try:
-                payload = await asyncio.to_thread(
-                    self._fetch_json,
-                    OPEN_METEO_ENSEMBLE,
-                    params={
-                        "latitude": latitude,
-                        "longitude": longitude,
-                        "daily": "temperature_2m_max",
-                        "models": ENSEMBLE_MODELS,
-                        "timezone": "auto",
-                        "start_date": contract.target_date,
-                        "end_date": contract.target_date,
-                    },
-                    timeout=self._timeout_seconds,
-                )
-                daily = payload.get("daily")
-                daily_units = payload.get("daily_units")
-                if not isinstance(daily, dict) or not isinstance(daily_units, dict):
-                    raise ValueError("Open-Meteo response has no daily object")
-                if daily.get("time") != [contract.target_date]:
-                    raise ValueError("Open-Meteo response date does not match the request")
-                groups: dict[str, list[float]] = {
-                    model: [] for model in MODEL_KEY_MARKERS
-                }
-                for key, raw_values in daily.items():
-                    key = str(key)
-                    if key == "time":
-                        continue
-                    if not key.startswith("temperature_2m_max"):
-                        raise ValueError(f"unexpected Open-Meteo daily field: {key}")
-                    model = next(
-                        (name for name, marker in MODEL_KEY_MARKERS.items() if marker in key),
-                        None,
-                    )
-                    if model is None:
-                        raise ValueError(f"unknown Open-Meteo model field: {key}")
-                    if daily_units.get(key) != "°C":
-                        raise ValueError(f"unexpected Open-Meteo unit for {key}")
-                    if not isinstance(raw_values, list) or len(raw_values) != 1 or raw_values[0] is None:
-                        raise ValueError(f"invalid Open-Meteo values for {key}")
-                    value = float(raw_values[0])
-                    if not math.isfinite(value):
-                        raise ValueError(f"non-finite Open-Meteo value for {key}")
-                    groups[model].append(value)
-                if any(len(values) < 2 for values in groups.values()):
-                    raise ValueError("Open-Meteo response omitted an ensemble model family")
-                total_members = sum(len(values) for values in groups.values())
-                if total_members < self._min_members:
-                    raise ValueError(f"Open-Meteo returned only {total_members} ensemble members")
-            except Exception as exc:
-                response = getattr(exc, "response", None)
-                detail = f"{type(exc).__name__}: {exc}"
-                if getattr(response, "status_code", None) == 429:
-                    self._rate_limit_until = (
-                        monotonic_now + self._rate_limit_backoff_seconds
-                    )
-                    self._rate_limit_message = detail
-                    raise ForecastUnavailableError(
-                        f"Open-Meteo forecast unavailable: {detail}",
-                        provider_global=True,
-                    ) from exc
-                else:
-                    self._failure_until[cache_key] = (
-                        monotonic_now + self._failure_backoff_seconds
-                    )
-                    self._failure_messages[cache_key] = detail
-                    raise ForecastUnavailableError(
-                        f"Open-Meteo forecast unavailable for {contract.event_key}: {detail}"
-                    ) from exc
-            model_members = tuple(tuple(groups[name]) for name in MODEL_KEY_MARKERS)
-            self._failure_until.pop(cache_key, None)
-            self._failure_messages.pop(cache_key, None)
-            self._cache[cache_key] = (monotonic_now + self._cache_seconds, model_members)
-        target = datetime.fromisoformat(contract.target_date).date()
-        timezone_name = CITY_TIMEZONES.get(contract.city)
-        if timezone_name is None:
-            raise ValueError(f"no resolver timezone for {contract.city}")
-        resolver_today = now.astimezone(ZoneInfo(timezone_name)).date()
-        lead_days = max(0, (target - resolver_today).days)
-        return self._probability(contract, model_members, lead_days)
+            probability = distribution.cdf(upper_c) - distribution.cdf(lower_c)
+        model_probabilities.append(probability)
+        model_means.append(model_mean)
+        model_variances.append(model_std ** 2)
+    distribution_probability = statistics.mean(model_probabilities)
+    directional_probability = min(
+        0.999,
+        max(0.001, distribution_probability),
+    )
+    mean = statistics.mean(model_means)
+    mixture_second_moment = statistics.mean(
+        variance + model_mean ** 2
+        for variance, model_mean in zip(model_variances, model_means, strict=True)
+    )
+    raw_std = math.sqrt(max(0, mixture_second_moment - mean ** 2))
+    return EnsembleForecast(
+        raw_probability=Decimal(str(directional_probability)),
+        ensemble_mean_c=Decimal(str(mean)),
+        ensemble_std_c=Decimal(str(raw_std)),
+        n_members=sum(len(members) for members in model_members),
+        lead_days=lead_days,
+        model_count=len(model_members),
+        distribution_probability=Decimal(str(distribution_probability)),
+    )
 
 
 class MetNoLocationForecast:
@@ -1512,7 +1333,7 @@ def _deterministic_forecast(
     target = date.fromisoformat(contract.target_date)
     resolver_today = now.astimezone(ZoneInfo(timezone_name)).date()
     lead_days = max(0, (target - resolver_today).days)
-    result = OpenMeteoEnsemble._probability(
+    result = _ensemble_probability(
         contract,
         ((maximum_c,),),
         lead_days,
@@ -1545,9 +1366,8 @@ class ResilientForecastEnsemble:
             raise ValueError("forecast failure backoff must be positive")
         self.providers = tuple(providers)
         self.weights = dict(weights or {
-            "open-meteo": Decimal("0.45"),
-            "met-no": Decimal("0.30"),
-            "nws": Decimal("0.25"),
+            "met-no": Decimal("0.55"),
+            "nws": Decimal("0.45"),
         })
         self.calibrator = calibrator or ProbabilityCalibration()
         self._failure_backoff_seconds = failure_backoff_seconds

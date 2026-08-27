@@ -18,6 +18,7 @@ from src.v3.paper_weather import (
     EnsembleForecast,
     ForecastUnavailableError,
     ObservationBoundResult,
+    ResilientForecastEnsemble,
     WeatherPaperPolicy,
 )
 
@@ -153,6 +154,24 @@ def test_paper_settings_require_all_authenticated_paths_to_remain_disabled(tmp_p
         "ENABLE_V3_LIVE_TRADING must be false",
         "ENABLE_V3_ACCOUNT_READS must be false",
     )
+
+
+def test_default_weather_ensemble_excludes_open_meteo(tmp_path):
+    worker = PaperWorker(
+        client=FakePublicClient([], []),
+        settings=settings(
+            tmp_path,
+            weather_policy=WeatherPaperPolicy(enabled=True),
+        ),
+        store=PaperStore(tmp_path),
+    )
+
+    assert isinstance(worker.forecast, ResilientForecastEnsemble)
+    assert tuple(provider.name for provider in worker.forecast.providers) == (
+        "met-no",
+        "nws",
+    )
+    assert "open-meteo" not in worker.forecast.weights
 
 
 def test_worker_records_public_scan_and_opens_one_capped_paper_position(tmp_path):
@@ -677,7 +696,7 @@ def test_weather_settlement_calibrates_provider_probability_against_yes_outcome(
         "shares": "5",
         "all_in_cost": "0.50",
         "model_probability": "0.80",
-        "provider_probabilities": {"open-meteo": "0.20"},
+        "provider_probabilities": {"met-no": "0.20"},
         "city": "singapore",
         "lead_days": 1,
     }
@@ -703,7 +722,7 @@ def test_weather_settlement_calibrates_provider_probability_against_yes_outcome(
         "city": "singapore",
         "lead_days": 1,
         "outcome": 1,
-        "provider_probabilities": (("open-meteo", D("0.20")),),
+        "provider_probabilities": (("met-no", D("0.20")),),
     }]
 
 
