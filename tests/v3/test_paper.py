@@ -658,6 +658,55 @@ def test_no_weather_position_loss_settles_with_correct_brier_and_no_duplicate(tm
     assert settlements[0]["directional_outcome"] == 0
 
 
+def test_weather_settlement_calibrates_provider_probability_against_yes_outcome(tmp_path):
+    resolved = market(closed=True)
+    resolved.id = "weather-calibration"
+    resolved.condition_id = "weather-calibration-condition"
+    resolved.outcomes.yes.price = D("1")
+    resolved.outcomes.no.price = D("0")
+    client = FakePublicClient([resolved], [])
+    store = PaperStore(tmp_path)
+    state = PaperState.new(D("37.50"))
+    state.cash = D("37.00")
+    state.open_positions[resolved.condition_id] = {
+        "strategy": "weather_directional",
+        "event_key": "weather:singapore:2026-08-25",
+        "market_id": resolved.id,
+        "condition_id": resolved.condition_id,
+        "side": "NO",
+        "shares": "5",
+        "all_in_cost": "0.50",
+        "model_probability": "0.80",
+        "provider_probabilities": {"open-meteo": "0.20"},
+        "city": "singapore",
+        "lead_days": 1,
+    }
+    store.save_state(state)
+
+    class RecordingForecast:
+        def __init__(self):
+            self.calls = []
+
+        def record_outcome(self, **kwargs):
+            self.calls.append(kwargs)
+
+    forecast = RecordingForecast()
+    worker = PaperWorker(
+        client=client,
+        settings=settings(tmp_path),
+        store=store,
+        forecast=forecast,
+    )
+
+    assert asyncio.run(worker._settle_positions("2026-08-26T00:00:00+00:00")) == (1, 0)
+    assert forecast.calls == [{
+        "city": "singapore",
+        "lead_days": 1,
+        "outcome": 1,
+        "provider_probabilities": (("open-meteo", D("0.20")),),
+    }]
+
+
 def test_run_paper_refuses_unsafe_settings_before_client_construction(tmp_path):
     constructed = False
 

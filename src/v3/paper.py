@@ -1122,6 +1122,7 @@ class PaperWorker:
                         yes_price if side == "YES" else no_price
                     ))
                     outcome = int(winning_price == ONE)
+                    calibration_outcome = int(Decimal(str(yes_price)) == ONE)
                     payout = shares if outcome else ZERO
                     probability = Decimal(str(position["model_probability"]))
                     brier = (probability - Decimal(outcome)) ** 2
@@ -1142,7 +1143,7 @@ class PaperWorker:
                             record_outcome(
                                 city=str(position.get("city", "")),
                                 lead_days=int(position.get("lead_days", 0)),
-                                outcome=outcome,
+                                outcome=calibration_outcome,
                                 provider_probabilities=provider_probabilities,
                             )
                 else:
