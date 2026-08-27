@@ -1,9 +1,7 @@
-"""Open-Meteo multi-model ensemble forecast for weather trading.
+"""Legacy weather forecast compatibility module.
 
-Calls Open-Meteo ensemble API with 4 models (ECMWF + GFS + ICON + GEM)
-to get ~143 ensemble members for daily high temperatures. Uses Gaussian
-CDF probability (not raw counting) with lead-time sigma inflation for
-calibrated probability estimates.
+The legacy forecast provider is retired. The active V4 paper worker uses the
+provider adapters in ``src.v3.paper_weather`` instead.
 
 Upgrade history:
 - 2026-04-09: Created with GFS 31-member raw counting
@@ -22,7 +20,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-import requests
+
 from loguru import logger
 from scipy.stats import norm
 
@@ -235,10 +233,6 @@ class WeatherForecast:
     MIN_PROBABILITY = 0.10
     API_TIMEOUT = 15  # slightly longer for multi-model responses
 
-    # 4 independent global models — one API call returns all members
-    # ECMWF(51) + GFS(31) + ICON(40) + GEM(21) = 143 total
-    ENSEMBLE_MODELS = "ecmwf_ifs025,gfs_seamless,icon_seamless,gem_global"
-
     # Lead-time sigma inflation: raw ensembles are overconfident.
     # Factor multiplied into ensemble stdev to correct underdispersion.
     SIGMA_INFLATION = {
@@ -267,48 +261,14 @@ class WeatherForecast:
         return None
 
     def _fetch_ensemble(self, lat: float, lon: float, date: str) -> Optional[list[float]]:
-        """Fetch multi-model ensemble forecast for daily max temperature.
-
-        Returns list of ~143 ensemble member predictions (°C) for daily high.
-        Uses ECMWF(51) + GFS(31) + ICON(40) + GEM(21) in a single API call.
-        """
-        try:
-            resp = requests.get(
-                Config.OPEN_METEO_ENSEMBLE,
-                params={
-                    "latitude": lat,
-                    "longitude": lon,
-                    "daily": "temperature_2m_max",
-                    "models": self.ENSEMBLE_MODELS,
-                    "start_date": date,
-                    "end_date": date,
-                },
-                timeout=self.API_TIMEOUT,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-            # Multi-model: keys like temperature_2m_max_member01, ..._member51 (per model)
-            daily = data.get("daily", {})
-            highs = []
-            for key, vals in daily.items():
-                if key.startswith("temperature_2m_max") and vals:
-                    val = vals[0]
-                    if val is not None:
-                        highs.append(float(val))
-
-            if len(highs) < 10:
-                logger.debug(f"  Forecast: only {len(highs)} members for ({lat:.1f},{lon:.1f}) on {date}")
-                return None
-
-            return highs
-
-        except requests.exceptions.RequestException as e:
-            logger.debug(f"  Forecast: API error: {e}")
-            return None
-        except (KeyError, IndexError, ValueError) as e:
-            logger.debug(f"  Forecast: parse error: {e}")
-            return None
+        """Legacy compatibility hook; the retired ensemble provider is unused."""
+        logger.debug(
+            "  Legacy ensemble forecast disabled for (%s,%s) on %s",
+            lat,
+            lon,
+            date,
+        )
+        return None
 
     def _get_ensemble_highs(self, city: str, date: str) -> Optional[list[float]]:
         """Get ensemble highs with caching."""

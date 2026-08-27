@@ -1,7 +1,7 @@
 """Forecast Scanner — standalone weather strategy.
 
-Scans active Polymarket temperature markets, compares Open-Meteo multi-model
-ensemble probability to executable market price, and returns signals when the
+Scans active Polymarket temperature markets, compares a forecast-provider
+probability to executable market price, and returns signals when the
 forecast-market disagreement clears a dynamic uncertainty buffer.
 
 Core rules:
@@ -37,7 +37,7 @@ class ForecastSignal:
     forecast_prob: float      # Shrunk/calibrated probability used for decisions
     edge: float               # forecast_prob - market_price
     temp_info: str            # e.g. "14°C exact"
-    raw_forecast_prob: float = 0.0  # Raw Open-Meteo probability before shrinkage
+    raw_forecast_prob: float = 0.0  # Raw provider probability before shrinkage
     ensemble_std: float = 0.0     # ensemble spread (lower = more confident)
     n_members: int = 0            # number of ensemble members used
     n_eff: float = 0.0             # effective sample size after ensemble-agreement penalty

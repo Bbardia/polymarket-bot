@@ -171,7 +171,10 @@ def test_default_weather_ensemble_excludes_open_meteo(tmp_path):
         "met-no",
         "nws",
     )
-    assert "open-meteo" not in worker.forecast.weights
+    assert worker.forecast.weights == {
+        "met-no": D("0.55"),
+        "nws": D("0.45"),
+    }
 
 
 def test_worker_records_public_scan_and_opens_one_capped_paper_position(tmp_path):

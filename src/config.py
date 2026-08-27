@@ -76,9 +76,6 @@ class Config:
             joined = "; ".join(errors)
             raise RuntimeError(f"Live trading refused: {joined}")
 
-    # Open-Meteo (free, no key needed)
-    OPEN_METEO_ENSEMBLE = "https://ensemble-api.open-meteo.com/v1/ensemble"
-
     # Polymarket data API
     DATA_API_HOST = "https://data-api.polymarket.com"
 
