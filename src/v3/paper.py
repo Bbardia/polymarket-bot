@@ -69,6 +69,7 @@ class PaperSettings:
     reserve_fraction: Decimal = Decimal("0.25")
     max_order_notional: Decimal = Decimal("5")
     max_open_positions: int = 10
+    complete_set_enabled: bool = True
     weather_policy: WeatherPaperPolicy = field(
         default_factory=lambda: WeatherPaperPolicy(enabled=False)
     )
@@ -109,6 +110,7 @@ class PaperSettings:
             reserve_fraction=_decimal_env("V3_RESERVE_FRACTION", "0.25"),
             max_order_notional=_decimal_env("V3_PAPER_MAX_ORDER_NOTIONAL", "5"),
             max_open_positions=int(os.getenv("V3_PAPER_MAX_OPEN_POSITIONS", "10")),
+            complete_set_enabled=_env_bool("V3_PAPER_COMPLETE_SET_ENABLED", True),
             weather_policy=WeatherPaperPolicy(
                 enabled=_env_bool("V3_PAPER_WEATHER_ENABLED", True),
                 horizon_days=int(os.getenv("V3_PAPER_WEATHER_HORIZON_DAYS", "3")),
@@ -1189,17 +1191,20 @@ class PaperWorker:
         paper_trades = 0
         settlements, settlement_errors = await self._settle_positions(scanned_at)
         errors += settlement_errors
-        try:
-            markets = await self._discover_markets()
-        except Exception as exc:
+        if self.settings.complete_set_enabled:
+            try:
+                markets = await self._discover_markets()
+            except Exception as exc:
+                markets = ()
+                errors += 1
+                self.store.append_record(self.store.scans_path, {
+                    "scanned_at": scanned_at,
+                    "status": "discovery_error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "public_data_only": True,
+                })
+        else:
             markets = ()
-            errors += 1
-            self.store.append_record(self.store.scans_path, {
-                "scanned_at": scanned_at,
-                "status": "discovery_error",
-                "error": f"{type(exc).__name__}: {exc}",
-                "public_data_only": True,
-            })
 
         scanned = 0
         for market in markets:
@@ -1262,6 +1267,7 @@ class PaperWorker:
             "authenticated_client_initialized": False,
             "account_reads_enabled": False,
             "live_trading_enabled": False,
+            "complete_set_enabled": self.settings.complete_set_enabled,
             "weather_directional_enabled": self.settings.weather_policy.enabled,
             "weather_order_cap": str(self.settings.weather_policy.max_order_notional),
             "weather_position_cap": self.settings.weather_policy.max_open_positions,

@@ -177,6 +177,24 @@ def test_default_weather_ensemble_excludes_open_meteo(tmp_path):
     }
 
 
+def test_paper_can_disable_complete_set_lane(tmp_path):
+    client = FakePublicClient(
+        [market()],
+        [book("yes-token", ask="0.45"), book("no-token", ask="0.45")],
+    )
+    worker = PaperWorker(
+        client=client,
+        settings=settings(tmp_path, complete_set_enabled=False),
+        store=PaperStore(tmp_path),
+    )
+
+    result = asyncio.run(worker.run_cycle())
+
+    assert result.markets_discovered == 0
+    assert result.markets_scanned == 0
+    assert client.list_calls == 0
+
+
 def test_worker_records_public_scan_and_opens_one_capped_paper_position(tmp_path):
     client = FakePublicClient(
         [market()],
