@@ -185,8 +185,8 @@ def test_weather_discovery_rejects_a_resolution_station_mismatch():
 
 def test_weather_policy_caps_discovery_positions_and_kelly_inputs():
     with pytest.raises(ValueError, match="position cap"):
-        WeatherPaperPolicy(max_open_positions=16)
-    assert WeatherPaperPolicy(max_open_positions=15).max_open_positions == 15
+        WeatherPaperPolicy(max_open_positions=21)
+    assert WeatherPaperPolicy(max_open_positions=20).max_open_positions == 20
     with pytest.raises(ValueError, match="discovery limit"):
         WeatherPaperPolicy(discovery_limit=5_001)
     with pytest.raises(ValueError, match="fractional Kelly"):
@@ -544,6 +544,27 @@ def test_noaa_observations_use_station_only_request_filter_local_date_and_cache(
     assert calls[0][1] == {"ids": "WSSS", "format": "json", "hours": 24}
     assert calls[0][2] == {"User-Agent": "paper-v4-tests/1.0"}
     assert calls[0][3] == 20
+
+
+def test_noaa_observations_skip_missing_temperature_readings():
+    def fetch_json(*_args, **_kwargs):
+        return [
+            {"icaoId": "KMIA", "reportTime": "2026-08-31T17:00:00Z", "temp": None},
+            {"icaoId": "KMIA", "reportTime": "2026-08-31T18:00:00Z", "temp": 31.2},
+        ]
+
+    contract = parse_high_temperature_contract(
+        "Will the highest temperature in Miami be 90°F on August 31?",
+        end_date=datetime(2026, 8, 31, 12, tzinfo=timezone.utc),
+    )
+    assert contract is not None
+    observations = asyncio.run(
+        NOAAStationObservations(fetch_json=fetch_json).observations(
+            contract,
+            station_id="KMIA",
+        )
+    )
+    assert tuple(item.temperature_c for item in observations) == (D("31.2"),)
 
 
 def test_noaa_observations_convert_celsius_readings_to_fahrenheit_before_rounding():

@@ -480,8 +480,8 @@ class WeatherPaperPolicy:
             raise ValueError("weather price range must be inside (0, 1)")
         if self.max_order_notional <= ZERO:
             raise ValueError("weather paper order cap must be positive")
-        if not (1 <= self.max_open_positions <= 15):
-            raise ValueError("weather paper position cap must be in [1, 15]")
+        if not (1 <= self.max_open_positions <= 20):
+            raise ValueError("weather paper position cap must be in [1, 20]")
         if self.base_edge < ZERO or self.uncertainty_z < ZERO:
             raise ValueError("weather edge and uncertainty settings cannot be negative")
         if not (ZERO <= self.intraclass_correlation < ONE):
@@ -962,6 +962,11 @@ class NOAAStationObservations:
                     raise ValueError("NOAA METAR observation station does not match request")
                 observed_at = _parse_report_time(raw.get("reportTime"))
                 raw_temperature = raw.get("temp")
+                # NOAA returns null for an otherwise valid report when the
+                # station did not publish a temperature. Ignore that report;
+                # retain strict validation for malformed non-null values.
+                if raw_temperature is None:
+                    continue
                 if (
                     isinstance(raw_temperature, bool)
                     or not isinstance(raw_temperature, (int, float, Decimal))
