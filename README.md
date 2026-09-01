@@ -30,6 +30,9 @@ research compatibility; its live path is permanently disabled.
   unless explicitly supplied as managed local IDs.
 - Queue-aware maker replay and resolved-candidate shadow reports are offline,
   file-based inspection tools only.
+- Optional paper early exits use the complete directional position, executable
+  bid-side depth, and nonlinear exit fees. They record realized exit P&L in a
+  separate `paper_exits.jsonl` stream and never submit orders.
 - Legacy `run_full_loop.py --live` exits before constructing a client.
 - Repository watchdog is status-only and cannot launch the bot.
 - No Polymarket Hermes/Claude cron is required or configured.
@@ -164,6 +167,7 @@ weather_calibration.json persistent paper-only source/city/horizon probability c
 candidates.jsonl     positive strategy candidates and cap decisions
 paper_trades.jsonl   idempotent simulated-entry audit records
 settlements.jsonl    idempotent public-resolution settlement audit records
+paper_exits.jsonl    idempotent paper-only early-exit audit records
 ```
 
 `shadow-report` expects one resolved candidate per line. Decimal values should

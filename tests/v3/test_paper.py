@@ -698,6 +698,87 @@ def test_no_weather_position_loss_settles_with_correct_brier_and_no_duplicate(tm
     assert settlements[0]["directional_outcome"] == 0
 
 
+def test_paper_early_exit_uses_full_bid_depth_fees_and_persists_audit(tmp_path):
+    opened = market()
+    opened.trading.fees_enabled = True
+    opened.trading.fee_schedule = SimpleNamespace(rate=D("0.05"))
+    exit_book = book("yes-token", ask="0.50", bid="0.40")
+    exit_book.bids = (
+        SimpleNamespace(price=D("0.40"), size=D("3")),
+        SimpleNamespace(price=D("0.50"), size=D("2")),
+    )
+    client = FakePublicClient([opened], [exit_book])
+    store = PaperStore(tmp_path)
+    state = PaperState.new(D("37.50"))
+    state.cash = D("36.00")
+    state.open_positions[opened.condition_id] = {
+        "strategy": "weather_directional",
+        "event_key": "weather:singapore:2026-08-25",
+        "opened_at": "2026-08-24T00:00:00+00:00",
+        "market_id": opened.id,
+        "condition_id": opened.condition_id,
+        "side": "YES",
+        "token_id": "yes-token",
+        "shares": "5",
+        "all_in_cost": "1.50",
+    }
+    store.save_state(state)
+    worker = PaperWorker(
+        client=client,
+        settings=settings(
+            tmp_path,
+            early_exit_enabled=True,
+            early_exit_target_return=D("0.25"),
+            early_exit_min_profit=D("0.10"),
+        ),
+        store=store,
+    )
+
+    assert asyncio.run(worker._exit_positions("2026-08-25T00:00:00+00:00")) == (1, 0)
+    updated = store.load_state()
+    assert updated.open_positions == {}
+    assert updated.cash == D("38.139000")
+    assert updated.realized_pnl == D("0.639000")
+    exits = store.read_records(store.exits_path)
+    assert len(exits) == 1
+    assert exits[0]["exit_vwap"] == "0.44"
+    assert exits[0]["exit_fee"] == "0.061000"
+    assert exits[0]["net_proceeds"] == "2.139000"
+    assert exits[0]["realized_pnl"] == "0.639000"
+
+
+def test_paper_early_exit_refuses_shallow_bid_books_without_mutation(tmp_path):
+    opened = market()
+    shallow = book("yes-token", ask="0.50", bid="0.40")
+    shallow.bids = (SimpleNamespace(price=D("0.90"), size=D("4")),)
+    client = FakePublicClient([opened], [shallow])
+    store = PaperStore(tmp_path)
+    state = PaperState.new(D("37.50"))
+    state.cash = D("36.00")
+    state.open_positions[opened.condition_id] = {
+        "strategy": "weather_directional",
+        "market_id": opened.id,
+        "condition_id": opened.condition_id,
+        "side": "YES",
+        "token_id": "yes-token",
+        "shares": "5",
+        "all_in_cost": "1.50",
+    }
+    store.save_state(state)
+    worker = PaperWorker(
+        client=client,
+        settings=settings(tmp_path, early_exit_enabled=True),
+        store=store,
+    )
+
+    assert asyncio.run(worker._exit_positions("2026-08-25T00:00:00+00:00")) == (0, 0)
+    updated = store.load_state()
+    assert tuple(updated.open_positions) == (opened.condition_id,)
+    assert updated.cash == D("36.00")
+    assert updated.realized_pnl == D("0")
+    assert not store.exits_path.exists()
+
+
 def test_weather_settlement_calibrates_provider_probability_against_yes_outcome(tmp_path):
     resolved = market(closed=True)
     resolved.id = "weather-calibration"

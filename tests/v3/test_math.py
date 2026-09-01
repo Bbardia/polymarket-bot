@@ -6,6 +6,7 @@ from src.v3.math import (
     BookLevel,
     complete_set_opportunity,
     correlated_effective_sample_size,
+    execution_bid_vwap,
     execution_vwap,
     fee_adjusted_binary_kelly,
     is_tick_aligned,
@@ -31,6 +32,17 @@ def test_execution_vwap_walks_depth_and_refuses_partial_liquidity():
 
     with pytest.raises(ValueError, match="insufficient liquidity"):
         execution_vwap(asks, D("8"))
+
+
+def test_execution_bid_vwap_walks_highest_bids_first_and_refuses_partial_liquidity():
+    bids = [BookLevel(D("0.40"), D("3")), BookLevel(D("0.50"), D("4"))]
+    quote = execution_bid_vwap(bids, D("5"))
+    assert quote.shares == D("5")
+    assert quote.notional == D("2.40")
+    assert quote.vwap == D("0.48")
+
+    with pytest.raises(ValueError, match="insufficient liquidity"):
+        execution_bid_vwap(bids, D("8"))
 
 
 def test_complete_set_edge_is_based_on_executable_books_and_fees():
