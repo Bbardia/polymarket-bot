@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -11,9 +12,11 @@ from src.v3.paper_weather import (
     EnsembleForecast,
     ForecastUnavailableError,
     HighTemperatureContract,
+    JMAForecast,
     MetNoLocationForecast,
     NOAAStationObservations,
     NWSGridForecast,
+    OpenMeteoEnsemble,
     ObservationBoundResult,
     ObservationUnavailableError,
     OffsetWeatherPublicClient,
@@ -1230,6 +1233,150 @@ def test_nws_forecast_parses_fahrenheit_hourly_grid_data():
     result = asyncio.run(NWSGridForecast(fetch_json=fetch_json).forecast(contract))
     assert result.source == "nws"
     assert result.ensemble_mean_c == D("32.77777777777778")
+
+
+def test_open_meteo_forecast_parses_models_and_persists_cache_and_quota(tmp_path):
+    calls = []
+    contract = parse_exact_high_contract(
+        "Will the highest temperature in Tokyo be 32°C on August 25?",
+        end_date=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
+    )
+    assert contract is not None
+
+    def fetch_json(url, *, params, timeout):
+        calls.append((url, dict(params), timeout))
+        daily: dict[str, object] = {"time": [contract.target_date]}
+        units: dict[str, object] = {"time": "iso8601"}
+        for name, marker in {
+            "ecmwf": "ecmwf_ifs025_ensemble",
+            "gfs": "ncep_gefs_seamless",
+            "icon": "icon_seamless_eps",
+            "gem": "gem_global_ensemble",
+        }.items():
+            key = f"temperature_2m_max_{marker}"
+            daily[key] = [30.0]
+            units[key] = "°C"
+            for member in range(1, 3):
+                member_key = f"temperature_2m_max_member{member:02d}_{marker}"
+                daily[member_key] = [30.0 + member]
+                units[member_key] = "°C"
+        return {"daily": daily, "daily_units": units}
+
+    quota_path = tmp_path / "open_meteo_quota.json"
+    provider = OpenMeteoEnsemble(
+        fetch_json=fetch_json,
+        quota_path=quota_path,
+        max_requests_per_day=1,
+    )
+    first = asyncio.run(provider.forecast(contract, now=datetime(2026, 8, 24, tzinfo=timezone.utc)))
+    second = asyncio.run(provider.forecast(contract, now=datetime(2026, 8, 24, tzinfo=timezone.utc)))
+    assert first.source == "open-meteo"
+    assert first.provider_names == ("open-meteo",)
+    assert first.model_count == 4
+    assert second.raw_probability == first.raw_probability
+    assert len(calls) == 1
+
+    reloaded = OpenMeteoEnsemble(
+        fetch_json=fetch_json,
+        quota_path=quota_path,
+        max_requests_per_day=1,
+    )
+    cached = asyncio.run(reloaded.forecast(contract, now=datetime(2026, 8, 24, tzinfo=timezone.utc)))
+    assert cached.raw_probability == first.raw_probability
+    assert len(calls) == 1
+
+
+def test_open_meteo_enforces_persistent_daily_request_cap(tmp_path):
+    contract = parse_exact_high_contract(
+        "Will the highest temperature in Tokyo be 32°C on August 25?",
+        end_date=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
+    )
+    assert contract is not None
+
+    def fetch_json(url, *, params, timeout):
+        raise RuntimeError("not reached")
+
+    quota_path = tmp_path / "open_meteo_quota.json"
+    quota_path.write_text(json.dumps({"request_times": [datetime.now().timestamp()], "cache": {}}))
+    provider = OpenMeteoEnsemble(
+        fetch_json=fetch_json,
+        quota_path=quota_path,
+        max_requests_per_day=1,
+    )
+    with pytest.raises(ForecastUnavailableError, match="application quota exhausted"):
+        asyncio.run(provider.forecast(contract))
+
+
+def test_jma_forecast_parses_tokyo_daily_maximum_and_rejects_other_cities():
+    contract = parse_exact_high_contract(
+        "Will the highest temperature in Tokyo be 32°C on August 25?",
+        end_date=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
+    )
+    assert contract is not None
+
+    def fetch_json(url, *, params, headers, timeout):
+        assert url.endswith("/130000.json")
+        assert headers["User-Agent"]
+        return [{
+            "timeSeries": [
+                {
+                    "timeDefines": [
+                        "2026-08-25T00:00:00+09:00",
+                        "2026-08-25T09:00:00+09:00",
+                    ],
+                    "areas": [{"area": {"code": "44132"}, "temps": ["24", "32"]}],
+                },
+                {
+                    "timeDefines": ["2026-08-25T00:00:00+09:00"],
+                    "areas": [{"area": {"code": "44132"}, "tempsMax": ["32"]}],
+                },
+            ],
+        }]
+
+    result = asyncio.run(JMAForecast(fetch_json=fetch_json).forecast(contract))
+    assert result.source == "jma"
+    assert result.ensemble_mean_c == D("32")
+    other = parse_exact_high_contract(
+        "Will the highest temperature in Seoul be 32°C on August 25?",
+        end_date=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
+    )
+    assert other is not None
+    with pytest.raises(ForecastUnavailableError, match="no configured coverage"):
+        asyncio.run(JMAForecast(fetch_json=fetch_json).forecast(other))
+
+
+def test_resilient_ensemble_selects_weights_by_city_continent():
+    tokyo = parse_exact_high_contract(
+        "Will the highest temperature in Tokyo be 32°C on August 25?",
+        end_date=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
+    )
+    assert tokyo is not None
+    results = {
+        "jma": D("0.90"),
+        "open-meteo": D("0.60"),
+        "met-no": D("0.30"),
+    }
+
+    class Provider:
+        def __init__(self, name):
+            self.name = name
+
+        async def forecast(self, contract, *, now=None):
+            return EnsembleForecast(
+                raw_probability=results[self.name],
+                ensemble_mean_c=D("30"),
+                ensemble_std_c=D("1"),
+                n_members=4,
+                lead_days=1,
+                model_count=1,
+                source=self.name,
+            )
+
+    result = asyncio.run(ResilientForecastEnsemble([
+        Provider("jma"), Provider("open-meteo"), Provider("met-no"),
+    ]).forecast(tokyo))
+    expected = (D("0.90") * D("0.40") + D("0.60") * D("0.35") + D("0.30") * D("0.20")) / D("0.95")
+    assert result.raw_probability == expected
 
 
 def test_resilient_ensemble_uses_remaining_sources_when_one_provider_is_down():

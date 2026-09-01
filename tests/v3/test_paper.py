@@ -156,7 +156,7 @@ def test_paper_settings_require_all_authenticated_paths_to_remain_disabled(tmp_p
     )
 
 
-def test_default_weather_ensemble_excludes_open_meteo(tmp_path):
+def test_default_weather_ensemble_uses_four_capped_providers(tmp_path):
     worker = PaperWorker(
         client=FakePublicClient([], []),
         settings=settings(
@@ -168,12 +168,16 @@ def test_default_weather_ensemble_excludes_open_meteo(tmp_path):
 
     assert isinstance(worker.forecast, ResilientForecastEnsemble)
     assert tuple(provider.name for provider in worker.forecast.providers) == (
+        "open-meteo",
         "met-no",
         "nws",
+        "jma",
     )
     assert worker.forecast.weights == {
-        "met-no": D("0.55"),
-        "nws": D("0.45"),
+        "open-meteo": D("0.35"),
+        "met-no": D("0.30"),
+        "nws": D("0.20"),
+        "jma": D("0.15"),
     }
 
 

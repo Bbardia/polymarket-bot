@@ -25,6 +25,8 @@ from .paper_weather import (
     MetNoLocationForecast,
     NOAAStationObservations,
     NWSGridForecast,
+    JMAForecast,
+    OpenMeteoEnsemble,
     ObservationProvider,
     OffsetWeatherPublicClient,
     ProbabilityCalibration,
@@ -71,6 +73,8 @@ class PaperSettings:
     max_order_notional: Decimal = Decimal("5")
     max_open_positions: int = 10
     complete_set_enabled: bool = True
+    open_meteo_max_requests_per_day: int = 24
+    open_meteo_cache_seconds: float = 21_600.0
     early_exit_enabled: bool = False
     early_exit_target_return: Decimal = Decimal("0.25")
     early_exit_min_profit: Decimal = Decimal("0.10")
@@ -95,6 +99,10 @@ class PaperSettings:
             raise ValueError("paper reserve fraction must be in [0, 1)")
         if self.max_open_positions < 1:
             raise ValueError("paper max open positions must be positive")
+        if self.open_meteo_max_requests_per_day < 1:
+            raise ValueError("Open-Meteo daily request cap must be positive")
+        if self.open_meteo_cache_seconds <= 0:
+            raise ValueError("Open-Meteo cache duration must be positive")
         if self.early_exit_target_return < ZERO:
             raise ValueError("early-exit target return cannot be negative")
         if self.early_exit_min_profit < ZERO:
@@ -119,6 +127,12 @@ class PaperSettings:
             max_order_notional=_decimal_env("V3_PAPER_MAX_ORDER_NOTIONAL", "5"),
             max_open_positions=int(os.getenv("V3_PAPER_MAX_OPEN_POSITIONS", "10")),
             complete_set_enabled=_env_bool("V3_PAPER_COMPLETE_SET_ENABLED", True),
+            open_meteo_max_requests_per_day=int(
+                os.getenv("V3_PAPER_OPEN_METEO_MAX_REQUESTS_PER_DAY", "24")
+            ),
+            open_meteo_cache_seconds=float(
+                os.getenv("V3_PAPER_OPEN_METEO_CACHE_SECONDS", "21600")
+            ),
             early_exit_enabled=_env_bool("V3_PAPER_EARLY_EXIT_ENABLED", False),
             early_exit_target_return=_decimal_env(
                 "V3_PAPER_EARLY_EXIT_TARGET_RETURN", "0.25"
@@ -560,8 +574,14 @@ class PaperWorker:
             calibrator = ProbabilityCalibration(store.data_dir / "weather_calibration.json")
             self.forecast = ResilientForecastEnsemble(
                 (
+                    OpenMeteoEnsemble(
+                        quota_path=store.data_dir / "open_meteo_quota.json",
+                        max_requests_per_day=settings.open_meteo_max_requests_per_day,
+                        cache_seconds=settings.open_meteo_cache_seconds,
+                    ),
                     MetNoLocationForecast(),
                     NWSGridForecast(),
+                    JMAForecast(),
                 ),
                 calibrator=calibrator,
             )
@@ -813,6 +833,11 @@ class PaperWorker:
             "forecast_source": forecast.source,
             "provider_count": forecast.provider_count,
             "provider_names": list(forecast.provider_names),
+            "provider_weights": {
+                source: str(weight)
+                for source, weight in forecast.provider_weights
+            },
+            "continent": forecast.continent,
             "provider_probabilities": {
                 source: str(probability)
                 for source, probability in forecast.provider_probabilities
@@ -1397,6 +1422,14 @@ class PaperWorker:
             cash=self.state.cash,
             open_positions=len(self.state.open_positions),
         )
+        open_meteo = next(
+            (
+                provider
+                for provider in getattr(self.forecast, "providers", ())
+                if getattr(provider, "name", "") == "open-meteo"
+            ),
+            None,
+        )
         self.store.write_status({
             "mode": "PAPER",
             "running": bool(self.store.current_pid() and self.store._pid_alive(self.store.current_pid() or 0)),
@@ -1409,6 +1442,11 @@ class PaperWorker:
             "weather_directional_enabled": self.settings.weather_policy.enabled,
             "weather_order_cap": str(self.settings.weather_policy.max_order_notional),
             "weather_position_cap": self.settings.weather_policy.max_open_positions,
+            "open_meteo_request_cap": self.settings.open_meteo_max_requests_per_day,
+            "open_meteo_cache_seconds": self.settings.open_meteo_cache_seconds,
+            "open_meteo_requests_last_24h": (
+                None if open_meteo is None else open_meteo.requests_last_24h
+            ),
             "sdk_version": polymarket.__version__,
             "started_at": self.state.started_at,
             "last_scan_at": scanned_at,
