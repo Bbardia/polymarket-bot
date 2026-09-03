@@ -81,6 +81,9 @@ class PaperSettings:
     early_exit_enabled: bool = False
     early_exit_target_return: Decimal = Decimal("0.25")
     early_exit_min_profit: Decimal = Decimal("0.10")
+    hybrid_exit_enabled: bool = False
+    hybrid_exit_fraction: Decimal = Decimal("0.75")
+    hybrid_runner_target_return: Decimal = Decimal("0.50")
     weather_policy: WeatherPaperPolicy = field(
         default_factory=lambda: WeatherPaperPolicy(enabled=False)
     )
@@ -114,6 +117,15 @@ class PaperSettings:
             raise ValueError("early-exit target return cannot be negative")
         if self.early_exit_min_profit < ZERO:
             raise ValueError("early-exit minimum profit cannot be negative")
+        if self.hybrid_exit_enabled and not self.early_exit_enabled:
+            raise ValueError("hybrid exits require early exits to be enabled")
+        if self.hybrid_exit_enabled and not (ZERO < self.hybrid_exit_fraction < ONE):
+            raise ValueError("hybrid exit fraction must be between zero and one")
+        if (
+            self.hybrid_exit_enabled
+            and self.hybrid_runner_target_return < self.early_exit_target_return
+        ):
+            raise ValueError("hybrid runner target must not be below the first exit target")
 
     @classmethod
     def from_env(cls, root: Path) -> "PaperSettings":
@@ -151,6 +163,13 @@ class PaperSettings:
             ),
             early_exit_min_profit=_decimal_env(
                 "V3_PAPER_EARLY_EXIT_MIN_PROFIT", "0.10"
+            ),
+            hybrid_exit_enabled=_env_bool("V3_PAPER_HYBRID_ENABLED", False),
+            hybrid_exit_fraction=_decimal_env(
+                "V3_PAPER_HYBRID_EXIT_FRACTION", "0.75"
+            ),
+            hybrid_runner_target_return=_decimal_env(
+                "V3_PAPER_HYBRID_RUNNER_TARGET_RETURN", "0.50"
             ),
             weather_policy=WeatherPaperPolicy(
                 enabled=_env_bool("V3_PAPER_WEATHER_ENABLED", True),
@@ -1320,7 +1339,13 @@ class PaperWorker:
         return settled, errors
 
     async def _exit_positions(self, exited_at: str) -> tuple[int, int]:
-        """Paper-sell complete directional positions at executable bids."""
+        """Paper-sell directional positions at executable bids.
+
+        Hybrid campaigns take a configurable partial exit at the first target,
+        then leave the residual position as a runner. The residual can be sold
+        at the higher runner target or settle normally. This remains a paper
+        simulation because partial quantities may be below venue minimums.
+        """
         if not self.settings.early_exit_enabled:
             return 0, 0
 
@@ -1371,25 +1396,50 @@ class PaperWorker:
                     )
                     for level in book.bids
                 )
-                quote = execution_bid_vwap(levels, shares)
-                fees = execution_fee(levels, shares, context.fee_rate)
+                hybrid = self.settings.hybrid_exit_enabled
+                partial_exit = hybrid and not bool(position.get("hybrid_exit_done", False))
+                exit_shares = (
+                    shares * self.settings.hybrid_exit_fraction
+                    if partial_exit
+                    else shares
+                )
+                if exit_shares <= ZERO or exit_shares > shares:
+                    continue
+                quote = execution_bid_vwap(levels, exit_shares)
+                fees = execution_fee(levels, exit_shares, context.fee_rate)
                 net_proceeds = quote.notional - fees
-                entry_cost = Decimal(str(position["all_in_cost"]))
+                position_cost = Decimal(str(position["all_in_cost"]))
+                entry_cost = (
+                    position_cost * self.settings.hybrid_exit_fraction
+                    if partial_exit
+                    else position_cost
+                )
                 profit = net_proceeds - entry_cost
                 return_on_cost = profit / entry_cost if entry_cost > ZERO else ZERO
+                target_return = (
+                    self.settings.early_exit_target_return
+                    if not hybrid or partial_exit
+                    else self.settings.hybrid_runner_target_return
+                )
                 if (
                     profit < self.settings.early_exit_min_profit
-                    or return_on_cost < self.settings.early_exit_target_return
+                    or return_on_cost < target_return
                 ):
                     continue
 
                 self.state.cash += net_proceeds
                 self.state.realized_pnl += profit
                 self.state.total_paper_exits += 1
-                del self.state.open_positions[condition_id]
+                if partial_exit:
+                    position["shares"] = str(shares - exit_shares)
+                    position["all_in_cost"] = str(position_cost - entry_cost)
+                    position["hybrid_exit_done"] = True
+                else:
+                    del self.state.open_positions[condition_id]
                 exit_id = (
                     f"paper-exit:{condition_id}:"
-                    f"{position.get('opened_at', '')}"
+                    f"{position.get('opened_at', '')}:"
+                    f"{'partial' if partial_exit else 'runner' if hybrid else 'full'}"
                 )
                 self.store.commit_with_audit(
                     self.state,
@@ -1402,7 +1452,7 @@ class PaperWorker:
                         "strategy": str(position.get("strategy", "")),
                         "side": str(position.get("side", "")),
                         "token_id": token_id,
-                        "shares": str(shares),
+                        "shares": str(exit_shares),
                         "entry_cost": str(entry_cost),
                         "exit_vwap": str(quote.vwap),
                         "exit_notional": str(quote.notional),
@@ -1410,10 +1460,29 @@ class PaperWorker:
                         "net_proceeds": str(net_proceeds),
                         "realized_pnl": str(profit),
                         "return_on_cost": str(return_on_cost),
-                        "target_return": str(self.settings.early_exit_target_return),
+                        "target_return": str(target_return),
                         "minimum_profit": str(self.settings.early_exit_min_profit),
                         "paper_cash_after": str(self.state.cash),
-                        "reason": "paper early-exit profit target",
+                        "hybrid": hybrid,
+                        "hybrid_exit_fraction": (
+                            str(self.settings.hybrid_exit_fraction) if hybrid else None
+                        ),
+                        "runner_target_return": (
+                            str(self.settings.hybrid_runner_target_return) if hybrid else None
+                        ),
+                        "remaining_shares": (
+                            str(shares - exit_shares) if partial_exit else "0"
+                        ),
+                        "remaining_entry_cost": (
+                            str(position_cost - entry_cost) if partial_exit else "0"
+                        ),
+                        "reason": (
+                            "paper hybrid partial-exit profit target"
+                            if partial_exit
+                            else "paper hybrid runner profit target"
+                            if hybrid
+                            else "paper early-exit profit target"
+                        ),
                         "public_data_only": True,
                     },
                 )
@@ -1588,6 +1657,11 @@ class PaperWorker:
             "paper_exits_enabled": self.settings.early_exit_enabled,
             "paper_exit_target_return": str(self.settings.early_exit_target_return),
             "paper_exit_minimum_profit": str(self.settings.early_exit_min_profit),
+            "paper_hybrid_enabled": self.settings.hybrid_exit_enabled,
+            "paper_hybrid_exit_fraction": str(self.settings.hybrid_exit_fraction),
+            "paper_hybrid_runner_target_return": str(
+                self.settings.hybrid_runner_target_return
+            ),
             "paper_exits_this_cycle": summary.paper_exits,
             "settlements_this_cycle": summary.settlements,
             "errors_this_cycle": summary.errors,

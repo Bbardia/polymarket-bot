@@ -902,6 +902,67 @@ def test_paper_early_exit_refuses_shallow_bid_books_without_mutation(tmp_path):
     assert not store.exits_path.exists()
 
 
+def test_paper_hybrid_exit_keeps_runner_then_exits_at_higher_target(tmp_path):
+    opened = market()
+    opened.trading.fees_enabled = True
+    opened.trading.fee_schedule = SimpleNamespace(rate=D("0.05"))
+    exit_book = book("yes-token", ask="0.50", bid="0.40")
+    client = FakePublicClient([opened], [exit_book])
+    store = PaperStore(tmp_path)
+    state = PaperState.new(D("37.50"))
+    state.cash = D("36.00")
+    state.open_positions[opened.condition_id] = {
+        "strategy": "weather_directional",
+        "event_key": "weather:singapore:2026-08-25",
+        "opened_at": "2026-08-24T00:00:00+00:00",
+        "market_id": opened.id,
+        "condition_id": opened.condition_id,
+        "side": "YES",
+        "token_id": "yes-token",
+        "shares": "5",
+        "all_in_cost": "1.50",
+    }
+    store.save_state(state)
+    worker = PaperWorker(
+        client=client,
+        settings=settings(
+            tmp_path,
+            early_exit_enabled=True,
+            early_exit_target_return=D("0.25"),
+            early_exit_min_profit=D("0.10"),
+            hybrid_exit_enabled=True,
+            hybrid_exit_fraction=D("0.75"),
+            hybrid_runner_target_return=D("0.50"),
+        ),
+        store=store,
+    )
+
+    assert asyncio.run(worker._exit_positions("2026-08-25T00:00:00+00:00")) == (1, 0)
+    partial_state = store.load_state()
+    partial = partial_state.open_positions[opened.condition_id]
+    assert partial["shares"] == "1.25"
+    assert partial["all_in_cost"] == "0.3750"
+    assert partial["hybrid_exit_done"] is True
+    assert partial_state.cash == D("37.455000")
+    assert partial_state.realized_pnl == D("0.330000")
+    partial_exit = store.read_records(store.exits_path)[0]
+    assert partial_exit["shares"] == "3.75"
+    assert partial_exit["remaining_shares"] == "1.25"
+    assert partial_exit["reason"] == "paper hybrid partial-exit profit target"
+
+    exit_book.bids = (SimpleNamespace(price=D("0.80"), size=D("100")),)
+    assert asyncio.run(worker._exit_positions("2026-08-25T01:00:00+00:00")) == (1, 0)
+    final_state = store.load_state()
+    assert final_state.open_positions == {}
+    assert final_state.cash == D("38.445000")
+    assert final_state.realized_pnl == D("0.945000")
+    exits = store.read_records(store.exits_path)
+    assert len(exits) == 2
+    assert exits[1]["shares"] == "1.25"
+    assert exits[1]["target_return"] == "0.50"
+    assert exits[1]["reason"] == "paper hybrid runner profit target"
+
+
 def test_weather_settlement_calibrates_provider_probability_against_yes_outcome(tmp_path):
     resolved = market(closed=True)
     resolved.id = "weather-calibration"
