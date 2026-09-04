@@ -505,6 +505,7 @@ class WeatherPaperPolicy:
     fractional_kelly: Decimal = Decimal("0.05")
     uncertainty_z: Decimal = ONE
     observations_enabled: bool = False
+    require_healthy_forecast: bool = False
 
     def __post_init__(self) -> None:
         if self.horizon_days < 1 or self.horizon_days > 14:

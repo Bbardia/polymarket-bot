@@ -63,6 +63,9 @@ class PaperSettings:
     paper_trading: bool = True
     live_enabled: bool = False
     account_reads_enabled: bool = False
+    entries_enabled: bool = True
+    max_realized_loss: Decimal = ZERO
+    max_drawdown_fraction: Decimal = ZERO
     scan_interval_seconds: float = 300.0
     market_limit: int = 25
     discovery_max_markets: int = 2_000
@@ -97,6 +100,10 @@ class PaperSettings:
             raise ValueError("paper capital and order cap must be positive")
         if not (ZERO <= self.reserve_fraction < ONE):
             raise ValueError("paper reserve fraction must be in [0, 1)")
+        if self.max_realized_loss < ZERO:
+            raise ValueError("paper maximum realized loss cannot be negative")
+        if not (ZERO <= self.max_drawdown_fraction < ONE):
+            raise ValueError("paper maximum drawdown fraction must be in [0, 1)")
         if self.max_open_positions < 1:
             raise ValueError("paper max open positions must be positive")
         if self.open_meteo_max_requests_per_day < 1:
@@ -117,6 +124,11 @@ class PaperSettings:
             paper_trading=_env_bool("PAPER_TRADING", True),
             live_enabled=_env_bool("ENABLE_V3_LIVE_TRADING", False),
             account_reads_enabled=_env_bool("ENABLE_V3_ACCOUNT_READS", False),
+            entries_enabled=_env_bool("V3_PAPER_ENTRIES_ENABLED", True),
+            max_realized_loss=_decimal_env("V3_PAPER_MAX_REALIZED_LOSS", "0"),
+            max_drawdown_fraction=_decimal_env(
+                "V3_PAPER_MAX_DRAWDOWN_FRACTION", "0"
+            ),
             scan_interval_seconds=float(os.getenv("V3_PAPER_SCAN_INTERVAL_SECONDS", "300")),
             market_limit=int(os.getenv("V3_PAPER_MARKET_LIMIT", "25")),
             discovery_max_markets=int(os.getenv("V3_PAPER_DISCOVERY_MAX_MARKETS", "2000")),
@@ -159,6 +171,10 @@ class PaperSettings:
                     "V3_PAPER_WEATHER_OBSERVATIONS_ENABLED",
                     True,
                 ),
+                require_healthy_forecast=_env_bool(
+                    "V3_PAPER_WEATHER_REQUIRE_HEALTHY_FORECAST",
+                    False,
+                ),
             ),
         )
 
@@ -187,6 +203,7 @@ class PaperState:
     total_paper_trades: int = 0
     total_paper_exits: int = 0
     realized_pnl: Decimal = ZERO
+    peak_entry_equity: Decimal = ZERO
     open_positions: dict[str, dict[str, Any]] = field(default_factory=dict)
     traded_conditions: set[str] = field(default_factory=set)
     traded_strategy_keys: set[str] = field(default_factory=set)
@@ -196,7 +213,12 @@ class PaperState:
 
     @classmethod
     def new(cls, initial_cash: Decimal) -> "PaperState":
-        return cls(started_at=_utc_now(), initial_cash=initial_cash, cash=initial_cash)
+        return cls(
+            started_at=_utc_now(),
+            initial_cash=initial_cash,
+            cash=initial_cash,
+            peak_entry_equity=initial_cash,
+        )
 
     @classmethod
     def from_json(cls, payload: Mapping[str, Any]) -> "PaperState":
@@ -209,6 +231,10 @@ class PaperState:
             total_paper_trades=int(payload.get("total_paper_trades", 0)),
             total_paper_exits=int(payload.get("total_paper_exits", 0)),
             realized_pnl=Decimal(str(payload.get("realized_pnl", "0"))),
+            peak_entry_equity=Decimal(str(payload.get(
+                "peak_entry_equity",
+                payload.get("initial_cash", "0"),
+            ))),
             open_positions={str(key): dict(value) for key, value in payload.get("open_positions", {}).items()},
             traded_conditions={str(value) for value in payload.get("traded_conditions", [])},
             traded_strategy_keys={
@@ -233,6 +259,7 @@ class PaperState:
             "total_paper_trades": self.total_paper_trades,
             "total_paper_exits": self.total_paper_exits,
             "realized_pnl": str(self.realized_pnl),
+            "peak_entry_equity": str(self.peak_entry_equity),
             "open_positions": self.open_positions,
             "traded_conditions": sorted(self.traded_conditions),
             "traded_strategy_keys": sorted(self.traded_strategy_keys),
@@ -593,6 +620,51 @@ class PaperWorker:
         ):
             self.observation_provider = NOAAStationObservations()
 
+    def _open_entry_cost(self) -> Decimal:
+        return sum(
+            (
+                Decimal(str(position.get("all_in_cost", "0")))
+                for position in self.state.open_positions.values()
+            ),
+            ZERO,
+        )
+
+    def _entry_equity(self) -> Decimal:
+        """Return cash plus original cost of open positions."""
+        return self.state.cash + self._open_entry_cost()
+
+    def _refresh_peak_entry_equity(self) -> None:
+        self.state.peak_entry_equity = max(
+            self.state.peak_entry_equity,
+            self._entry_equity(),
+        )
+
+    def _entry_block_reason(self, *, forecast_status: str | None = None) -> str | None:
+        if not self.settings.entries_enabled:
+            return "paper entries disabled by profile"
+        if (
+            self.settings.max_realized_loss > ZERO
+            and self.state.realized_pnl <= -self.settings.max_realized_loss
+        ):
+            return "paper realized-loss breaker reached"
+        self._refresh_peak_entry_equity()
+        if (
+            self.settings.max_drawdown_fraction > ZERO
+            and self.state.peak_entry_equity > ZERO
+        ):
+            drawdown = (
+                self.state.peak_entry_equity - self._entry_equity()
+            ) / self.state.peak_entry_equity
+            if drawdown >= self.settings.max_drawdown_fraction:
+                return "paper drawdown breaker reached"
+        if (
+            forecast_status is not None
+            and self.settings.weather_policy.require_healthy_forecast
+            and forecast_status != "available"
+        ):
+            return "weather forecast health gate blocked entries"
+        return None
+
     async def _discover_markets(self) -> tuple[Any, ...]:
         markets: list[Any] = []
         examined = 0
@@ -722,7 +794,11 @@ class PaperWorker:
         candidate["candidate_id"] = f"complete-set:{condition_id}:{scanned_at}"
         paper_reason = "paper candidate"
         paper_executed = False
-        if condition_id in self.state.traded_conditions:
+        entry_block_reason = self._entry_block_reason()
+        if entry_block_reason is not None:
+            paper_reason = entry_block_reason
+            candidate.update({"tradeable": False, "reason": entry_block_reason})
+        elif condition_id in self.state.traded_conditions:
             paper_reason = "condition already paper traded"
         elif len(self.state.open_positions) >= self.settings.max_open_positions:
             paper_reason = "paper open-position cap reached"
@@ -773,7 +849,12 @@ class PaperWorker:
             "paper_cash_after": str(self.state.cash),
         })
         self.store.append_record(self.store.candidates_path, candidate)
-        row.update({"paper_executed": paper_executed, "paper_reason": paper_reason})
+        row.update({
+            "paper_executed": paper_executed,
+            "paper_reason": paper_reason,
+            "tradeable": row["tradeable"] if entry_block_reason is None else False,
+            "reason": row["reason"] if entry_block_reason is None else entry_block_reason,
+        })
         return row, True, paper_executed
 
     @staticmethod
@@ -1030,6 +1111,9 @@ class PaperWorker:
             ),
         )
         paper_trades = 0
+        entry_block_reason = self._entry_block_reason(
+            forecast_status=result.forecast_status,
+        )
         weather_open = sum(
             1
             for position in self.state.open_positions.values()
@@ -1053,7 +1137,10 @@ class PaperWorker:
             )
             paper_reason = "weather paper candidate"
             paper_executed = False
-            if evaluation.event_key in self.state.traded_strategy_keys:
+            if entry_block_reason is not None:
+                paper_reason = entry_block_reason
+                candidate.update({"tradeable": False, "reason": entry_block_reason})
+            elif evaluation.event_key in self.state.traded_strategy_keys:
                 paper_reason = "weather event already paper traded"
             elif weather_open >= self.settings.weather_policy.max_open_positions:
                 paper_reason = "weather paper position cap reached"
@@ -1112,6 +1199,8 @@ class PaperWorker:
             row.update({
                 "paper_executed": paper_executed,
                 "paper_reason": paper_reason,
+                "tradeable": row["tradeable"] if entry_block_reason is None else False,
+                "reason": row["reason"] if entry_block_reason is None else entry_block_reason,
             })
             self.store.append_record(self.store.weather_scans_path, row)
         return _WeatherScanSummary(
@@ -1353,6 +1442,7 @@ class PaperWorker:
         errors += settlement_errors
         paper_exits, exit_errors = await self._exit_positions(scanned_at)
         errors += exit_errors
+        self._refresh_peak_entry_equity()
         if self.settings.complete_set_enabled:
             try:
                 markets = await self._discover_markets()
@@ -1440,6 +1530,16 @@ class PaperWorker:
             "live_trading_enabled": False,
             "complete_set_enabled": self.settings.complete_set_enabled,
             "weather_directional_enabled": self.settings.weather_policy.enabled,
+            "paper_entries_enabled": self.settings.entries_enabled,
+            "paper_max_realized_loss": str(self.settings.max_realized_loss),
+            "paper_max_drawdown_fraction": str(self.settings.max_drawdown_fraction),
+            "paper_peak_entry_equity": str(self.state.peak_entry_equity),
+            "paper_entry_block_reason": self._entry_block_reason(
+                forecast_status=weather.forecast_status,
+            ),
+            "paper_weather_require_healthy_forecast": (
+                self.settings.weather_policy.require_healthy_forecast
+            ),
             "weather_order_cap": str(self.settings.weather_policy.max_order_notional),
             "weather_position_cap": self.settings.weather_policy.max_open_positions,
             "open_meteo_request_cap": self.settings.open_meteo_max_requests_per_day,

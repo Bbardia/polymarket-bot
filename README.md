@@ -18,7 +18,9 @@ research compatibility; its live path is permanently disabled.
   per rolling 24 hours and cached for six hours in ignored campaign state. A
   provider outage is recorded as degraded telemetry; remaining sources continue
   with wider uncertainty. Resolved paper outcomes update a persistent,
-  conservative per-source/city/horizon calibrator.
+  conservative per-source/city/horizon calibrator. A profile may require a fully
+  available forecast before admitting new entries; degraded forecasts are then
+  observation-only.
 - Provider weights are continent-aware: NWS is preferred in North America, MET
   Norway in Europe, JMA in its configured Japanese coverage, and Open-Meteo is
   the leading global fallback elsewhere. Unavailable providers are removed and
@@ -40,6 +42,9 @@ research compatibility; its live path is permanently disabled.
 - Optional paper early exits use the complete directional position, executable
   bid-side depth, and nonlinear exit fees. They record realized exit P&L in a
   separate `paper_exits.jsonl` stream and never submit orders.
+- Paper profiles can freeze new entries while continuing to settle and manage
+  existing paper positions. Optional realized-loss and entry-cost drawdown breakers
+  provide persistent admission controls; they never enable live trading.
 - Legacy `run_full_loop.py --live` exits before constructing a client.
 - Repository watchdog is status-only and cannot launch the bot.
 - No Polymarket Hermes/Claude cron is required or configured.
