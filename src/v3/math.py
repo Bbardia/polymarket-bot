@@ -52,12 +52,17 @@ def taker_fee(*, shares: Decimal, price: Decimal, fee_rate: Decimal) -> Decimal:
     return shares * fee_rate * price * (ONE - price)
 
 
-def _walk_levels(levels: Sequence[BookLevel] | Iterable[BookLevel], shares: Decimal) -> tuple[tuple[BookLevel, Decimal], ...]:
+def _walk_levels(
+    levels: Sequence[BookLevel] | Iterable[BookLevel],
+    shares: Decimal,
+    *,
+    descending: bool = False,
+) -> tuple[tuple[BookLevel, Decimal], ...]:
     if shares <= ZERO:
         raise ValueError("requested shares must be positive")
     remaining = shares
     filled: list[tuple[BookLevel, Decimal]] = []
-    for level in sorted(tuple(levels), key=lambda item: item.price):
+    for level in sorted(tuple(levels), key=lambda item: item.price, reverse=descending):
         take = min(level.size, remaining)
         filled.append((level, take))
         remaining -= take
@@ -86,6 +91,19 @@ def execution_vwap(levels: Sequence[BookLevel] | Iterable[BookLevel], shares: De
         raise ValueError("requested shares must be positive")
 
     filled = _walk_levels(levels, shares)
+    notional = sum((take * level.price for level, take in filled), ZERO)
+    return ExecutionQuote(shares=shares, notional=notional, vwap=notional / shares)
+
+
+def execution_bid_vwap(
+    levels: Sequence[BookLevel] | Iterable[BookLevel],
+    shares: Decimal,
+) -> ExecutionQuote:
+    """Walk bids from highest downward and require the requested size in full."""
+    if shares <= ZERO:
+        raise ValueError("requested shares must be positive")
+
+    filled = _walk_levels(levels, shares, descending=True)
     notional = sum((take * level.price for level, take in filled), ZERO)
     return ExecutionQuote(shares=shares, notional=notional, vwap=notional / shares)
 

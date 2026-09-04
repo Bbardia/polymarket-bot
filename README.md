@@ -13,10 +13,19 @@ research compatibility; its live path is permanently disabled.
 - `paper-run` is a public-data-only worker with durable local scans, candidates,
   simulated positions, and settlement records. It refuses to run if account
   reads or live trading are enabled.
-- V4 weather paper research combines MET Norway and NWS hourly forecasts when
-  coverage exists. A provider outage is recorded as degraded telemetry;
-  remaining sources continue with wider uncertainty. Resolved paper
-  outcomes update a persistent, conservative per-source/city/horizon calibrator.
+- V4 weather paper research combines Open-Meteo, MET Norway, NWS, and JMA
+  forecasts when coverage exists. Open-Meteo is capped at 24 uncached requests
+  per rolling 24 hours and cached for six hours in ignored campaign state. A
+  provider outage is recorded as degraded telemetry; remaining sources continue
+  with wider uncertainty. Resolved paper outcomes update a persistent,
+  conservative per-source/city/horizon calibrator. A profile may require a fully
+  available forecast before admitting new entries; degraded forecasts are then
+  observation-only.
+- Provider weights are continent-aware: NWS is preferred in North America, MET
+  Norway in Europe, JMA in its configured Japanese coverage, and Open-Meteo is
+  the leading global fallback elsewhere. Unavailable providers are removed and
+  the remaining weights are renormalized; JMA is currently configured for Tokyo
+  only rather than claiming unsupported pan-Asian coverage.
 - Weather market discovery uses read-only Gamma offset pagination because the
   official SDK's Weather-tag keyset continuation is currently Cloudflare-blocked;
   successive pages are deduplicated and bounded by the existing scan limits.
@@ -30,6 +39,12 @@ research compatibility; its live path is permanently disabled.
   unless explicitly supplied as managed local IDs.
 - Queue-aware maker replay and resolved-candidate shadow reports are offline,
   file-based inspection tools only.
+- Optional paper early exits use the complete directional position, executable
+  bid-side depth, and nonlinear exit fees. They record realized exit P&L in a
+  separate `paper_exits.jsonl` stream and never submit orders.
+- Paper profiles can freeze new entries while continuing to settle and manage
+  existing paper positions. Optional realized-loss and entry-cost drawdown breakers
+  provide persistent admission controls; they never enable live trading.
 - Legacy `run_full_loop.py --live` exits before constructing a client.
 - Repository watchdog is status-only and cannot launch the bot.
 - No Polymarket Hermes/Claude cron is required or configured.
@@ -141,8 +156,8 @@ separately labeled strategies:
   after fees. It never accepts a mathematically locked-in loss merely to create
   activity.
 - Directional weather: discovers exact, range, and tail daily-high buckets
-  from the public Weather tag and compares executable prices with MET Norway
-  and NWS forecasts. Resolution URLs must identify the
+  from the public Weather tag and compares executable prices with four
+  regional/global forecast sources. Resolution URLs must identify the
   modeled airport station. Same-day paper entries always fail closed unless a
   successful public NOAA observation exists for that exact station and local
   date. The paper-only lane uses a 3% base edge plus
@@ -164,6 +179,7 @@ weather_calibration.json persistent paper-only source/city/horizon probability c
 candidates.jsonl     positive strategy candidates and cap decisions
 paper_trades.jsonl   idempotent simulated-entry audit records
 settlements.jsonl    idempotent public-resolution settlement audit records
+paper_exits.jsonl    idempotent paper-only early-exit audit records
 ```
 
 `shadow-report` expects one resolved candidate per line. Decimal values should

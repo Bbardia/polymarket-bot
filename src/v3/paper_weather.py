@@ -30,7 +30,42 @@ from .weather_surface import EventSurface, SurfaceBucket, analyze_event_surface
 ZERO = Decimal("0")
 ONE = Decimal("1")
 HALF = Decimal("0.5")
+OPEN_METEO_ENSEMBLE = "https://ensemble-api.open-meteo.com/v1/ensemble"
 NOAA_METAR = "https://aviationweather.gov/api/data/metar"
+ENSEMBLE_MODELS = "ecmwf_ifs025,gfs_seamless,icon_seamless,gem_global"
+MODEL_KEY_MARKERS: Mapping[str, str] = {
+    "ecmwf": "ecmwf_ifs025_ensemble",
+    "gfs": "ncep_gefs_seamless",
+    "icon": "icon_seamless_eps",
+    "gem": "gem_global_ensemble",
+}
+
+CITY_CONTINENTS: Mapping[str, str] = {
+    "new york": "north_america", "nyc": "north_america", "chicago": "north_america",
+    "seattle": "north_america", "atlanta": "north_america", "dallas": "north_america",
+    "miami": "north_america", "los angeles": "north_america", "austin": "north_america",
+    "houston": "north_america", "denver": "north_america", "san francisco": "north_america",
+    "toronto": "north_america", "mexico city": "north_america", "panama city": "north_america",
+    "ankara": "europe", "istanbul": "europe", "munich": "europe", "milan": "europe",
+    "madrid": "europe", "warsaw": "europe", "amsterdam": "europe", "helsinki": "europe",
+    "berlin": "europe", "moscow": "europe", "stockholm": "europe",
+    "tokyo": "asia", "seoul": "asia", "shanghai": "asia", "singapore": "asia",
+    "hong kong": "asia", "taipei": "asia", "wuhan": "asia", "lucknow": "asia",
+    "kuala lumpur": "asia", "jakarta": "asia", "mumbai": "asia", "jeddah": "asia",
+    "karachi": "asia", "busan": "asia", "qingdao": "asia", "guangzhou": "asia",
+    "tel aviv": "asia", "buenos aires": "south_america", "sao paulo": "south_america",
+    "cape town": "africa", "lagos": "africa", "sydney": "oceania",
+}
+
+CONTINENT_WEIGHTS: Mapping[str, Mapping[str, Decimal]] = {
+    "north_america": {"nws": Decimal("0.45"), "open-meteo": Decimal("0.30"), "met-no": Decimal("0.15"), "jma": Decimal("0.10")},
+    "europe": {"met-no": Decimal("0.45"), "open-meteo": Decimal("0.35"), "jma": Decimal("0.10"), "nws": Decimal("0.10")},
+    "asia": {"jma": Decimal("0.40"), "open-meteo": Decimal("0.35"), "met-no": Decimal("0.20"), "nws": Decimal("0.05")},
+    "oceania": {"open-meteo": Decimal("0.45"), "met-no": Decimal("0.35"), "jma": Decimal("0.10"), "nws": Decimal("0.10")},
+    "south_america": {"open-meteo": Decimal("0.45"), "met-no": Decimal("0.35"), "jma": Decimal("0.10"), "nws": Decimal("0.10")},
+    "africa": {"open-meteo": Decimal("0.45"), "met-no": Decimal("0.35"), "jma": Decimal("0.10"), "nws": Decimal("0.10")},
+    "global": {"open-meteo": Decimal("0.35"), "met-no": Decimal("0.30"), "nws": Decimal("0.20"), "jma": Decimal("0.15")},
+}
 
 # Airport/station coordinates matching the locations used by weather contracts.
 CITY_COORDS: Mapping[str, tuple[float, float]] = {
@@ -367,6 +402,8 @@ class EnsembleForecast:
     provider_probabilities: tuple[tuple[str, Decimal], ...] = ()
     provider_failures: tuple[tuple[str, str], ...] = ()
     calibration_samples: int = 0
+    continent: str = "global"
+    provider_weights: tuple[tuple[str, Decimal], ...] = ()
 
 
 class ProbabilityCalibration:
@@ -468,6 +505,7 @@ class WeatherPaperPolicy:
     fractional_kelly: Decimal = Decimal("0.05")
     uncertainty_z: Decimal = ONE
     observations_enabled: bool = False
+    require_healthy_forecast: bool = False
 
     def __post_init__(self) -> None:
         if self.horizon_days < 1 or self.horizon_days > 14:
@@ -836,6 +874,31 @@ def _default_noaa_fetch_json(
     return response.json()
 
 
+JsonFetcher = Callable[..., Mapping[str, Any]]
+
+
+def _default_fetch_json(
+    url: str,
+    *,
+    params: Mapping[str, Any],
+    timeout: float,
+) -> Mapping[str, Any]:
+    response = requests.get(
+        url,
+        params=params,
+        headers={
+            "User-Agent": "polymarket-bot-weather-research/5.0",
+            "Accept": "application/json",
+        },
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, Mapping):
+        raise ValueError("weather provider response must be a JSON object")
+    return payload
+
+
 def _parse_report_time(raw_value: Any) -> datetime:
     if not isinstance(raw_value, str):
         raise ValueError("NOAA METAR reportTime must be an ISO timestamp")
@@ -1135,6 +1198,348 @@ def _ensemble_probability(
     )
 
 
+class OpenMeteoEnsemble:
+    """Quota-capped Open-Meteo multi-model forecast adapter."""
+
+    name = "open-meteo"
+
+    def __init__(
+        self,
+        *,
+        fetch_json: JsonFetcher = _default_fetch_json,
+        min_members: int = 10,
+        cache_seconds: float = 21_600,
+        timeout_seconds: float = 20,
+        failure_backoff_seconds: float = 300,
+        max_requests_per_day: int = 24,
+        quota_path: Path | None = None,
+    ) -> None:
+        if (
+            min_members < 2
+            or cache_seconds <= 0
+            or timeout_seconds <= 0
+            or failure_backoff_seconds <= 0
+            or max_requests_per_day < 1
+        ):
+            raise ValueError("invalid Open-Meteo client settings")
+        self._fetch_json = fetch_json
+        self._min_members = min_members
+        self._cache_seconds = cache_seconds
+        self._timeout_seconds = timeout_seconds
+        self._failure_backoff_seconds = failure_backoff_seconds
+        self._max_requests_per_day = max_requests_per_day
+        self._quota_path = quota_path
+        self._cache: dict[
+            tuple[str, str],
+            tuple[float, tuple[tuple[float, ...], ...]],
+        ] = {}
+        self._request_times: list[float] = []
+        self._failure_until: dict[tuple[str, str], float] = {}
+        self._failure_messages: dict[tuple[str, str], str] = {}
+        self._load_quota_state()
+
+    def _load_quota_state(self) -> None:
+        if self._quota_path is None or not self._quota_path.is_file():
+            return
+        try:
+            payload = json.loads(self._quota_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(payload, dict):
+            return
+        now = time.time()
+        raw_times = payload.get("request_times", [])
+        if isinstance(raw_times, list):
+            self._request_times = [
+                float(value)
+                for value in raw_times
+                if isinstance(value, (int, float)) and now - float(value) < 86_400
+            ]
+        raw_cache = payload.get("cache", {})
+        if not isinstance(raw_cache, dict):
+            return
+        for raw_key, raw_value in raw_cache.items():
+            if not isinstance(raw_value, dict):
+                continue
+            expires_at = raw_value.get("expires_at")
+            raw_members = raw_value.get("members")
+            if not isinstance(expires_at, (int, float)) or expires_at <= now:
+                continue
+            if not isinstance(raw_members, list):
+                continue
+            try:
+                members = tuple(
+                    tuple(float(value) for value in family)
+                    for family in raw_members
+                    if isinstance(family, list)
+                )
+            except (TypeError, ValueError):
+                continue
+            cache_key = str(raw_key).split("|", 1)
+            if len(members) == len(MODEL_KEY_MARKERS) and len(cache_key) == 2:
+                self._cache[(cache_key[0], cache_key[1])] = (
+                    float(expires_at),
+                    members,
+                )
+
+    def _save_quota_state(self) -> None:
+        if self._quota_path is None:
+            return
+        self._quota_path.parent.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        cache = {
+            "|".join(key): {
+                "expires_at": expires_at,
+                "members": [list(family) for family in members],
+            }
+            for key, (expires_at, members) in self._cache.items()
+            if expires_at > now
+        }
+        payload = {
+            "request_times": [value for value in self._request_times if now - value < 86_400],
+            "cache": cache,
+        }
+        temporary = self._quota_path.with_suffix(self._quota_path.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.replace(self._quota_path)
+
+    def _prune(self, now: float) -> None:
+        self._request_times = [value for value in self._request_times if now - value < 86_400]
+        for key, (expires_at, _members) in tuple(self._cache.items()):
+            if expires_at <= now:
+                self._cache.pop(key, None)
+        for key, expires_at in tuple(self._failure_until.items()):
+            if expires_at <= now:
+                self._failure_until.pop(key, None)
+                self._failure_messages.pop(key, None)
+
+    def _reserve_request(self, now: float) -> None:
+        self._prune(now)
+        if len(self._request_times) >= self._max_requests_per_day:
+            raise ForecastUnavailableError(
+                f"Open-Meteo application quota exhausted ({self._max_requests_per_day} requests/24h)",
+                provider_global=True,
+            )
+        self._request_times.append(now)
+        self._save_quota_state()
+
+    @property
+    def requests_last_24h(self) -> int:
+        self._prune(time.time())
+        return len(self._request_times)
+
+    async def forecast(
+        self,
+        contract: HighTemperatureContract,
+        *,
+        now: datetime | None = None,
+    ) -> EnsembleForecast:
+        now = now or datetime.now(timezone.utc)
+        cache_key = (contract.city, contract.target_date)
+        monotonic_now = time.monotonic()
+        cached = self._cache.get(cache_key)
+        if cached is not None and cached[0] > time.time():
+            model_members = cached[1]
+        else:
+            failure_until = self._failure_until.get(cache_key, 0.0)
+            if monotonic_now < failure_until:
+                raise ForecastUnavailableError(
+                    f"Open-Meteo forecast backoff active for {contract.event_key}: "
+                    f"{self._failure_messages.get(cache_key, 'prior request failed')}"
+                )
+            self._reserve_request(time.time())
+            latitude, longitude = CITY_COORDS[contract.city]
+            try:
+                payload = await asyncio.to_thread(
+                    self._fetch_json,
+                    OPEN_METEO_ENSEMBLE,
+                    params={
+                        "latitude": latitude,
+                        "longitude": longitude,
+                        "daily": "temperature_2m_max",
+                        "models": ENSEMBLE_MODELS,
+                        "timezone": "auto",
+                        "start_date": contract.target_date,
+                        "end_date": contract.target_date,
+                    },
+                    timeout=self._timeout_seconds,
+                )
+                daily = payload.get("daily")
+                units = payload.get("daily_units")
+                if not isinstance(daily, dict) or not isinstance(units, dict):
+                    raise ValueError("Open-Meteo response has no daily object")
+                if daily.get("time") != [contract.target_date]:
+                    raise ValueError("Open-Meteo response date does not match the request")
+                groups: dict[str, list[float]] = {
+                    name: [] for name in MODEL_KEY_MARKERS
+                }
+                for raw_key, raw_values in daily.items():
+                    key = str(raw_key)
+                    if key == "time":
+                        continue
+                    if not key.startswith("temperature_2m_max"):
+                        raise ValueError(f"unexpected Open-Meteo daily field: {key}")
+                    model = next(
+                        (
+                            name
+                            for name, marker in MODEL_KEY_MARKERS.items()
+                            if marker in key
+                        ),
+                        None,
+                    )
+                    if model is None or units.get(key) != "°C":
+                        raise ValueError(f"invalid Open-Meteo model field: {key}")
+                    if (
+                        not isinstance(raw_values, list)
+                        or len(raw_values) != 1
+                        or raw_values[0] is None
+                        or isinstance(raw_values[0], bool)
+                    ):
+                        raise ValueError(f"invalid Open-Meteo values for {key}")
+                    value = float(raw_values[0])
+                    if not math.isfinite(value):
+                        raise ValueError(f"non-finite Open-Meteo value for {key}")
+                    groups[model].append(value)
+                if any(len(values) < 2 for values in groups.values()):
+                    raise ValueError("Open-Meteo response omitted an ensemble model family")
+                total_members = sum(len(values) for values in groups.values())
+                if total_members < self._min_members:
+                    raise ValueError(f"Open-Meteo returned only {total_members} ensemble members")
+                model_members = tuple(tuple(groups[name]) for name in MODEL_KEY_MARKERS)
+            except Exception as exc:
+                detail = f"{type(exc).__name__}: {exc}"
+                self._failure_until[cache_key] = monotonic_now + self._failure_backoff_seconds
+                self._failure_messages[cache_key] = detail
+                raise ForecastUnavailableError(
+                    f"Open-Meteo forecast unavailable for {contract.event_key}: {detail}",
+                    provider_global=getattr(getattr(exc, "response", None), "status_code", None) == 429,
+                ) from exc
+            self._failure_until.pop(cache_key, None)
+            self._failure_messages.pop(cache_key, None)
+            self._cache[cache_key] = (
+                time.time() + self._cache_seconds,
+                model_members,
+            )
+            self._save_quota_state()
+        target = date.fromisoformat(contract.target_date)
+        timezone_name = CITY_TIMEZONES.get(contract.city)
+        if timezone_name is None:
+            raise ValueError(f"no resolver timezone for {contract.city}")
+        lead_days = max(0, (target - now.astimezone(ZoneInfo(timezone_name)).date()).days)
+        result = _ensemble_probability(contract, model_members, lead_days)
+        return replace(
+            result,
+            source=self.name,
+            provider_count=1,
+            provider_names=(self.name,),
+            provider_probabilities=((self.name, result.raw_probability),),
+            continent=CITY_CONTINENTS.get(contract.city, "global"),
+            provider_weights=((self.name, ONE),),
+        )
+
+
+class JMAForecast:
+    """Direct Japan Meteorological Agency forecast adapter for Tokyo."""
+
+    name = "jma"
+    covered_cities = frozenset({"tokyo"})
+    area_codes = {"tokyo": "130000"}
+    temperature_area_codes = {"tokyo": "44132"}
+
+    def __init__(
+        self,
+        *,
+        fetch_json: Callable[..., Any] = _default_noaa_fetch_json,
+        cache_seconds: float = 21_600,
+        timeout_seconds: float = 20,
+        user_agent: str = "polymarket-bot-weather-research/5.0",
+    ) -> None:
+        if cache_seconds <= 0 or timeout_seconds <= 0 or not user_agent.strip():
+            raise ValueError("invalid JMA client settings")
+        self._fetch_json = fetch_json
+        self._cache_seconds = cache_seconds
+        self._timeout_seconds = timeout_seconds
+        self._user_agent = user_agent
+        self._cache: dict[tuple[str, str], tuple[float, float]] = {}
+
+    async def forecast(
+        self,
+        contract: HighTemperatureContract,
+        *,
+        now: datetime | None = None,
+    ) -> EnsembleForecast:
+        now = now or datetime.now(timezone.utc)
+        if contract.city not in self.covered_cities:
+            raise ForecastUnavailableError(
+                f"JMA has no configured coverage for {contract.city}",
+                provider_covered=False,
+            )
+        key = (contract.city, contract.target_date)
+        cached = self._cache.get(key)
+        if cached is not None and cached[0] > time.monotonic():
+            maximum = cached[1]
+        else:
+            try:
+                payload = await asyncio.to_thread(
+                    self._fetch_json,
+                    f"https://www.jma.go.jp/bosai/forecast/data/forecast/{self.area_codes[contract.city]}.json",
+                    params={},
+                    headers={"User-Agent": self._user_agent, "Accept": "application/json"},
+                    timeout=self._timeout_seconds,
+                )
+                if not isinstance(payload, list):
+                    raise ValueError("JMA response must be a JSON list")
+                values: list[float] = []
+                for report in payload:
+                    if not isinstance(report, dict):
+                        continue
+                    for series in report.get("timeSeries", []):
+                        if not isinstance(series, dict):
+                            continue
+                        times = series.get("timeDefines", [])
+                        for area in series.get("areas", []):
+                            if not isinstance(area, dict):
+                                continue
+                            area_info = area.get("area", {})
+                            if str(area_info.get("code", "")) != self.temperature_area_codes[contract.city]:
+                                continue
+                            temperatures = area.get("temps")
+                            if isinstance(temperatures, list):
+                                for raw_time, raw_temperature in zip(times, temperatures):
+                                    if (
+                                        isinstance(raw_time, str)
+                                        and raw_time[:10] == contract.target_date
+                                        and raw_temperature not in (None, "")
+                                    ):
+                                        value = float(raw_temperature)
+                                        if math.isfinite(value):
+                                            values.append(value)
+                            maxima = area.get("tempsMax")
+                            if not isinstance(maxima, list):
+                                continue
+                            for index, raw_time in enumerate(times):
+                                if (
+                                    isinstance(raw_time, str)
+                                    and raw_time[:10] == contract.target_date
+                                    and index < len(maxima)
+                                    and maxima[index] not in (None, "")
+                                ):
+                                    value = float(maxima[index])
+                                    if math.isfinite(value):
+                                        values.append(value)
+                if not values:
+                    raise ValueError("JMA response has no target-date maximum temperature")
+                maximum = max(values)
+            except Exception as exc:
+                detail = f"{type(exc).__name__}: {exc}"
+                raise ForecastUnavailableError(
+                    f"JMA forecast unavailable for {contract.event_key}: {detail}",
+                    provider_global=getattr(getattr(exc, "response", None), "status_code", None) == 429,
+                ) from exc
+            self._cache[key] = (time.monotonic() + self._cache_seconds, maximum)
+        return _deterministic_forecast(contract, maximum, now=now, source=self.name)
+
+
 class MetNoLocationForecast:
     """JSON forecast adapter for the independent MET Norway service."""
 
@@ -1349,6 +1754,8 @@ def _deterministic_forecast(
         provider_count=1,
         provider_names=(source,),
         provider_probabilities=((source, result.raw_probability),),
+        continent=CITY_CONTINENTS.get(contract.city, "global"),
+        provider_weights=((source, ONE),),
     )
 
 
@@ -1370,10 +1777,12 @@ class ResilientForecastEnsemble:
         if failure_backoff_seconds <= 0:
             raise ValueError("forecast failure backoff must be positive")
         self.providers = tuple(providers)
-        self.weights = dict(weights or {
-            "met-no": Decimal("0.55"),
-            "nws": Decimal("0.45"),
-        })
+        self.weights_by_continent = {
+            continent: dict(values)
+            for continent, values in CONTINENT_WEIGHTS.items()
+        }
+        self._explicit_weights = None if weights is None else dict(weights)
+        self.weights = dict(weights or self.weights_by_continent["global"])
         self.calibrator = calibrator or ProbabilityCalibration()
         self._failure_backoff_seconds = failure_backoff_seconds
         self._failure_until: dict[str, float] = {}
@@ -1387,6 +1796,11 @@ class ResilientForecastEnsemble:
     ) -> EnsembleForecast:
         successful: list[tuple[str, EnsembleForecast]] = []
         failures: list[tuple[str, str]] = []
+        continent = CITY_CONTINENTS.get(contract.city, "global")
+        selected_weights = self._explicit_weights or self.weights_by_continent.get(
+            continent,
+            self.weights,
+        )
         for provider in self.providers:
             name = str(getattr(provider, "name", type(provider).__name__.lower()))
             monotonic_now = time.monotonic()
@@ -1428,7 +1842,7 @@ class ResilientForecastEnsemble:
                 result.lead_days,
                 result.raw_probability,
             )
-            weight = self.weights.get(name, ONE)
+            weight = selected_weights.get(name, ONE)
             if weight > ZERO:
                 values.append((name, result, calibrated, weight))
         if not values:
@@ -1477,6 +1891,11 @@ class ResilientForecastEnsemble:
             ),
             provider_failures=tuple(failures),
             calibration_samples=self.calibrator.samples(),
+            continent=continent,
+            provider_weights=tuple(
+                (name, weight / total_weight)
+                for name, _result, _probability, weight in values
+            ),
         )
 
     def record_outcome(
