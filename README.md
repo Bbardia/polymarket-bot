@@ -18,9 +18,9 @@ research compatibility; its live path is permanently disabled.
   per rolling 24 hours and cached for six hours in ignored campaign state. A
   provider outage is recorded as degraded telemetry; remaining sources continue
   with wider uncertainty. Resolved paper outcomes update a persistent,
-  conservative per-source/city/horizon calibrator. A profile may require a fully
-  available forecast before admitting new entries; degraded forecasts are then
-  observation-only.
+  conservative per-source/city/horizon calibrator. A profile may require a minimum
+  number of available providers before admitting new entries; degraded forecasts
+  with insufficient independent coverage are then observation-only.
 - Provider weights are continent-aware: NWS is preferred in North America, MET
   Norway in Europe, JMA in its configured Japanese coverage, and Open-Meteo is
   the leading global fallback elsewhere. Unavailable providers are removed and

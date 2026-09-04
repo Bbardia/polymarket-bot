@@ -506,6 +506,7 @@ class WeatherPaperPolicy:
     uncertainty_z: Decimal = ONE
     observations_enabled: bool = False
     require_healthy_forecast: bool = False
+    minimum_provider_count: int = 2
 
     def __post_init__(self) -> None:
         if self.horizon_days < 1 or self.horizon_days > 14:
@@ -528,6 +529,8 @@ class WeatherPaperPolicy:
             raise ValueError("weather prior strength cannot be negative")
         if not (ZERO < self.fractional_kelly <= ONE):
             raise ValueError("weather fractional Kelly must be in (0, 1]")
+        if not (1 <= self.minimum_provider_count <= 4):
+            raise ValueError("weather minimum provider count must be in [1, 4]")
 
 
 @dataclass(frozen=True)
@@ -1983,6 +1986,16 @@ def _side_evaluation(
     ask = executable.vwap
     if not (policy.min_price <= ask <= policy.max_price):
         return None
+    if (
+        trade_block_reason is None
+        and policy.require_healthy_forecast
+        and forecast.provider_count < policy.minimum_provider_count
+    ):
+        trade_block_reason = (
+            "weather forecast health gate requires at least "
+            f"{policy.minimum_provider_count} providers "
+            f"(got {forecast.provider_count})"
+        )
     raw_probability = yes_probability if side == "YES" else ONE - yes_probability
     resolver_certain = (
         observation.same_day_observation_available

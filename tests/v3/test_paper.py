@@ -326,6 +326,7 @@ def test_degraded_weather_forecast_blocks_new_entries(tmp_path):
             worker.settings.weather_policy,
             base_edge=D("0"),
             require_healthy_forecast=True,
+            minimum_provider_count=2,
         ),
     )
     worker.forecast = EventForecast(
@@ -338,13 +339,52 @@ def test_degraded_weather_forecast_blocks_new_entries(tmp_path):
     ))
 
     assert result.weather_forecast_status == "degraded"
-    assert result.weather_candidates == 1
+    assert result.weather_candidates == 0
     assert result.paper_trades == 0
-    candidate = store.read_records(store.candidates_path)[0]
-    assert candidate["paper_reason"] == "weather forecast health gate blocked entries"
-    assert store.read_status()["paper_entry_block_reason"] == (
-        "weather forecast health gate blocked entries"
+    evaluation = next(
+        row
+        for row in store.read_records(store.weather_scans_path)
+        if row.get("market_id") == "degraded"
     )
+    assert evaluation["tradeable"] is False
+    assert evaluation["reason"] == (
+        "weather forecast health gate requires at least 2 providers (got 1)"
+    )
+    assert store.read_status()["paper_entry_block_reason"] is None
+    assert store.read_status()["paper_weather_min_provider_count"] == 2
+
+
+def test_degraded_weather_forecast_with_minimum_providers_can_trade(tmp_path):
+    item = event_weather_market("degraded-two", "31°C", "0.50")
+    worker, store = event_worker(
+        tmp_path,
+        [item],
+        {(D("31"), D("31")): D("0.90")},
+    )
+    worker.settings = replace(
+        worker.settings,
+        weather_policy=replace(
+            worker.settings.weather_policy,
+            base_edge=D("0"),
+            require_healthy_forecast=True,
+            minimum_provider_count=2,
+        ),
+    )
+    worker.forecast = EventForecast(
+        {(D("31"), D("31")): D("0.90")},
+        provider_names=("met-no", "nws"),
+        provider_failures=(("open-meteo", "quota exhausted"),),
+    )
+
+    result = asyncio.run(worker.run_cycle(
+        now=datetime(2026, 8, 24, tzinfo=timezone.utc),
+    ))
+
+    assert result.weather_forecast_status == "degraded"
+    assert result.weather_candidates == 1
+    assert result.paper_trades == 1
+    trade = store.read_records(store.trades_path)[0]
+    assert trade["paper_executed"] is True
 
 
 def test_complete_set_position_settles_from_public_resolution_state(tmp_path):
@@ -1087,8 +1127,15 @@ class EventWeatherClient(FakePublicClient):
 
 
 class EventForecast:
-    def __init__(self, probabilities, *, provider_failures=()):
+    def __init__(
+        self,
+        probabilities,
+        *,
+        provider_names=("met-no",),
+        provider_failures=(),
+    ):
         self.probabilities = probabilities
+        self.provider_names = tuple(provider_names)
         self.provider_failures = tuple(provider_failures)
 
     async def forecast(self, contract, *, now=None):
@@ -1101,7 +1148,11 @@ class EventForecast:
             ensemble_std_c=D("1"),
             n_members=100,
             lead_days=0,
-            provider_names=("met-no",),
+            provider_count=len(self.provider_names),
+            provider_names=self.provider_names,
+            provider_probabilities=tuple(
+                (name, probability) for name in self.provider_names
+            ),
             provider_failures=self.provider_failures,
         )
 

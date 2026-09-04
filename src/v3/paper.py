@@ -175,6 +175,9 @@ class PaperSettings:
                     "V3_PAPER_WEATHER_REQUIRE_HEALTHY_FORECAST",
                     False,
                 ),
+                minimum_provider_count=int(
+                    os.getenv("V3_PAPER_WEATHER_MIN_PROVIDER_COUNT", "2")
+                ),
             ),
         )
 
@@ -1111,9 +1114,7 @@ class PaperWorker:
             ),
         )
         paper_trades = 0
-        entry_block_reason = self._entry_block_reason(
-            forecast_status=result.forecast_status,
-        )
+        entry_block_reason = self._entry_block_reason()
         weather_open = sum(
             1
             for position in self.state.open_positions.values()
@@ -1534,11 +1535,12 @@ class PaperWorker:
             "paper_max_realized_loss": str(self.settings.max_realized_loss),
             "paper_max_drawdown_fraction": str(self.settings.max_drawdown_fraction),
             "paper_peak_entry_equity": str(self.state.peak_entry_equity),
-            "paper_entry_block_reason": self._entry_block_reason(
-                forecast_status=weather.forecast_status,
-            ),
+            "paper_entry_block_reason": self._entry_block_reason(),
             "paper_weather_require_healthy_forecast": (
                 self.settings.weather_policy.require_healthy_forecast
+            ),
+            "paper_weather_min_provider_count": (
+                self.settings.weather_policy.minimum_provider_count
             ),
             "weather_order_cap": str(self.settings.weather_policy.max_order_notional),
             "weather_position_cap": self.settings.weather_policy.max_open_positions,
