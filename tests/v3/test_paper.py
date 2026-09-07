@@ -829,6 +829,7 @@ def test_paper_early_exit_uses_full_bid_depth_fees_and_persists_audit(tmp_path):
     exit_book.bids = (
         SimpleNamespace(price=D("0.40"), size=D("3")),
         SimpleNamespace(price=D("0.50"), size=D("2")),
+        SimpleNamespace(price=D("0.01"), size=D("100")),
     )
     client = FakePublicClient([opened], [exit_book])
     store = PaperStore(tmp_path)
@@ -868,6 +869,48 @@ def test_paper_early_exit_uses_full_bid_depth_fees_and_persists_audit(tmp_path):
     assert exits[0]["exit_fee"] == "0.061000"
     assert exits[0]["net_proceeds"] == "2.139000"
     assert exits[0]["realized_pnl"] == "0.639000"
+
+
+@pytest.mark.parametrize("hybrid,runner", [(False, False), (True, False), (True, True)])
+def test_exit_threshold_uses_fees_from_best_bids(tmp_path, hybrid, runner):
+    opened = market()
+    opened.trading.fees_enabled = True
+    opened.trading.fee_schedule = SimpleNamespace(rate=D("0.05"))
+    exit_book = book("yes-token", ask="0.50", bid="0.40")
+    exit_book.bids = (
+        SimpleNamespace(price=D("0.01"), size=D("100")),
+        SimpleNamespace(price=D("0.40"), size=D("10")),
+    )
+    shares = D("1.25") if runner else D("5")
+    fraction = D("0.75") if hybrid and not runner else D("1")
+    sold = shares * fraction
+    target = D("0.50") if runner else D("0.28")
+    correct_net = sold * D("0.40") - sold * D("0.05") * D("0.40") * D("0.60")
+    # True return is one percentage point below target; wrong low-bid fees
+    # make every stage appear profitable enough to execute.
+    cost = correct_net / (D("1") + target - D("0.01")) / fraction
+    store = PaperStore(tmp_path)
+    state = PaperState.new(D("37.50"))
+    state.cash -= cost
+    state.open_positions[opened.condition_id] = {
+        "strategy": "weather_directional", "market_id": opened.id,
+        "condition_id": opened.condition_id, "side": "YES",
+        "token_id": "yes-token", "shares": str(shares),
+        "all_in_cost": str(cost), "hybrid_exit_done": runner,
+    }
+    store.save_state(state)
+    worker = PaperWorker(
+        client=FakePublicClient([opened], [exit_book]),
+        settings=settings(tmp_path, early_exit_enabled=True,
+                          early_exit_target_return=D("0.28"),
+                          early_exit_min_profit=D("0.10"),
+                          hybrid_exit_enabled=hybrid),
+        store=store,
+    )
+    assert asyncio.run(worker._exit_positions("2026-08-25T00:00:00+00:00")) == (0, 0)
+    assert store.load_state().cash == state.cash
+    assert store.load_state().open_positions == state.open_positions
+    assert not store.exits_path.exists()
 
 
 def test_paper_early_exit_refuses_shallow_bid_books_without_mutation(tmp_path):

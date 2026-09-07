@@ -1406,7 +1406,9 @@ class PaperWorker:
                 if exit_shares <= ZERO or exit_shares > shares:
                     continue
                 quote = execution_bid_vwap(levels, exit_shares)
-                fees = execution_fee(levels, exit_shares, context.fee_rate)
+                fees = execution_fee(
+                    levels, exit_shares, context.fee_rate, descending=True
+                )
                 net_proceeds = quote.notional - fees
                 position_cost = Decimal(str(position["all_in_cost"]))
                 entry_cost = (

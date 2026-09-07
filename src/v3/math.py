@@ -77,10 +77,15 @@ def execution_fee(
     levels: Sequence[BookLevel] | Iterable[BookLevel],
     shares: Decimal,
     fee_rate: Decimal,
+    *,
+    descending: bool = False,
 ) -> Decimal:
-    """Sum nonlinear fees at each executable depth level."""
+    """Sum fees on the executed fills; sells must walk bids descending."""
     return sum(
-        (taker_fee(shares=take, price=level.price, fee_rate=fee_rate) for level, take in _walk_levels(levels, shares)),
+        (
+            taker_fee(shares=take, price=level.price, fee_rate=fee_rate)
+            for level, take in _walk_levels(levels, shares, descending=descending)
+        ),
         ZERO,
     )
 

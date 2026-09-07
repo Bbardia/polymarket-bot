@@ -10,7 +10,12 @@ two-provider gate. Complete sets, live trading, and account reads remain off.
 Start each evaluation with a fresh ignored data directory; never combine its
 P&L with historical ledgers. Review after two days using the metrics below.
 This is a user-selected paper-policy promotion, not statistical proof that
-hybrid outperforms holding. Library defaults stay opt-in for compatibility;
+hybrid outperforms holding. Historical early-exit ledgers used ask-order fee
+walking on bid books; their recorded exit P&L can be overstated or understated.
+The promoted worker charges fees on the same highest-first bid fills as sale
+proceeds, with regression coverage for full, partial, and runner thresholds.
+Old ledgers remain unchanged and must not be treated as corrected results.
+Library defaults stay opt-in for compatibility;
 `.env.template` defines the promoted main configuration.
 
 ## Historical experiment decision
