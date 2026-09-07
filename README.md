@@ -1,4 +1,4 @@
-# Polymarket Trading Bot — V3 Foundation
+# Polymarket Trading Bot — V6 Hybrid Paper
 
 Paper-first Polymarket research and trading infrastructure for a small,
 risk-capped account. The April-era execution loop is retained only for offline
@@ -18,9 +18,9 @@ research compatibility; its live path is permanently disabled.
   per rolling 24 hours and cached for six hours in ignored campaign state. A
   provider outage is recorded as degraded telemetry; remaining sources continue
   with wider uncertainty. Resolved paper outcomes update a persistent,
-  conservative per-source/city/horizon calibrator. A profile may require a fully
-  available forecast before admitting new entries; degraded forecasts are then
-  observation-only.
+  conservative per-source/city/horizon calibrator. New entries require the
+  configured per-market minimum of independent providers (two in the main
+  profile); degraded markets below that minimum are observation-only.
 - Provider weights are continent-aware: NWS is preferred in North America, MET
   Norway in Europe, JMA in its configured Japanese coverage, and Open-Meteo is
   the leading global fallback elsewhere. Unavailable providers are removed and
@@ -42,9 +42,14 @@ research compatibility; its live path is permanently disabled.
 - Optional paper early exits use the complete directional position, executable
   bid-side depth, and nonlinear exit fees. They record realized exit P&L in a
   separate `paper_exits.jsonl` stream and never submit orders.
-- Paper profiles can freeze new entries while continuing to settle and manage
-  existing paper positions. Optional realized-loss and entry-cost drawdown breakers
-  provide persistent admission controls; they never enable live trading.
+- The main V6 paper profile sells 75% at a 28% net return-on-cost target,
+  retaining 25% for a 50% target or final resolution.
+  Partial quantities are explicitly simulation-only because
+  they may be below venue minimum order sizes.
+- Paper profiles can freeze new entries while continuing to manage existing
+  positions. The main profile keeps a 5 pUSD realized-loss breaker, a 10%
+  entry-cost drawdown breaker, five-position cap, and two-provider entry gate.
+  Promotion is a paper-policy decision, not proof of statistical superiority.
 - Legacy `run_full_loop.py --live` exits before constructing a client.
 - Repository watchdog is status-only and cannot launch the bot.
 - No Polymarket Hermes/Claude cron is required or configured.
@@ -162,7 +167,7 @@ separately labeled strategies:
   successful public NOAA observation exists for that exact station and local
   date. The paper-only lane uses a 3% base edge plus
   spread/uncertainty/lead-time guards, caps each simulated order at `5 pUSD`,
-  and allows at most one bucket per city/date and fifteen concurrent weather
+  and allows at most one bucket per city/date and five concurrent weather
   positions. Maker quotes remain explicitly unsubmitted. Mechanically complete
   city/date baskets are labeled unverified cross-market hypotheses until common
   event membership is proven; they are never candidates and never change state.
