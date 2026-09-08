@@ -23,6 +23,7 @@ from src.v3.paper_weather import (
     _ensemble_probability,
     ProbabilityCalibration,
     ResilientForecastEnsemble,
+    SevenTimerForecast,
     StationObservation,
     WeatherPaperPolicy,
     apply_observation_bounds,
@@ -1212,6 +1213,37 @@ def test_met_no_forecast_parses_target_local_date_and_returns_source_metadata():
     assert result.ensemble_mean_c == D("33.0")
 
 
+def test_seven_timer_forecast_parses_global_daily_maximum_and_caches():
+    calls = []
+
+    def fetch_json(url, *, params, headers, timeout):
+        calls.append((url, dict(params)))
+        assert url == "https://www.7timer.info/bin/api.pl"
+        assert params["product"] == "civillight"
+        assert params["unit"] == "metric"
+        assert headers["User-Agent"]
+        return {
+            "dataseries": [
+                {"date": 20260825, "temp2m": {"max": 33, "min": 25}},
+                {"date": 20260826, "temp2m": {"max": 99, "min": 25}},
+            ],
+        }
+
+    contract = parse_exact_high_contract(
+        "Will the highest temperature in Singapore be 33°C on August 25?",
+        end_date=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
+    )
+    assert contract is not None
+    provider = SevenTimerForecast(fetch_json=fetch_json, min_request_interval_seconds=0)
+    first = asyncio.run(provider.forecast(contract, now=datetime(2026, 8, 24, tzinfo=timezone.utc)))
+    second = asyncio.run(provider.forecast(contract, now=datetime(2026, 8, 24, tzinfo=timezone.utc)))
+    assert first.source == "seven-timer"
+    assert first.provider_names == ("seven-timer",)
+    assert first.ensemble_mean_c == D("33")
+    assert second.raw_probability == first.raw_probability
+    assert len(calls) == 1
+
+
 def test_nws_forecast_parses_fahrenheit_hourly_grid_data():
     def fetch_json(url, *, params, headers, timeout):
         if "/points/" in url:
@@ -1355,6 +1387,7 @@ def test_resilient_ensemble_selects_weights_by_city_continent():
         "jma": D("0.90"),
         "open-meteo": D("0.60"),
         "met-no": D("0.30"),
+        "seven-timer": D("0.01"),
     }
 
     class Provider:
@@ -1373,10 +1406,11 @@ def test_resilient_ensemble_selects_weights_by_city_continent():
             )
 
     result = asyncio.run(ResilientForecastEnsemble([
-        Provider("jma"), Provider("open-meteo"), Provider("met-no"),
+        Provider("jma"), Provider("open-meteo"), Provider("seven-timer"), Provider("met-no"),
     ]).forecast(tokyo))
     expected = (D("0.90") * D("0.40") + D("0.60") * D("0.35") + D("0.30") * D("0.20")) / D("0.95")
     assert result.raw_probability == expected
+    assert "seven-timer" not in result.provider_names
 
 
 def test_resilient_ensemble_uses_remaining_sources_when_one_provider_is_down():

@@ -32,6 +32,7 @@ ZERO = Decimal("0")
 ONE = Decimal("1")
 HALF = Decimal("0.5")
 OPEN_METEO_ENSEMBLE = "https://ensemble-api.open-meteo.com/v1/ensemble"
+SEVEN_TIMER_FORECAST = "https://www.7timer.info/bin/api.pl"
 NOAA_METAR = "https://aviationweather.gov/api/data/metar"
 ENSEMBLE_MODELS = "ecmwf_ifs025,gfs_seamless,icon_seamless,gem_global"
 MODEL_KEY_MARKERS: Mapping[str, str] = {
@@ -59,13 +60,13 @@ CITY_CONTINENTS: Mapping[str, str] = {
 }
 
 CONTINENT_WEIGHTS: Mapping[str, Mapping[str, Decimal]] = {
-    "north_america": {"nws": Decimal("0.45"), "open-meteo": Decimal("0.30"), "met-no": Decimal("0.15"), "jma": Decimal("0.10")},
-    "europe": {"met-no": Decimal("0.45"), "open-meteo": Decimal("0.35"), "jma": Decimal("0.10"), "nws": Decimal("0.10")},
-    "asia": {"jma": Decimal("0.40"), "open-meteo": Decimal("0.35"), "met-no": Decimal("0.20"), "nws": Decimal("0.05")},
-    "oceania": {"open-meteo": Decimal("0.45"), "met-no": Decimal("0.35"), "jma": Decimal("0.10"), "nws": Decimal("0.10")},
-    "south_america": {"open-meteo": Decimal("0.45"), "met-no": Decimal("0.35"), "jma": Decimal("0.10"), "nws": Decimal("0.10")},
-    "africa": {"open-meteo": Decimal("0.45"), "met-no": Decimal("0.35"), "jma": Decimal("0.10"), "nws": Decimal("0.10")},
-    "global": {"open-meteo": Decimal("0.35"), "met-no": Decimal("0.30"), "nws": Decimal("0.20"), "jma": Decimal("0.15")},
+    "north_america": {"nws": Decimal("0.45"), "open-meteo": Decimal("0.30"), "met-no": Decimal("0.15"), "jma": Decimal("0.10"), "seven-timer": Decimal("0.10")},
+    "europe": {"met-no": Decimal("0.45"), "open-meteo": Decimal("0.35"), "jma": Decimal("0.10"), "nws": Decimal("0.10"), "seven-timer": Decimal("0.10")},
+    "asia": {"jma": Decimal("0.40"), "open-meteo": Decimal("0.35"), "met-no": Decimal("0.20"), "nws": Decimal("0.05"), "seven-timer": Decimal("0.10")},
+    "oceania": {"open-meteo": Decimal("0.45"), "met-no": Decimal("0.35"), "jma": Decimal("0.10"), "nws": Decimal("0.10"), "seven-timer": Decimal("0.10")},
+    "south_america": {"open-meteo": Decimal("0.45"), "met-no": Decimal("0.35"), "jma": Decimal("0.10"), "nws": Decimal("0.10"), "seven-timer": Decimal("0.10")},
+    "africa": {"open-meteo": Decimal("0.45"), "met-no": Decimal("0.35"), "jma": Decimal("0.10"), "nws": Decimal("0.10"), "seven-timer": Decimal("0.10")},
+    "global": {"open-meteo": Decimal("0.35"), "met-no": Decimal("0.30"), "nws": Decimal("0.20"), "jma": Decimal("0.15"), "seven-timer": Decimal("0.10")},
 }
 
 # Airport/station coordinates matching the locations used by weather contracts.
@@ -1636,6 +1637,119 @@ class MetNoLocationForecast:
         )
 
 
+class SevenTimerForecast:
+    """Global no-key CIVIL Light fallback, primarily NOAA/GFS-derived.
+
+    This is a coverage fallback, not an independent ensemble. It is skipped
+    whenever Open-Meteo succeeds because 7Timer documents a primarily GFS-based
+    product and would otherwise double-count overlapping model information.
+    """
+
+    name = "seven-timer"
+    covered_cities = frozenset(CITY_COORDS)
+
+    def __init__(
+        self,
+        *,
+        fetch_json: Callable[..., Mapping[str, Any]] = _default_noaa_fetch_json,
+        cache_seconds: float = 21_600,
+        timeout_seconds: float = 20,
+        min_request_interval_seconds: float = 0.25,
+        user_agent: str = "polymarket-bot-weather-research/7timer",
+    ) -> None:
+        if (
+            cache_seconds <= 0
+            or timeout_seconds <= 0
+            or min_request_interval_seconds < 0
+            or not user_agent.strip()
+        ):
+            raise ValueError("invalid 7Timer client settings")
+        self._fetch_json = fetch_json
+        self._cache_seconds = cache_seconds
+        self._timeout_seconds = timeout_seconds
+        self._min_request_interval_seconds = min_request_interval_seconds
+        self._user_agent = user_agent
+        self._cache: dict[tuple[str, str], tuple[float, float]] = {}
+        self._last_request_at = 0.0
+
+    async def forecast(
+        self,
+        contract: HighTemperatureContract,
+        *,
+        now: datetime | None = None,
+    ) -> EnsembleForecast:
+        now = now or datetime.now(timezone.utc)
+        if contract.city not in self.covered_cities:
+            raise ForecastUnavailableError(
+                f"7Timer has no configured coverage for {contract.city}",
+                provider_covered=False,
+            )
+        key = (contract.city, contract.target_date)
+        cached = self._cache.get(key)
+        if cached is not None and cached[0] > time.monotonic():
+            maximum = cached[1]
+        else:
+            wait_for = (
+                self._min_request_interval_seconds
+                - (time.monotonic() - self._last_request_at)
+            )
+            if wait_for > 0:
+                await asyncio.sleep(wait_for)
+            self._last_request_at = time.monotonic()
+            latitude, longitude = CITY_COORDS[contract.city]
+            try:
+                payload = await asyncio.to_thread(
+                    self._fetch_json,
+                    SEVEN_TIMER_FORECAST,
+                    params={
+                        "lat": latitude,
+                        "lon": longitude,
+                        "product": "civillight",
+                        "output": "json",
+                        "unit": "metric",
+                    },
+                    headers={
+                        "User-Agent": self._user_agent,
+                        "Accept": "application/json",
+                    },
+                    timeout=self._timeout_seconds,
+                )
+                series = payload.get("dataseries")
+                if not isinstance(series, list):
+                    raise ValueError("7Timer response has no dataseries")
+                target = int(contract.target_date.replace("-", ""))
+                matching = [
+                    item
+                    for item in series
+                    if isinstance(item, dict) and item.get("date") in {target, str(target)}
+                ]
+                if len(matching) != 1:
+                    raise ValueError("7Timer response has no unique target-date forecast")
+                temperature = matching[0].get("temp2m")
+                raw_maximum = temperature.get("max") if isinstance(temperature, dict) else None
+                if (
+                    raw_maximum is None
+                    or isinstance(raw_maximum, bool)
+                    or not math.isfinite(float(raw_maximum))
+                ):
+                    raise ValueError("7Timer target-date maximum temperature is invalid")
+                maximum = float(raw_maximum)
+            except Exception as exc:
+                response = getattr(exc, "response", None)
+                detail = f"{type(exc).__name__}: {exc}"
+                raise ForecastUnavailableError(
+                    f"7Timer forecast unavailable for {contract.event_key}: {detail}",
+                    provider_global=getattr(response, "status_code", None) == 429,
+                ) from exc
+            self._cache[key] = (time.monotonic() + self._cache_seconds, maximum)
+        return _deterministic_forecast(
+            contract,
+            maximum,
+            now=now,
+            source=self.name,
+        )
+
+
 class NWSGridForecast:
     """US-only NWS hourly grid forecast adapter with no credentials."""
 
@@ -1814,6 +1928,13 @@ class ResilientForecastEnsemble:
         )
         for provider in self.providers:
             name = str(getattr(provider, "name", type(provider).__name__.lower()))
+            if name == "seven-timer" and any(
+                existing_name == "open-meteo"
+                for existing_name, _result in successful
+            ):
+                # 7Timer documents a primarily NOAA/GFS-derived product; do
+                # not double-count it when the Open-Meteo ensemble succeeded.
+                continue
             monotonic_now = time.monotonic()
             failure_until = self._failure_until.get(name, 0.0)
             if monotonic_now < failure_until:

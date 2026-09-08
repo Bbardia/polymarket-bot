@@ -255,6 +255,21 @@ The consistent practitioner lesson is selectivity, station-specific data, and
 execution discipline. The consistent evidence problem is the absence of public,
 independently reconciled, fee- and depth-aware weather-bot ledgers.
 
+The NWS API is free and open but explicitly has reasonable, non-public rate
+limits and requires a User-Agent.[19] MET Norway likewise says its service is
+free but can throttle or block excessive traffic and requires an identifying
+User-Agent.[20] Open-Meteo's free API is not unlimited: its published terms cap
+non-commercial use at fewer than 10,000 calls per day, with hourly and minute
+limits.[21]
+
+7Timer is a useful global fallback because its no-key CIVIL Light API exposes a
+daily maximum temperature and its documentation says it covers the globe.[18]
+Its documentation also says the product is primarily NOAA/GFS-derived, so V7
+uses it only when Open-Meteo is unavailable and does not count it alongside a
+successful Open-Meteo result. It is cached, request-spaced, and still treated
+as a forecast hypothesis requiring calibration—not as an unlimited or fully
+independent provider.
+
 ## Research-backed strategy choices
 
 ### Adopt now in V7
@@ -337,3 +352,7 @@ engine.
 [15] https://predictandprofit.io/prediction-market-trading-bot
 [16] https://blog.devgenius.io/found-the-weather-trading-bots-quietly-making-24-000-on-polymarket-and-built-one-myself-for-free-120bd34d6f09
 [17] https://www.polymarket.com/weather
+[18] https://www.7timer.info/doc.php?lang=en
+[19] https://www.weather.gov/documentation/services-web-API
+[20] https://docs.api.met.no/doc/FAQ.html
+[21] https://open-meteo.com/en/terms

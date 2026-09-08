@@ -157,7 +157,7 @@ def test_paper_settings_require_all_authenticated_paths_to_remain_disabled(tmp_p
     )
 
 
-def test_default_weather_ensemble_uses_four_capped_providers(tmp_path):
+def test_default_weather_ensemble_uses_five_capped_providers(tmp_path):
     worker = PaperWorker(
         client=FakePublicClient([], []),
         settings=settings(
@@ -171,6 +171,7 @@ def test_default_weather_ensemble_uses_four_capped_providers(tmp_path):
     assert tuple(provider.name for provider in worker.forecast.providers) == (
         "open-meteo",
         "met-no",
+        "seven-timer",
         "nws",
         "jma",
     )
@@ -179,6 +180,7 @@ def test_default_weather_ensemble_uses_four_capped_providers(tmp_path):
         "met-no": D("0.30"),
         "nws": D("0.20"),
         "jma": D("0.15"),
+        "seven-timer": D("0.10"),
     }
 
 

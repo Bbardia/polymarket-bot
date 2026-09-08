@@ -23,7 +23,10 @@ executable depth walks. The useful, independently implemented change is
   side, including rejected candidates, with stable IDs, decision timestamps,
   model/provider probabilities, book/fee context, and an empty finalized label;
 - preserve `forecast_issuance_at: null` when a provider does not expose issuance
-  time instead of falsely treating retrieval time as issuance time.
+  time instead of falsely treating retrieval time as issuance time;
+- add a cached, request-spaced global 7Timer fallback for coverage gaps. It is
+  treated as NOAA/GFS-derived and is skipped whenever Open-Meteo succeeds, so
+  it does not create duplicate provider independence merely to pass a gate.
 
 The flag is disabled by default. V7 remains paper-only and refuses to construct
 with live trading or account reads enabled.
