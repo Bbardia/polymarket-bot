@@ -116,6 +116,13 @@ def test_worker_sizing_audit_cash_recheck_and_restart(tmp_path):
     assert result.paper_trades == 1
     candidates = store.read_records(store.candidates_path)
     assert len(candidates) == 2
+    snapshots = store.read_records(store.forecast_snapshots_path)
+    assert len(snapshots) == 2
+    assert all(snapshot['forecast_provenance_version'] == 'v7-snapshot-v1' for snapshot in snapshots)
+    assert all(snapshot['forecast_decision_at'] == '2026-08-24T00:00:00+00:00' for snapshot in snapshots)
+    assert all(snapshot['forecast_issuance_at'] is None for snapshot in snapshots)
+    assert all(snapshot['forecast_label'] is None for snapshot in snapshots)
+    assert len({snapshot['forecast_snapshot_id'] for snapshot in snapshots}) == 2
     traded = next(row for row in candidates if row['paper_executed'])
     skipped = next(row for row in candidates if not row['paper_executed'])
     assert D(traded['shares']) > D('5')

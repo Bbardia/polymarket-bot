@@ -309,6 +309,7 @@ class PaperStore:
         self.status_path = self.data_dir / "status.json"
         self.scans_path = self.data_dir / "scans.jsonl"
         self.weather_scans_path = self.data_dir / "weather_scans.jsonl"
+        self.forecast_snapshots_path = self.data_dir / "forecast_snapshots.jsonl"
         self.weather_events_path = self.data_dir / "weather_events.jsonl"
         self.candidates_path = self.data_dir / "candidates.jsonl"
         self.trades_path = self.data_dir / "paper_trades.jsonl"
@@ -1165,6 +1166,23 @@ class PaperWorker:
         )
         for evaluation in ordered_evaluations:
             row = self._weather_row(evaluation, scanned_at)
+            snapshot = dict(row)
+            snapshot["forecast_snapshot_id"] = (
+                f"{self.state.started_at}:{prospective_cycle}:"
+                f"{evaluation.condition_id}:{evaluation.side}"
+            )
+            snapshot.update({
+                "forecast_decision_at": scanned_at,
+                "forecast_issuance_at": None,
+                "forecast_provenance_version": "v7-snapshot-v1",
+                "forecast_label": None,
+                "forecast_label_finalized_at": None,
+            })
+            self.store.append_unique_record(
+                self.store.forecast_snapshots_path,
+                snapshot,
+                id_field="forecast_snapshot_id",
+            )
             chosen = selected.get(evaluation.event_key) is evaluation
             if not chosen:
                 if evaluation.paper_tradeable:

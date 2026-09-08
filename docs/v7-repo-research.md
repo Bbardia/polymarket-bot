@@ -18,7 +18,12 @@ executable depth walks. The useful, independently implemented change is
 - cap by the weather order cap, current cash, and Kelly budget;
 - skip a venue minimum that does not fit instead of rounding risk upward;
 - recheck cash and Kelly budget immediately before committing each candidate;
-- persist sizing inputs and execution-time budget for auditability.
+- persist sizing inputs and execution-time budget for auditability;
+- emit immutable `forecast_snapshots.jsonl` records for every evaluated weather
+  side, including rejected candidates, with stable IDs, decision timestamps,
+  model/provider probabilities, book/fee context, and an empty finalized label;
+- preserve `forecast_issuance_at: null` when a provider does not expose issuance
+  time instead of falsely treating retrieval time as issuance time.
 
 The flag is disabled by default. V7 remains paper-only and refuses to construct
 with live trading or account reads enabled.
@@ -55,7 +60,7 @@ lane using resolved outcomes and conservative executable-bid marks, normalized
 returns, exposure, holding time, provider health, Brier/log loss, and rejection
 reasons. A small positive P&L or a passing test suite is not promotion evidence.
 
-A later residual-bias experiment should first capture immutable decision-time
-forecast snapshots and separately joined finalized station labels. Until that
-provenance exists, fitting a correction would risk look-ahead and is deliberately
-not included in this branch.
+A later residual-bias experiment should use the new immutable forecast snapshot
+stream and separately joined finalized station labels. Until enough trustworthy
+labels and point-in-time provenance exist, fitting a correction would risk
+look-ahead and is deliberately not included in this branch.

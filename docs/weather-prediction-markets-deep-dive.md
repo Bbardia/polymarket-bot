@@ -47,9 +47,12 @@ The practical order of work is:
    fractional Kelly. Never force a venue minimum that is larger than the risk
    budget.
 
-V7 implements item 7 and preserves the existing settlement, provider, and
-executable-depth gates. Items 2–4 require a proper forecast tape and are
-research candidates rather than unvalidated V7 behavior.
+V7 implements item 7 and now emits an immutable `forecast_snapshots.jsonl`
+stream for every evaluated weather side, including rejected candidates. The
+stream carries stable IDs, decision timestamps, model/provider probabilities,
+book/fee context, and explicit empty labels. Items 2–4 still require finalized
+station joins and enough data for calibration; the snapshot stream does not by
+itself prove forecast skill.
 
 ## What the calculation should be
 
