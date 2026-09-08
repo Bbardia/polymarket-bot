@@ -156,4 +156,3 @@ def test_v6_default_stays_venue_minimum_and_v7_missing_bankroll_blocks():
     enabled = evaluate(replace(policy, kelly_sizing_enabled=True))
     assert not any(row.paper_tradeable for row in enabled.evaluations)
     assert any('bankroll' in row.paper_reason for row in enabled.evaluations)
-

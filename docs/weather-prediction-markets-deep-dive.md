@@ -1,6 +1,6 @@
 # Weather prediction-market deep dive
 
-**Research date:** 2026-09-08  
+**Research date:** 2026-09-08
 **Scope:** Polymarket/Kalshi temperature markets, forecast calculation,
 calibration, sizing, execution, and publicly reported trader experience.
 
