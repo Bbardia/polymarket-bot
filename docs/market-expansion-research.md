@@ -1,6 +1,6 @@
 # Market expansion research
 
-**Research date:** 2026-09-08  
+**Research date:** 2026-09-08
 **Scope:** Market families that could use the weather lane's core method:
 objective settlement, point-in-time data, probability distributions, executable
 prices, fees, and conservative sizing.
