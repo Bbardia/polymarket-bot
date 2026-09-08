@@ -26,6 +26,7 @@ from .maker_shadow import MakerShadowQuote, propose_buy_quote
 from .math import BookLevel, execution_fee, execution_vwap
 from .strategies.weather import WeatherDecision, WeatherMarketInput, evaluate_weather_market
 from .weather_surface import EventSurface, SurfaceBucket, analyze_event_surface
+from .weather_sizing import size_weather_entry
 
 ZERO = Decimal("0")
 ONE = Decimal("1")
@@ -507,6 +508,8 @@ class WeatherPaperPolicy:
     observations_enabled: bool = False
     require_healthy_forecast: bool = False
     minimum_provider_count: int = 2
+    kelly_sizing_enabled: bool = False
+    sizing_bankroll: Decimal | None = None  # Injected by paper worker, never env.
 
     def __post_init__(self) -> None:
         if self.horizon_days < 1 or self.horizon_days > 14:
@@ -565,6 +568,11 @@ class WeatherEvaluation:
     observation_error: str | None = None
     same_day_observation_status: str = "not_applicable"
     maker_shadow: MakerShadowQuote | None = None
+    sizing_mode: str = "venue_minimum"
+    sizing_bankroll: Decimal | None = None
+    sizing_budget: Decimal | None = None
+    venue_minimum_shares: Decimal | None = None
+    fee_rate: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -2005,7 +2013,7 @@ def _side_evaluation(
     outcome = market.outcomes.yes if side == "YES" else market.outcomes.no
     anchor = Decimal(str(outcome.price if outcome.price is not None else ask))
     fee = execution_fee(ask_levels, shares, context.fee_rate)
-    decision = evaluate_weather_market(WeatherMarketInput(
+    market_input = WeatherMarketInput(
         raw_probability=raw_probability,
         anchor_probability=anchor,
         n_members=forecast.n_members,
@@ -2022,8 +2030,27 @@ def _side_evaluation(
         fractional_kelly=policy.fractional_kelly,
         base_edge=policy.base_edge,
         uncertainty_z=policy.uncertainty_z,
-    ))
+    )
+    decision = evaluate_weather_market(market_input)
     all_in_cost = executable.notional + fee
+    sizing_budget = None
+    venue_minimum = shares
+    if policy.kelly_sizing_enabled:
+        try:
+            sized = size_weather_entry(
+                levels=ask_levels, market=market_input, minimum_shares=shares,
+                bankroll=policy.sizing_bankroll, order_cap=policy.max_order_notional,
+            )
+        except ValueError as exc:
+            trade_block_reason = trade_block_reason or f"kelly sizing unavailable: {exc}"
+        else:
+            shares, ask, fee = sized.shares, sized.ask, sized.fee
+            all_in_cost, decision = sized.all_in_cost, sized.decision
+            sizing_budget = sized.budget
+            if not sized.accepted:
+                trade_block_reason = trade_block_reason or sized.reason
+            if not (policy.min_price <= ask <= policy.max_price):
+                trade_block_reason = trade_block_reason or "sized executable price outside weather range"
     tradeable = bool(
         decision.tradeable
         and all_in_cost <= policy.max_order_notional
@@ -2062,6 +2089,11 @@ def _side_evaluation(
         decision=decision,
         paper_tradeable=tradeable,
         paper_reason=reason,
+        sizing_mode="fractional_kelly" if policy.kelly_sizing_enabled else "venue_minimum",
+        sizing_bankroll=policy.sizing_bankroll,
+        sizing_budget=sizing_budget,
+        venue_minimum_shares=venue_minimum,
+        fee_rate=context.fee_rate,
         same_day_contract=same_day_contract,
         same_day_observation_available=observation.same_day_observation_available,
         current_high_display=observation.current_high_display,

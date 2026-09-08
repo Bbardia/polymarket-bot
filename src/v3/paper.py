@@ -9,7 +9,7 @@ import os
 import signal
 import sys
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -48,6 +48,13 @@ def _utc_now() -> str:
 
 def _env_bool(name: str, default: bool) -> bool:
     return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _strict_env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name, str(default)).strip().lower()
+    if value not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+        raise ValueError(f"{name} must be an explicit boolean")
+    return value in {"1", "true", "yes", "on"}
 
 
 def _decimal_env(name: str, default: str) -> Decimal:
@@ -127,6 +134,9 @@ class PaperSettings:
         ):
             raise ValueError("hybrid runner target must not be below the first exit target")
 
+        if self.weather_policy.kelly_sizing_enabled and self.safety_errors():
+            raise ValueError("V7 Kelly sizing is paper-only: " + "; ".join(self.safety_errors()))
+
     @classmethod
     def from_env(cls, root: Path) -> "PaperSettings":
         raw_dir = Path(os.getenv("V3_PAPER_DATA_DIR", "data/v3-paper"))
@@ -185,6 +195,7 @@ class PaperSettings:
                 intraclass_correlation=_decimal_env("V3_PAPER_WEATHER_ICC", "0.05"),
                 prior_strength=_decimal_env("V3_PAPER_WEATHER_PRIOR_STRENGTH", "10"),
                 fractional_kelly=_decimal_env("V3_PAPER_WEATHER_FRACTIONAL_KELLY", "0.05"),
+                kelly_sizing_enabled=_strict_env_bool("V3_PAPER_WEATHER_KELLY_SIZING_ENABLED", False),
                 uncertainty_z=_decimal_env("V3_PAPER_WEATHER_UNCERTAINTY_Z", "1"),
                 observations_enabled=_env_bool(
                     "V3_PAPER_WEATHER_OBSERVATIONS_ENABLED",
@@ -955,6 +966,12 @@ class PaperWorker:
             "net_edge": str(decision.net_edge),
             "minimum_edge": str(decision.minimum_edge),
             "kelly_fraction": str(decision.kelly_fraction),
+            "sizing_mode": evaluation.sizing_mode,
+            "sizing_bankroll": None if evaluation.sizing_bankroll is None else str(evaluation.sizing_bankroll),
+            "sizing_budget": None if evaluation.sizing_budget is None else str(evaluation.sizing_budget),
+            "venue_minimum_shares": None if evaluation.venue_minimum_shares is None else str(evaluation.venue_minimum_shares),
+            "fee_rate": None if evaluation.fee_rate is None else str(evaluation.fee_rate),
+            "fee_source": "gamma_market_schedule_or_disabled",
             "same_day_contract": evaluation.same_day_contract,
             "same_day_observation_available": (
                 evaluation.same_day_observation_available
@@ -1057,7 +1074,14 @@ class PaperWorker:
             result = await evaluate_weather_universe(
                 client=self.weather_client,
                 forecast=self.forecast,
-                policy=self.settings.weather_policy,
+                policy=(replace(
+                    self.settings.weather_policy,
+                    sizing_bankroll=max(ZERO, min(self.state.cash, self.settings.initial_cash)),
+                    max_order_notional=min(
+                        self.settings.max_order_notional,
+                        self.settings.weather_policy.max_order_notional,
+                    ),
+                ) if self.settings.weather_policy.kelly_sizing_enabled else self.settings.weather_policy),
                 observation_provider=self.observation_provider,
                 now=now,
             )
@@ -1157,6 +1181,20 @@ class PaperWorker:
             )
             paper_reason = "weather paper candidate"
             paper_executed = False
+            if self.settings.weather_policy.kelly_sizing_enabled:
+                execution_bankroll = max(
+                    ZERO,
+                    min(self.state.cash, self.settings.initial_cash),
+                )
+                execution_sizing_budget = min(
+                    self.settings.max_order_notional,
+                    execution_bankroll,
+                    execution_bankroll * evaluation.decision.kelly_fraction,
+                )
+                candidate.update({
+                    "execution_sizing_bankroll": str(execution_bankroll),
+                    "execution_sizing_budget": str(execution_sizing_budget),
+                })
             if entry_block_reason is not None:
                 paper_reason = entry_block_reason
                 candidate.update({"tradeable": False, "reason": entry_block_reason})
@@ -1166,6 +1204,15 @@ class PaperWorker:
                 paper_reason = "weather paper position cap reached"
             elif len(self.state.open_positions) >= self.settings.max_open_positions:
                 paper_reason = "paper open-position cap reached"
+            elif (
+                self.settings.weather_policy.kelly_sizing_enabled
+                and evaluation.all_in_cost > min(
+                    self.settings.max_order_notional,
+                    max(ZERO, min(self.state.cash, self.settings.initial_cash))
+                    * evaluation.decision.kelly_fraction,
+                )
+            ):
+                paper_reason = "kelly budget reduced since scan; skip without upsizing"
             elif evaluation.all_in_cost > self.state.cash:
                 paper_reason = "insufficient paper cash"
             else:
@@ -1613,6 +1660,9 @@ class PaperWorker:
             "paper_weather_min_provider_count": (
                 self.settings.weather_policy.minimum_provider_count
             ),
+            "weather_kelly_sizing_enabled": self.settings.weather_policy.kelly_sizing_enabled,
+            "weather_fractional_kelly": str(self.settings.weather_policy.fractional_kelly),
+            "weather_sizing_bankroll_basis": "min(current_cash,initial_trading_cash)",
             "weather_order_cap": str(self.settings.weather_policy.max_order_notional),
             "weather_position_cap": self.settings.weather_policy.max_open_positions,
             "open_meteo_request_cap": self.settings.open_meteo_max_requests_per_day,
@@ -1797,6 +1847,9 @@ def paper_status(settings: PaperSettings) -> dict[str, Any]:
             "account_reads_enabled": False,
             "live_trading_enabled": False,
             "weather_directional_enabled": settings.weather_policy.enabled,
+            "weather_kelly_sizing_enabled": settings.weather_policy.kelly_sizing_enabled,
+            "weather_fractional_kelly": str(settings.weather_policy.fractional_kelly),
+            "weather_sizing_bankroll_basis": "min(current_cash,initial_trading_cash)",
             "data_dir": str(store.data_dir),
             "state": "not_started",
         }
