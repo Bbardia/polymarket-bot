@@ -1204,6 +1204,18 @@ def test_weather_environment_defaults_enable_resolver_observations_and_widen_pap
     assert policy.min_price == D("0.02")
     assert policy.max_price == D("0.98")
     assert policy.max_order_notional == D("5")
+def test_weather_ladder_environment_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setenv("V3_PAPER_WEATHER_LADDER_ENABLED", "true")
+    monkeypatch.setenv("V3_PAPER_WEATHER_LADDER_WIDTH", "4")
+    monkeypatch.setenv("V3_PAPER_WEATHER_LADDER_MIN_EXPECTED_PROFIT", "0.03")
+    monkeypatch.setenv("V3_PAPER_WEATHER_LADDER_MIN_CLUSTER_PROBABILITY", "0.70")
+    monkeypatch.setenv("V3_PAPER_WEATHER_LADDER_MAX_BASKET_COST", "4")
+    policy = PaperSettings.from_env(tmp_path).weather_policy
+    assert policy.ladder_enabled is True
+    assert policy.ladder_width == 4
+    assert policy.ladder_min_expected_profit == D("0.03")
+    assert policy.ladder_min_cluster_probability == D("0.70")
+    assert policy.ladder_max_basket_cost == D("4")
 
 
 def event_weather_market(market_id: str, outcome: str, yes_price: str):
@@ -1270,6 +1282,7 @@ def event_worker(
     *,
     observation_provider=None,
     observations_enabled=False,
+    ladder_enabled=False,
 ):
     books = []
     for item in markets:
@@ -1298,6 +1311,7 @@ def event_worker(
         max_price=D("0.98"),
         max_order_notional=D("5"),
         base_edge=D("1"),
+        ladder_enabled=ladder_enabled,
     )
     store = PaperStore(tmp_path)
     worker = PaperWorker(
@@ -1458,6 +1472,38 @@ def test_weather_event_store_dedupes_an_existing_event_cycle_id(tmp_path):
     asyncio.run(worker.run_cycle(now=datetime(2026, 8, 24, tzinfo=timezone.utc)))
 
     assert len(store.read_records(store.weather_events_path)) == 1
+
+
+def test_weather_ladder_generates_one_basket_and_blocks_directional_duplicate(tmp_path):
+    markets = [
+        event_weather_market("ladder-29", "29°C", "0.10"),
+        event_weather_market("ladder-30", "30°C", "0.10"),
+        event_weather_market("ladder-31", "31°C", "0.10"),
+    ]
+    worker, store = event_worker(
+        tmp_path,
+        markets,
+        {
+            (D("29"), D("29")): D("0.30"),
+            (D("30"), D("30")): D("0.40"),
+            (D("31"), D("31")): D("0.20"),
+        },
+        ladder_enabled=True,
+    )
+    summary = asyncio.run(worker.run_cycle(now=datetime(2026, 8, 24, tzinfo=timezone.utc)))
+    event_row = store.read_records(store.weather_events_path)[0]
+    assert len(event_row["ladder_candidates"]) == 1
+    ladder = event_row["ladder_candidates"][0]
+    assert ladder["tradeable"] is True
+    assert D(ladder["cluster_probability"]) == D("0.90")
+    assert D(ladder["loss_if_outside_cluster"]) < D("0")
+    assert summary.paper_trades == 1
+    state = store.load_state().to_json()
+    assert len(state["open_positions"]) == 1
+    position = next(iter(state["open_positions"].values()))
+    assert position["strategy"] == "weather_ladder"
+    assert len(position["legs"]) == 3
+    assert not any(row.get("strategy") == "weather_directional" for row in store.read_records(store.trades_path))
 
 
 def test_incomplete_weather_partition_never_reports_basket_profit(tmp_path):

@@ -14,7 +14,7 @@ from datetime import date, datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from statistics import NormalDist
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
@@ -26,6 +26,7 @@ from .maker_shadow import MakerShadowQuote, propose_buy_quote
 from .math import BookLevel, execution_fee, execution_vwap
 from .strategies.weather import WeatherDecision, WeatherMarketInput, evaluate_weather_market
 from .weather_surface import EventSurface, SurfaceBucket, analyze_event_surface
+from .weather_ladder import LadderBucket, LadderResult, evaluate_ladder
 from .weather_sizing import size_weather_entry
 
 ZERO = Decimal("0")
@@ -511,6 +512,11 @@ class WeatherPaperPolicy:
     minimum_provider_count: int = 2
     kelly_sizing_enabled: bool = False
     sizing_bankroll: Decimal | None = None  # Injected by paper worker, never env.
+    ladder_enabled: bool = False
+    ladder_width: int = 3
+    ladder_min_expected_profit: Decimal = Decimal("0.02")
+    ladder_min_cluster_probability: Decimal = Decimal("0.60")
+    ladder_max_basket_cost: Decimal = Decimal("5")
 
     def __post_init__(self) -> None:
         if self.horizon_days < 1 or self.horizon_days > 14:
@@ -535,6 +541,14 @@ class WeatherPaperPolicy:
             raise ValueError("weather fractional Kelly must be in (0, 1]")
         if not (1 <= self.minimum_provider_count <= 4):
             raise ValueError("weather minimum provider count must be in [1, 4]")
+        if self.ladder_width not in {3, 4}:
+            raise ValueError("weather ladder width must be 3 or 4")
+        if self.ladder_min_expected_profit < ZERO:
+            raise ValueError("weather ladder minimum expected profit cannot be negative")
+        if not ZERO <= self.ladder_min_cluster_probability <= ONE:
+            raise ValueError("weather ladder cluster probability must be in [0, 1]")
+        if self.ladder_max_basket_cost <= ZERO:
+            raise ValueError("weather ladder basket cost must be positive")
 
 
 @dataclass(frozen=True)
@@ -600,6 +614,7 @@ class WeatherEventEvaluation:
     unit_verified: bool = True
     parsed_event_membership_verified: bool = True
     event_membership_verified: bool = False
+    ladder_candidates: tuple[LadderResult, ...] = ()
     public_data_only: bool = True
     execution_status: str = "not_executed"
 
@@ -2270,6 +2285,7 @@ def _build_event_evaluations(
         Sequence[tuple[Any, HighTemperatureContract, str]],
     ],
     components: Mapping[str, _SurfaceComponent],
+    policy: WeatherPaperPolicy,
 ) -> tuple[WeatherEventEvaluation, ...]:
     events: list[WeatherEventEvaluation] = []
     for (event_key, unit), entries in sorted(discovered.items()):
@@ -2360,6 +2376,59 @@ def _build_event_evaluations(
                 probability_sum=probability_sum,
                 reason="event market data or resolver verification incomplete",
             )
+        ladder_candidates: list[LadderResult] = []
+        if policy.ladder_enabled:
+            width = policy.ladder_width
+            for start in range(0, max(0, len(ordered_entries) - width + 1)):
+                window = ordered_entries[start:start + width]
+                window_components = [components.get(str(item[0].id)) for item in window]
+                if any(component is None for component in window_components):
+                    continue
+                typed_components = tuple(component for component in window_components if component is not None)
+                contracts_in_window = [item[1] for item in window]
+                if any(
+                    contract.display_lower is None
+                    or contract.display_upper is None
+                    or contract.display_lower != contract.display_upper
+                    for contract in contracts_in_window
+                ):
+                    continue
+                if any(
+                    cast(Decimal, right.display_lower)
+                    != cast(Decimal, left.display_upper) + ONE
+                    for left, right in zip(contracts_in_window, contracts_in_window[1:], strict=False)
+                ):
+                    continue
+                if not negative_risk_verified or not resolution_station_verified:
+                    continue
+                ladder_buckets = tuple(
+                    LadderBucket(
+                        key=str(item[0].condition_id),
+                        market_id=str(item[0].id),
+                        condition_id=str(item[0].condition_id),
+                        token_id=str(item[0].outcomes.yes.token_id),
+                        question=str(item[0].question),
+                        lower_display=cast(Decimal, item[1].display_lower),
+                        upper_display=cast(Decimal, item[1].display_upper),
+                        model_probability=(
+                            component.forecast.distribution_probability
+                            if component.forecast.distribution_probability is not None
+                            else component.forecast.raw_probability
+                        ),
+                        yes_asks=_book_levels(component.yes_book.asks),
+                        minimum_size=Decimal(str(component.yes_book.min_order_size)),
+                        fee_rate=cast(Decimal, component.context.fee_rate),
+                    )
+                    for item, component in zip(window, typed_components, strict=True)
+                )
+                ladder_candidates.append(evaluate_ladder(
+                    event_key=event_key,
+                    unit=unit,
+                    buckets=ladder_buckets,
+                    min_expected_profit=policy.ladder_min_expected_profit,
+                    min_cluster_probability=policy.ladder_min_cluster_probability,
+                    max_basket_cost=policy.ladder_max_basket_cost,
+                ))
         events.append(WeatherEventEvaluation(
             event_key=event_key,
             unit=unit,
@@ -2367,6 +2436,7 @@ def _build_event_evaluations(
             surface=surface,
             negative_risk_verified=negative_risk_verified,
             resolution_station_verified=resolution_station_verified,
+            ladder_candidates=tuple(ladder_candidates),
         ))
     return tuple(events)
 
@@ -2599,7 +2669,7 @@ async def evaluate_weather_universe(
         forecast_status = "degraded"
     else:
         forecast_status = "available"
-    events = _build_event_evaluations(discovered_events, components)
+    events = _build_event_evaluations(discovered_events, components, policy)
     return WeatherUniverseResult(
         markets_discovered=len(markets),
         markets_evaluated=len(markets),

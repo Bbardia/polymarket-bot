@@ -38,6 +38,7 @@ from .paper_weather import (
     evaluate_weather_universe,
 )
 from .strategies.complete_set import CompleteSetDecision, evaluate_complete_set
+from .weather_ladder import LadderResult
 
 ZERO = Decimal("0")
 ONE = Decimal("1")
@@ -208,6 +209,19 @@ class PaperSettings:
                 ),
                 minimum_provider_count=int(
                     os.getenv("V3_PAPER_WEATHER_MIN_PROVIDER_COUNT", "2")
+                ),
+                ladder_enabled=_strict_env_bool(
+                    "V3_PAPER_WEATHER_LADDER_ENABLED", False
+                ),
+                ladder_width=int(os.getenv("V3_PAPER_WEATHER_LADDER_WIDTH", "3")),
+                ladder_min_expected_profit=_decimal_env(
+                    "V3_PAPER_WEATHER_LADDER_MIN_EXPECTED_PROFIT", "0.02"
+                ),
+                ladder_min_cluster_probability=_decimal_env(
+                    "V3_PAPER_WEATHER_LADDER_MIN_CLUSTER_PROBABILITY", "0.60"
+                ),
+                ladder_max_basket_cost=_decimal_env(
+                    "V3_PAPER_WEATHER_LADDER_MAX_BASKET_COST", "5"
                 ),
             ),
         )
@@ -994,6 +1008,41 @@ class PaperWorker:
         }
 
     @staticmethod
+    def _ladder_payload(result: LadderResult) -> dict[str, Any]:
+        return {
+            "event_key": result.event_key,
+            "unit": result.unit,
+            "width": result.width,
+            "legs": [
+                {
+                    "key": leg.key,
+                    "market_id": leg.market_id,
+                    "condition_id": leg.condition_id,
+                    "token_id": leg.token_id,
+                    "question": leg.question,
+                    "model_probability": str(leg.model_probability),
+                    "shares": str(leg.shares),
+                    "ask_vwap": str(leg.ask_vwap),
+                    "fee": str(leg.fee),
+                    "all_in_cost": str(leg.all_in_cost),
+                }
+                for leg in result.legs
+            ],
+            "cluster_probability": str(result.cluster_probability),
+            "outside_probability": str(result.outside_probability),
+            "shares": str(result.shares),
+            "total_cost": str(result.total_cost),
+            "expected_payout": str(result.expected_payout),
+            "expected_profit": str(result.expected_profit),
+            "payout_if_selected_wins": str(result.payout_if_selected_wins),
+            "profit_if_selected_wins": str(result.profit_if_selected_wins),
+            "loss_if_outside_cluster": str(result.loss_if_outside_cluster),
+            "executable": result.executable,
+            "tradeable": result.tradeable,
+            "reason": result.reason,
+        }
+
+    @staticmethod
     def _weather_event_row(
         event: WeatherEventEvaluation,
         *,
@@ -1032,6 +1081,10 @@ class PaperWorker:
             "event_key": event.event_key,
             "unit": event.unit,
             "contracts": contracts,
+            "ladder_candidates": [
+                PaperWorker._ladder_payload(result)
+                for result in event.ladder_candidates
+            ],
             "model_probability_sum": str(surface.model_probability_sum),
             "model_probability_residual": str(surface.model_probability_residual),
             "bucket_count": surface.bucket_count,
@@ -1135,8 +1188,103 @@ class PaperWorker:
                 id_field="event_id",
             )
 
+        ladder_paper_trades = 0
+        ladder_candidate_count = 0
+        ladder_event_keys: set[str] = set()
+        entry_block_reason = self._entry_block_reason()
+        weather_open = sum(
+            1
+            for position in self.state.open_positions.values()
+            if str(position.get("strategy", "")).startswith("weather_")
+        )
+        for event in result.events:
+            if not event.ladder_candidates:
+                continue
+            ladder_candidate_count += len(event.ladder_candidates)
+            best_ladder = max(
+                event.ladder_candidates,
+                key=lambda item: item.expected_profit,
+            )
+            candidate_id = f"weather-ladder:{event.event_key}:{scanned_at}"
+            candidate = {
+                "candidate_id": candidate_id,
+                "strategy": "weather_ladder",
+                "event_key": event.event_key,
+                "scanned_at": scanned_at,
+                "ladder": self._ladder_payload(best_ladder),
+                "paper_only": True,
+                "public_data_only": True,
+            }
+            paper_reason = best_ladder.reason
+            paper_executed = False
+            if entry_block_reason is not None:
+                paper_reason = entry_block_reason
+            elif event.event_key in self.state.traded_strategy_keys:
+                paper_reason = "weather event already paper traded"
+            elif not best_ladder.tradeable:
+                paper_reason = best_ladder.reason
+            elif weather_open >= self.settings.weather_policy.max_open_positions:
+                paper_reason = "weather paper position cap reached"
+            elif len(self.state.open_positions) >= self.settings.max_open_positions:
+                paper_reason = "paper open-position cap reached"
+            elif best_ladder.total_cost > self.state.cash:
+                paper_reason = "insufficient paper cash"
+            else:
+                paper_executed = True
+                ladder_paper_trades += 1
+                weather_open += 1
+                self.state.cash -= best_ladder.total_cost
+                basket_id = candidate_id
+                self.state.traded_strategy_keys.add(event.event_key)
+                for leg in best_ladder.legs:
+                    self.state.traded_conditions.add(leg.condition_id)
+                self.state.open_positions[basket_id] = {
+                    "strategy": "weather_ladder",
+                    "event_key": event.event_key,
+                    "opened_at": scanned_at,
+                    "basket_id": basket_id,
+                    "all_in_cost": str(best_ladder.total_cost),
+                    "shares": str(best_ladder.shares),
+                    "model_probability": str(best_ladder.cluster_probability),
+                    "expected_profit": str(best_ladder.expected_profit),
+                    "profit_if_selected_wins": str(best_ladder.profit_if_selected_wins),
+                    "loss_if_outside_cluster": str(best_ladder.loss_if_outside_cluster),
+                    "legs": [
+                        {
+                            "market_id": leg.market_id,
+                            "condition_id": leg.condition_id,
+                            "token_id": leg.token_id,
+                            "shares": str(leg.shares),
+                            "all_in_cost": str(leg.all_in_cost),
+                        }
+                        for leg in best_ladder.legs
+                    ],
+                }
+                self.state.total_paper_trades += 1
+                trade = dict(candidate)
+                trade.update({
+                    "paper_executed": True,
+                    "paper_reason": paper_reason,
+                    "paper_cash_after": str(self.state.cash),
+                })
+                self.store.commit_with_audit(
+                    self.state,
+                    audit_id=candidate_id,
+                    stream="paper_trades",
+                    payload=trade,
+                )
+                ladder_event_keys.add(event.event_key)
+            candidate.update({
+                "paper_executed": paper_executed,
+                "paper_reason": paper_reason,
+                "paper_cash_after": str(self.state.cash),
+            })
+            self.store.append_record(self.store.candidates_path, candidate)
+
         selected: dict[str, WeatherEvaluation] = {}
         for evaluation in result.evaluations:
+            if evaluation.event_key in ladder_event_keys:
+                continue
             if not evaluation.paper_tradeable:
                 continue
             previous = selected.get(evaluation.event_key)
@@ -1159,12 +1307,12 @@ class PaperWorker:
                 selected_rank.get(id(item), 0),
             ),
         )
-        paper_trades = 0
+        paper_trades = ladder_paper_trades
         entry_block_reason = self._entry_block_reason()
         weather_open = sum(
             1
             for position in self.state.open_positions.values()
-            if position.get("strategy") == "weather_directional"
+            if str(position.get("strategy", "")).startswith("weather_")
         )
         for evaluation in ordered_evaluations:
             row = self._weather_row(evaluation, scanned_at)
@@ -1300,7 +1448,7 @@ class PaperWorker:
             forecast_errors=len(result.forecast_errors),
             provider_names=result.provider_names,
             provider_failures=result.provider_failures,
-            candidates=len(selected),
+            candidates=len(selected) + ladder_candidate_count,
             paper_trades=paper_trades,
             errors=len(result.errors),
             events_observed=len(result.events),
@@ -1319,6 +1467,75 @@ class PaperWorker:
         settled = 0
         errors = 0
         for condition_id, position in tuple(self.state.open_positions.items()):
+            if str(position.get("strategy", "")) == "weather_ladder":
+                try:
+                    legs = tuple(position.get("legs", ()))
+                    if not legs:
+                        continue
+                    leg_markets = []
+                    all_resolved = True
+                    for leg in legs:
+                        market = await self.client.get_market(id=str(leg["market_id"]))
+                        if not bool(getattr(market.state, "closed", False)):
+                            all_resolved = False
+                            break
+                        yes_price = getattr(market.outcomes.yes, "price", None)
+                        no_price = getattr(market.outcomes.no, "price", None)
+                        if yes_price is None or no_price is None:
+                            all_resolved = False
+                            break
+                        if {Decimal(str(yes_price)), Decimal(str(no_price))} != {ZERO, ONE}:
+                            all_resolved = False
+                            break
+                        leg_markets.append((leg, Decimal(str(yes_price))))
+                    if not all_resolved:
+                        continue
+                    payout = sum(
+                        (
+                            Decimal(str(leg["shares"]))
+                            if yes_price == ONE else ZERO
+                        )
+                        for leg, yes_price in leg_markets
+                    )
+                    all_in_cost = Decimal(str(position["all_in_cost"]))
+                    pnl = payout - all_in_cost
+                    self.state.cash += payout
+                    self.state.realized_pnl += pnl
+                    del self.state.open_positions[condition_id]
+                    self.store.commit_with_audit(
+                        self.state,
+                        audit_id=f"settlement:{condition_id}",
+                        stream="settlements",
+                        payload={
+                            "settled_at": settled_at,
+                            "condition_id": condition_id,
+                            "strategy": "weather_ladder",
+                            "event_key": str(position.get("event_key", "")),
+                            "payout": str(payout),
+                            "realized_pnl": str(pnl),
+                            "all_in_cost": str(all_in_cost),
+                            "winning_legs": [
+                                str(leg["condition_id"])
+                                for leg, yes_price in leg_markets
+                                if yes_price == ONE
+                            ],
+                            "paper_cash_after": str(self.state.cash),
+                            "public_data_only": True,
+                        },
+                    )
+                    settled += 1
+                    continue
+                except Exception as exc:
+                    errors += 1
+                    self.store.append_record(self.store.settlements_path, {
+                        "settled_at": settled_at,
+                        "condition_id": condition_id,
+                        "strategy": "weather_ladder",
+                        "status": "settlement_error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "public_data_only": True,
+                    })
+                    continue
             try:
                 market = await self.client.get_market(id=str(position["market_id"]))
                 if not bool(getattr(market.state, "closed", False)):
