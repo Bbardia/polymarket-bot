@@ -12,8 +12,31 @@ from typing import Any
 
 import requests
 
+from src.v3.sanity import (
+    SanityError,
+    assert_newest_at_index,
+    assert_partition_sums_to_one,
+    book_hard_reject,
+    check_price_age,
+    check_probability,
+    geography_gate,
+)
+
 
 UTC = timezone.utc
+
+# Remediation item 4: US CPI (BLS CUUR0000SA0) may only price markets that
+# name the United States. Everything else fails closed.
+US_GEOGRAPHY_MARKERS = (
+    "united states", "u.s.", "us cpi", "us inflation", "bureau of labor statistics", "bls",
+    "cuur0000sa0", "cpi-u",
+)
+FOREIGN_GEOGRAPHY_MARKERS = (
+    "argentina", "argentine", "canada", "canadian", "united kingdom", "uk ", "eurozone", "europe",
+    "china", "chinese", "japan", "japanese", "australia", "australian", "brazil", "mexico",
+    "india", "korea", "russia", "switzerland", "germany", "france", "italy", "spain", "turkey",
+    "new zealand", "venezuela", "nigeria", "south africa", "indonesia", "egypt",
+)
 
 
 def now_iso() -> str:
@@ -93,14 +116,27 @@ class V8Settings:
     fed_enabled: bool = True
     cpi_enabled: bool = True
     sports_enabled: bool = True
+    # Remediation item 1: paper entries are frozen unless a profile opts in.
+    # Discovery, model telemetry and settlement keep running.
+    entries_enabled: bool = False
+    # Remediation item 4: a book older than this at decision time is stale.
+    max_price_age_seconds: float = 300.0
+    fed_realized_cuts_ytd: int = 0
 
     @classmethod
     def from_env(cls, root: Path) -> "V8Settings":
         def flag(name: str, default: bool) -> bool:
-            return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
+            value = os.getenv(name, str(default)).strip().lower()
+            if value not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+                raise ValueError(f"{name} must be an explicit boolean")
+            return value in {"1", "true", "yes", "on"}
 
         data_dir = Path(os.getenv("V8_DATA_DIR", str(root / "data" / "v8-paper"))).expanduser()
+        interval = float(os.getenv("V8_SCAN_INTERVAL_SECONDS", "300"))
         return cls(
+            entries_enabled=flag("V8_ENTRIES_ENABLED", False),
+            max_price_age_seconds=float(os.getenv("V8_MAX_PRICE_AGE_SECONDS", str(interval))),
+            fed_realized_cuts_ytd=int(os.getenv("V8_FED_REALIZED_CUTS_YTD", "0")),
             root=root,
             data_dir=data_dir,
             scan_interval_seconds=float(os.getenv("V8_SCAN_INTERVAL_SECONDS", "300")),
@@ -126,6 +162,7 @@ class V8Settings:
             "authenticated_client": False,
             "public_data_only": True,
             "orders_submitted": False,
+            "paper_entries_enabled": self.entries_enabled,
             "starting_capital": self.initial_capital,
         }
 
@@ -257,12 +294,13 @@ def soccer_probabilities(home_golo: float, away_golo: float) -> dict[str, float]
 class FedModel:
     MONTHS = {"JAN": 1, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6, "JUL": 7, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
 
-    def __init__(self, http: PublicHTTP) -> None:
+    def __init__(self, http: PublicHTTP, *, realized_cuts: int = 0) -> None:
         self.http = http
         self.cached_at = 0.0
         self.distribution: dict[int, float] = {0: 1.0}
         self.source = "unavailable"
         self.meetings: list[dict[str, Any]] = []
+        self.realized_cuts = realized_cuts
 
     def refresh(self) -> None:
         if time.time() - self.cached_at < 240:
@@ -324,36 +362,79 @@ class FedModel:
         self.source = "kalshi-public-fed-decision-midpoints" if meetings else "unavailable"
         self.cached_at = time.time()
 
+    MONTH_NAMES = {
+        "january": 1, "february": 2, "march": 3, "april": 4,
+        "may": 5, "june": 6, "july": 7, "august": 8,
+        "september": 9, "october": 10, "november": 11, "december": 12,
+    }
+
+    @classmethod
+    def classify_predicate(cls, question: str, group_item_title: str = "") -> tuple[str, int | None] | None:
+        """Remediation item 4: explicit Fed predicate semantics, fail closed.
+
+        Returns one of ``("exact", n)``, ``("at_least", n)``, ``("cut_by", month)``,
+        ``("any_cut", None)`` or ``None`` when the question cannot be classified
+        unambiguously. Count buckets are never routed to the P(>=1) branch.
+        """
+        text = f"{question} {group_item_title}".lower().strip()
+        if not text:
+            return None
+        if re.search(r"\b(\d+)\s*\+\s*(?:fed\s+)?rate\s+cuts?\b", text) or re.search(
+            r"\b(\d+)\s+or\s+more\s+(?:fed\s+)?rate\s+cuts?\b", text
+        ):
+            match = re.search(r"\b(\d+)\s*(?:\+|or\s+more)", text)
+            return ("at_least", int(match.group(1))) if match else None
+        exact = re.search(r"\bwill\s+(\d+)\s+fed\s+rate\s+cuts?\s+happen\b", text) or re.search(
+            r"\bexactly\s+(\d+)\s+(?:fed\s+)?(?:rate\s+)?cuts?\b", text
+        )
+        if exact:
+            return ("exact", int(exact.group(1)))
+        if re.search(r"\bno\s+(?:fed\s+)?rate\s+cuts?\b", text) or re.search(r"\b0\s+(?:fed\s+)?rate\s+cuts?\b", text):
+            return ("exact", 0)
+        if "how many" in text:
+            group = re.fullmatch(r"\s*(\d+)\s*(?:\(.*\))?\s*", group_item_title.lower())
+            return ("exact", int(group.group(1))) if group else None
+        if "rate cut" in text:
+            for name, month in cls.MONTH_NAMES.items():
+                if re.search(rf"\bby\s+(?:the\s+)?{name}\b", text):
+                    return ("cut_by", month)
+            if re.search(r"\bby\s+(?:end\s+of\s+)?20\d{2}\b", text) or re.search(r"\bin\s+20\d{2}\b", text):
+                return ("any_cut", None)
+        return None
+
     def probability(self, market: dict[str, Any]) -> tuple[float, str, dict[str, Any]] | None:
         self.refresh()
         if not self.meetings:
             return None
-        title = f"{market.get('question', '')} {market.get('groupItemTitle', '')}".lower()
-        if "how many fed rate cuts" in title or "rate cuts" in title:
-            match = re.search(r"(\d+)\s*(?:\(|$)", str(market.get("groupItemTitle", "")))
-            if not match:
-                match = re.search(r"(?:exactly|number of)\s*(\d+)", title)
-            if match:
-                count = int(match.group(1))
-                probability = self.distribution.get(count, 0.0)
-                return probability, self.source, {"distribution": self.distribution, "meetings": self.meetings}
-        if "fed rate cut" in title and "how many" not in title:
-            cutoff = None
-            for name, month in {
-                "january": 1, "february": 2, "march": 3, "april": 4,
-                "may": 5, "june": 6, "july": 7, "august": 8,
-                "september": 9, "october": 10, "november": 11, "december": 12,
-            }.items():
-                if re.search(rf"by\s+{name}", title):
-                    cutoff = month
-                    break
-            meetings = self.meetings if cutoff is None else [item for item in self.meetings if item["month"] <= cutoff]
-            probability = 1.0
-            for meeting in meetings:
-                probability *= meeting["none"]
-            probability = 1.0 - probability
-            return probability, self.source, {"cutoff_month": cutoff, "meetings": meetings}
-        return None
+        predicate = self.classify_predicate(str(market.get("question", "")), str(market.get("groupItemTitle", "")))
+        if predicate is None:
+            return None
+        # The cut-count vector must be a verified partition before any use.
+        assert_partition_sums_to_one(self.distribution.values(), name="fed cut-count distribution")
+        kind, argument = predicate
+        realized = self.realized_cuts
+        shifted = {count + realized: probability for count, probability in self.distribution.items()}
+        metadata: dict[str, Any] = {
+            "predicate": kind,
+            "argument": argument,
+            "distribution": shifted,
+            "meetings": self.meetings,
+            "realized_cuts_ytd_assumed": realized,
+        }
+        if kind == "exact":
+            return shifted.get(argument, 0.0), self.source, metadata
+        if kind == "at_least":
+            return sum(p for count, p in shifted.items() if count >= argument), self.source, metadata
+        if kind == "cut_by":
+            meetings = [item for item in self.meetings if item["month"] <= argument]
+        else:
+            meetings = list(self.meetings)
+        none = 1.0
+        for meeting in meetings:
+            none *= meeting["none"]
+        if realized > 0:
+            return 1.0, self.source, {**metadata, "cutoff_month": argument, "meetings_used": meetings}
+        return 1.0 - none, self.source, {**metadata, "cutoff_month": argument, "meetings_used": meetings}
 
 
 class CPIModel:
@@ -371,36 +452,58 @@ class CPIModel:
             "https://api.bls.gov/publicAPI/v2/timeseries/data/CUUR0000SA0",
             {"startyear": str(year - 2), "endyear": str(year)},
         )
-        values: dict[tuple[int, int], float] = {}
-        for item in payload.get("Results", {}).get("series", [{}])[0].get("data", []):
-            period = str(item.get("period", ""))
-            if not period.startswith("M") or period == "M13":
-                continue
-            try:
-                values[(int(item["year"]), int(period[1:]))] = float(item["value"])
-            except (KeyError, TypeError, ValueError):
-                continue
-        yoy: dict[tuple[int, int], float] = {}
-        for (item_year, month), value in values.items():
-            previous = values.get((item_year - 1, month))
-            if previous:
-                yoy[(item_year, month)] = (value / previous - 1.0) * 100.0
-        self.yoy = yoy
+        self.yoy = self.yoy_from_payload(payload)
         self.source = "bls-public-CUUR0000SA0"
         self.cached_at = time.time()
 
-    def probability(self, market: dict[str, Any], event_title: str = "") -> tuple[float, str, dict[str, Any]] | None:
+    @staticmethod
+    def yoy_from_payload(payload: dict[str, Any]) -> dict[tuple[int, int], float]:
+        """Parse a BLS v2 timeseries payload into chronologically sorted YoY prints.
+
+        Remediation item 4: BLS returns newest-first. The declared newest index
+        (0) is asserted against the data, and every downstream consumer reads
+        the sorted dict so "last" always means "latest", never "January".
+        """
+        rows = payload.get("Results", {}).get("series", [{}])[0].get("data", [])
+        monthly = [
+            item for item in rows
+            if str(item.get("period", "")).startswith("M") and str(item.get("period")) != "M13"
+        ]
+        if not monthly:
+            return {}
+
+        def key(item: dict[str, Any]) -> tuple[int, int]:
+            return (int(item["year"]), int(str(item["period"])[1:]))
+
+        assert_newest_at_index(monthly, newest_index=0, key=key, name="BLS CUUR0000SA0 series")
+        values: dict[tuple[int, int], float] = {}
+        for item in monthly:
+            try:
+                values[key(item)] = float(item["value"])
+            except (KeyError, TypeError, ValueError):
+                continue
+        yoy: dict[tuple[int, int], float] = {}
+        for (item_year, month) in sorted(values):
+            previous = values.get((item_year - 1, month))
+            if previous:
+                yoy[(item_year, month)] = (values[(item_year, month)] / previous - 1.0) * 100.0
+        return yoy
+
+    def probability(
+        self, market: dict[str, Any], event_title: str = "", event_description: str = ""
+    ) -> tuple[float, str, dict[str, Any]] | None:
         self.refresh()
         title = f"{event_title} {market.get('question', '')} {market.get('groupItemTitle', '')}".lower()
         if "cpi" not in title and "inflation" not in title and "pce" not in title:
             return None
-        foreign_markers = (
-            "canada", "canadian", "united kingdom", "uk", "eurozone", "europe",
-            "china", "chinese", "japan", "japanese", "australia", "australian",
-            "brazil", "mexico", "india", "korea", "russia", "switzerland", "germany",
-            "france", "italy", "spain", "turkey", "new zealand",
-        )
-        if any(re.search(rf"\b{re.escape(country)}\b", title) for country in foreign_markers):
+        # Remediation item 4: geography fails closed. The market must name the
+        # United States (or the BLS series) and must not name another country.
+        geography_text = f"{title} {event_description}".lower()
+        if geography_gate(
+            geography_text,
+            required_markers=US_GEOGRAPHY_MARKERS,
+            forbidden_markers=FOREIGN_GEOGRAPHY_MARKERS,
+        ) is not None:
             return None
         if "pce" in title and "cpi" not in title:
             return None
@@ -409,17 +512,20 @@ class CPIModel:
             return None
         threshold = float(threshold_match.group(1))
         year = datetime.now(UTC).year
-        known = [value for (item_year, _), value in self.yoy.items() if item_year == year]
+        ordered = sorted(self.yoy.items())
+        known = [value for (item_year, _), value in ordered if item_year == year]
         if not known:
             return None
         observed_max = max(known)
+        whitelist: str | None = None
         if observed_max > threshold:
             probability = 1.0
+            whitelist = "observed_threshold_already_exceeded"
         else:
             months_observed = len(known)
             remaining = max(0, 12 - months_observed)
-            history = list(self.yoy.values())[-24:]
-            mean = known[-1]
+            history = [value for _, value in ordered][-24:]
+            mean = known[-1]  # latest print: ``known`` is chronologically sorted
             if len(history) >= 3:
                 slope = (history[-1] - history[-3]) / 2.0
                 mean += max(-0.25, min(0.25, slope))
@@ -434,7 +540,9 @@ class CPIModel:
             "threshold_percent": threshold,
             "observed_max_percent": observed_max,
             "known_yoy": known,
+            "latest_known_period": f"{ordered[-1][0][0]}-{ordered[-1][0][1]:02d}" if ordered else None,
             "forecast_method": "latest-yoy-normal-max-with-history-volatility",
+            "probability_whitelist_reason": whitelist,
         }
 
 
@@ -525,7 +633,7 @@ class V8Worker:
         self.http = PublicHTTP()
         self.state_path = settings.data_dir / "state.json"
         self.state = State.from_path(self.state_path, settings.initial_capital)
-        self.fed = FedModel(self.http)
+        self.fed = FedModel(self.http, realized_cuts=settings.fed_realized_cuts_ytd)
         self.cpi = CPIModel(self.http)
         self.sports = ClubEloModel(self.http)
         self.lock_path = settings.data_dir / "worker.lock"
@@ -624,6 +732,35 @@ class V8Worker:
     def book(self, token_id: str) -> dict[str, Any]:
         return self.http.get_json("https://clob.polymarket.com/book", {"token_id": token_id})
 
+    def book_block_reason(self, book: dict[str, Any], *, now: datetime | None = None) -> str | None:
+        """Remediation item 4: stale, thin or wide books are hard rejects."""
+        asks = sorted(((float(x["price"]), float(x["size"])) for x in book.get("asks", [])), key=lambda row: row[0])
+        bids = sorted(((float(x["price"]), float(x["size"])) for x in book.get("bids", [])), key=lambda row: -row[0])
+        reject = book_hard_reject(
+            best_bid=bids[0][0] if bids else None,
+            best_ask=asks[0][0] if asks else None,
+            best_ask_size=asks[0][1] if asks else None,
+        )
+        if reject is not None:
+            return reject
+        raw_timestamp = book.get("timestamp")
+        price_at: datetime | None = None
+        if raw_timestamp not in (None, ""):
+            try:
+                stamp = float(raw_timestamp)
+                price_at = datetime.fromtimestamp(stamp / 1000.0 if stamp > 1e11 else stamp, tz=UTC)
+            except (TypeError, ValueError):
+                price_at = None
+        try:
+            check_price_age(
+                decision_at=now or datetime.now(UTC),
+                price_at=price_at,
+                max_age_seconds=self.settings.max_price_age_seconds,
+            )
+        except SanityError as exc:
+            return f"stale or untimestamped price: {exc}"
+        return None
+
     @staticmethod
     def best_ask(book: dict[str, Any], quantity: float) -> tuple[float, float] | None:
         asks = sorted(((float(x["price"]), float(x["size"])) for x in book.get("asks", [])), key=lambda row: row[0])
@@ -643,7 +780,9 @@ class V8Worker:
         if lane == "macro":
             title = f"{event.get('title', '')} {market.get('question', '')}"
             if "cpi" in title.lower() or "inflation" in title.lower() or "pce" in title.lower():
-                return self.cpi.probability(market, str(event.get("title", "")))
+                return self.cpi.probability(
+                    market, str(event.get("title", "")), str(event.get("description", "") or "")
+                )
             return self.fed.probability(market)
         sports_probability = self.sports.outcome_probability(str(event.get("title", "")), str(market.get("question", "")))
         if sports_probability is None:
@@ -699,11 +838,25 @@ class V8Worker:
     ) -> dict[str, Any]:
         question = str(market.get("question", ""))
         base = {"timestamp": now_iso(), "lane": lane, "event_id": str(event.get("id")), "market_id": str(market.get("id")), "question": question}
-        model = self.model_probability(lane, event, market)
+        try:
+            model = self.model_probability(lane, event, market)
+        except SanityError as exc:
+            return {**base, "status": "rejected", "reason": "sanity_invariant_violation", "detail": str(exc)}
         if model is None:
             return {**base, "status": "rejected", "reason": "model_unavailable"}
         probability, source, metadata = model
-        probability = max(0.0, min(1.0, float(probability)))
+        # Remediation item 4: clamp-and-flag. Extreme model outputs are only
+        # tradeable when the model names a whitelisted deterministic reason.
+        sanity = check_probability(
+            float(probability),
+            whitelist_reason=metadata.get("probability_whitelist_reason") if isinstance(metadata, dict) else None,
+        )
+        probability = float(sanity.value)
+        if sanity.flagged:
+            return {
+                **base, "status": "rejected", "reason": "probability_out_of_bounds_flagged",
+                "detail": sanity.reason, "model_probability": probability, "model_source": source,
+            }
         try:
             token_ids = json.loads(market.get("clobTokenIds", "[]"))
         except (TypeError, json.JSONDecodeError):
@@ -718,6 +871,7 @@ class V8Worker:
             return {**base, "status": "rejected", "reason": "lane_position_cap", "model_probability": probability, "model_source": source}
         quantity = max(5.0, float(market.get("orderMinSize", 5) or 5))
         side_rows: list[tuple[str, float, float, float, str]] = []
+        blocked_reasons: list[dict[str, Any]] = []
         for index, side in enumerate(("YES", "NO")):
             side_probability = probability if side == "YES" else 1.0 - probability
             try:
@@ -735,7 +889,15 @@ class V8Worker:
             all_in = filled_quantity * price + fee
             edge = side_probability - (all_in / filled_quantity)
             side_rows.append((side, side_probability, price, fee, book_hash))
+            block_reason = self.book_block_reason(book)
+            if block_reason is not None:
+                blocked_reasons.append({"side": side, "reason": block_reason})
+                continue
             if edge >= self.settings.min_edge and all_in <= self.settings.max_order_notional:
+                if not self.settings.entries_enabled:
+                    # Remediation item 1: real gate. Telemetry continues; no state mutation.
+                    blocked_reasons.append({"side": side, "reason": "entries_disabled_by_profile", "edge": edge})
+                    continue
                 if self.state.cash - all_in < self.settings.initial_capital * self.settings.reserve_fraction:
                     continue
                 position = Position(
@@ -777,10 +939,16 @@ class V8Worker:
                 }
                 append_jsonl(self.settings.data_dir / "paper_trades.jsonl", record)
                 return record
+        reason = "insufficient_edge_or_budget"
+        if any(item["reason"] == "entries_disabled_by_profile" for item in blocked_reasons):
+            reason = "entries_disabled_by_profile"
+        elif blocked_reasons:
+            reason = "book_sanity_reject"
         return {
             **base,
             "status": "rejected",
-            "reason": "insufficient_edge_or_budget",
+            "reason": reason,
+            "blocked": blocked_reasons,
             "model_probability": probability,
             "model_source": source,
             "model_metadata": metadata,
