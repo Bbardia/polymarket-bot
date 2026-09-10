@@ -127,6 +127,9 @@ def settings(tmp_path, **overrides) -> PaperSettings:
         "paper_trading": True,
         "live_enabled": False,
         "account_reads_enabled": False,
+        # Entries are disabled by default since the 2026-09 remediation;
+        # these tests exercise the entry path, so opt in explicitly.
+        "entries_enabled": True,
         "scan_interval_seconds": 60.0,
         "market_limit": 5,
         "min_liquidity": D("1000"),

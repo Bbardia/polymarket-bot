@@ -19,6 +19,14 @@ import polymarket
 from polymarket import AsyncPublicClient
 
 from .market_context import MarketContext
+from .marking import (
+    LegMark,
+    PortfolioMark,
+    mark_leg,
+    mark_portfolio,
+    migrated_peak,
+    position_legs,
+)
 from .math import BookLevel, execution_bid_vwap, execution_fee
 from .paper_weather import (
     ForecastProvider,
@@ -72,9 +80,18 @@ class PaperSettings:
     paper_trading: bool = True
     live_enabled: bool = False
     account_reads_enabled: bool = False
-    entries_enabled: bool = True
+    # Remediation item 1: entries are disabled unless a campaign profile opts in.
+    entries_enabled: bool = False
     max_realized_loss: Decimal = ZERO
     max_drawdown_fraction: Decimal = ZERO
+    # Remediation item 2: breakers driven off executable bid-side marks.
+    max_mark_drawdown_fraction: Decimal = Decimal("0.10")
+    max_gross_exposure_fraction: Decimal = Decimal("0.30")
+    # Remediation item 3: bounded settlement retries and stuck detection.
+    settlement_max_attempts: int = 3
+    settlement_retry_delay_seconds: float = 0.5
+    settlement_stuck_after_failures: int = 12
+    unresolved_stake_publish_fraction: Decimal = Decimal("0.05")
     scan_interval_seconds: float = 300.0
     market_limit: int = 25
     discovery_max_markets: int = 2_000
@@ -116,6 +133,18 @@ class PaperSettings:
             raise ValueError("paper maximum realized loss cannot be negative")
         if not (ZERO <= self.max_drawdown_fraction < ONE):
             raise ValueError("paper maximum drawdown fraction must be in [0, 1)")
+        if not (ZERO <= self.max_mark_drawdown_fraction < ONE):
+            raise ValueError("paper maximum mark drawdown fraction must be in [0, 1)")
+        if not (ZERO <= self.max_gross_exposure_fraction <= ONE):
+            raise ValueError("paper gross exposure fraction must be in [0, 1]")
+        if self.settlement_max_attempts < 1 or self.settlement_max_attempts > 10:
+            raise ValueError("settlement attempts must be in [1, 10]")
+        if self.settlement_retry_delay_seconds < 0:
+            raise ValueError("settlement retry delay cannot be negative")
+        if self.settlement_stuck_after_failures < 1:
+            raise ValueError("settlement stuck threshold must be positive")
+        if not (ZERO <= self.unresolved_stake_publish_fraction <= ONE):
+            raise ValueError("unresolved stake publish fraction must be in [0, 1]")
         if self.max_open_positions < 1:
             raise ValueError("paper max open positions must be positive")
         if self.open_meteo_max_requests_per_day < 1:
@@ -148,10 +177,23 @@ class PaperSettings:
             paper_trading=_env_bool("PAPER_TRADING", True),
             live_enabled=_env_bool("ENABLE_V3_LIVE_TRADING", False),
             account_reads_enabled=_env_bool("ENABLE_V3_ACCOUNT_READS", False),
-            entries_enabled=_env_bool("V3_PAPER_ENTRIES_ENABLED", True),
+            entries_enabled=_strict_env_bool("V3_PAPER_ENTRIES_ENABLED", False),
             max_realized_loss=_decimal_env("V3_PAPER_MAX_REALIZED_LOSS", "0"),
             max_drawdown_fraction=_decimal_env(
                 "V3_PAPER_MAX_DRAWDOWN_FRACTION", "0"
+            ),
+            max_mark_drawdown_fraction=_decimal_env(
+                "V3_PAPER_MAX_MARK_DRAWDOWN_FRACTION", "0.10"
+            ),
+            max_gross_exposure_fraction=_decimal_env(
+                "V3_PAPER_MAX_GROSS_EXPOSURE_FRACTION", "0.30"
+            ),
+            settlement_max_attempts=int(os.getenv("V3_PAPER_SETTLEMENT_MAX_ATTEMPTS", "3")),
+            settlement_retry_delay_seconds=float(
+                os.getenv("V3_PAPER_SETTLEMENT_RETRY_DELAY_SECONDS", "0.5")
+            ),
+            settlement_stuck_after_failures=int(
+                os.getenv("V3_PAPER_SETTLEMENT_STUCK_AFTER_FAILURES", "12")
             ),
             scan_interval_seconds=float(os.getenv("V3_PAPER_SCAN_INTERVAL_SECONDS", "300")),
             market_limit=int(os.getenv("V3_PAPER_MARKET_LIMIT", "25")),
@@ -258,6 +300,16 @@ class PaperState:
     weather_resolved: int = 0
     weather_brier_sum: Decimal = ZERO
     pending_audits: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Remediation item 2/3 additive fields. ``None`` peaks mean "not yet
+    # migrated"; the first mark migrates safely via ``migrated_peak``.
+    peak_mark_equity: Decimal | None = None
+    peak_mark_equity_migrated: bool = False
+    last_mark_equity: Decimal | None = None
+    # Settlement and early-exit P&L are tracked separately from the point
+    # this build starts; legacy history is reconciled from the JSONL ledgers.
+    realized_settlement_pnl: Decimal = ZERO
+    realized_exit_pnl: Decimal = ZERO
+    settlement_failures: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def new(cls, initial_cash: Decimal) -> "PaperState":
@@ -266,6 +318,8 @@ class PaperState:
             initial_cash=initial_cash,
             cash=initial_cash,
             peak_entry_equity=initial_cash,
+            peak_mark_equity=initial_cash,
+            last_mark_equity=initial_cash,
         )
 
     @classmethod
@@ -295,6 +349,23 @@ class PaperState:
                 str(key): dict(value)
                 for key, value in payload.get("pending_audits", {}).items()
             },
+            peak_mark_equity=(
+                None
+                if payload.get("peak_mark_equity") is None
+                else Decimal(str(payload["peak_mark_equity"]))
+            ),
+            peak_mark_equity_migrated=bool(payload.get("peak_mark_equity_migrated", False)),
+            last_mark_equity=(
+                None
+                if payload.get("last_mark_equity") is None
+                else Decimal(str(payload["last_mark_equity"]))
+            ),
+            realized_settlement_pnl=Decimal(str(payload.get("realized_settlement_pnl", "0"))),
+            realized_exit_pnl=Decimal(str(payload.get("realized_exit_pnl", "0"))),
+            settlement_failures={
+                str(key): int(value)
+                for key, value in payload.get("settlement_failures", {}).items()
+            },
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -314,6 +385,16 @@ class PaperState:
             "weather_resolved": self.weather_resolved,
             "weather_brier_sum": str(self.weather_brier_sum),
             "pending_audits": self.pending_audits,
+            "peak_mark_equity": (
+                None if self.peak_mark_equity is None else str(self.peak_mark_equity)
+            ),
+            "peak_mark_equity_migrated": self.peak_mark_equity_migrated,
+            "last_mark_equity": (
+                None if self.last_mark_equity is None else str(self.last_mark_equity)
+            ),
+            "realized_settlement_pnl": str(self.realized_settlement_pnl),
+            "realized_exit_pnl": str(self.realized_exit_pnl),
+            "settlement_failures": dict(self.settlement_failures),
         }
 
 
@@ -669,6 +750,96 @@ class PaperWorker:
             and settings.weather_policy.observations_enabled
         ):
             self.observation_provider = NOAAStationObservations()
+        self._portfolio_mark: PortfolioMark | None = None
+        self._mark_error: str | None = None
+
+    async def _mark_positions(self, marked_at: str) -> PortfolioMark:
+        """Executable bid-side mark of every open leg (remediation item 2).
+
+        Books are fetched once per cycle for all legs. A leg whose book is
+        missing marks to zero and is counted as unmarkable; a leg deeper than
+        the resting bids is marked on the fillable part only.
+        """
+        legs_spec: list[tuple[str, str, Decimal, Decimal, Decimal | None]] = []
+        for key, position in self.state.open_positions.items():
+            stored_rate = position.get("fee_rate")
+            fee_rate = None if stored_rate is None else Decimal(str(stored_rate))
+            for leg_key, token_id, shares, cost in position_legs(key, position):
+                legs_spec.append((leg_key, token_id, shares, cost, fee_rate))
+        books_by_token: dict[str, Any] = {}
+        self._mark_error = None
+        token_ids = sorted({spec[1] for spec in legs_spec})
+        if token_ids:
+            try:
+                books = await self.client.get_order_books(token_ids=token_ids)
+                books_by_token = {str(book.token_id): book for book in books}
+            except Exception as exc:
+                self._mark_error = f"{type(exc).__name__}: {exc}"
+        leg_marks: list[LegMark] = []
+        for leg_key, token_id, shares, cost, fee_rate in legs_spec:
+            book = books_by_token.get(token_id)
+            bids = None
+            if book is not None:
+                bids = []
+                for level in getattr(book, "bids", ()) or ():
+                    try:
+                        bids.append(BookLevel(
+                            price=Decimal(str(level.price)),
+                            size=Decimal(str(level.size)),
+                        ))
+                    except (ValueError, ArithmeticError):
+                        continue
+            leg_marks.append(mark_leg(
+                key=leg_key, token_id=token_id, shares=shares, all_in_cost=cost,
+                bids=bids, fee_rate=fee_rate,
+            ))
+        mark = mark_portfolio(cash=self.state.cash, legs=leg_marks)
+        peak, migrated = migrated_peak(
+            stored_peak=self.state.peak_mark_equity,
+            initial_cash=self.state.initial_cash,
+            peak_entry_equity=self.state.peak_entry_equity,
+            current_mark_equity=mark.mark_equity,
+        )
+        if migrated:
+            self.state.peak_mark_equity_migrated = True
+        self.state.peak_mark_equity = peak
+        self.state.last_mark_equity = mark.mark_equity
+        self._portfolio_mark = mark
+        return mark
+
+    def _mark_drawdown(self) -> Decimal | None:
+        mark = self._portfolio_mark
+        peak = self.state.peak_mark_equity
+        if mark is None or peak is None or peak <= ZERO:
+            return None
+        return (peak - mark.mark_equity) / peak
+
+    def _ledger_pnl_split(self) -> dict[str, Any]:
+        """Reconcile settlement vs exit P&L additively from the JSONL ledgers."""
+        settlement_pnl = ZERO
+        settlement_count = 0
+        settlement_errors = 0
+        for row in self.store.read_records(self.store.settlements_path):
+            if row.get("status") == "settlement_error":
+                settlement_errors += 1
+                continue
+            if "realized_pnl" in row:
+                settlement_pnl += Decimal(str(row["realized_pnl"]))
+                settlement_count += 1
+        exit_pnl = ZERO
+        exit_count = 0
+        for row in self.store.read_records(self.store.exits_path):
+            if "realized_pnl" in row:
+                exit_pnl += Decimal(str(row["realized_pnl"]))
+                exit_count += 1
+        return {
+            "ledger_settlement_pnl": str(settlement_pnl),
+            "ledger_settlement_count": settlement_count,
+            "ledger_settlement_error_rows": settlement_errors,
+            "ledger_exit_pnl": str(exit_pnl),
+            "ledger_exit_count": exit_count,
+            "ledger_pnl_reconciles_state": (settlement_pnl + exit_pnl) == self.state.realized_pnl,
+        }
 
     def _open_entry_cost(self) -> Decimal:
         return sum(
@@ -689,7 +860,13 @@ class PaperWorker:
             self._entry_equity(),
         )
 
-    def _entry_block_reason(self, *, forecast_status: str | None = None) -> str | None:
+    def _entry_block_reason(
+        self,
+        *,
+        forecast_status: str | None = None,
+        prospective_cost: Decimal = ZERO,
+    ) -> str | None:
+        """Re-evaluated before every fill so breakers see intra-cycle changes."""
         if not self.settings.entries_enabled:
             return "paper entries disabled by profile"
         if (
@@ -707,6 +884,21 @@ class PaperWorker:
             ) / self.state.peak_entry_equity
             if drawdown >= self.settings.max_drawdown_fraction:
                 return "paper drawdown breaker reached"
+        mark_drawdown = self._mark_drawdown()
+        if (
+            self.settings.max_mark_drawdown_fraction > ZERO
+            and mark_drawdown is not None
+            and mark_drawdown >= self.settings.max_mark_drawdown_fraction
+        ):
+            return "paper mark-to-market drawdown breaker reached"
+        if self._portfolio_mark is not None and self.settings.max_gross_exposure_fraction < ONE:
+            # Gross exposure uses live state (cost already deducted from cash
+            # on fills this cycle) plus the prospective fill, against the
+            # last executable mark equity.
+            gross_after = self._open_entry_cost() + prospective_cost
+            cap = self.settings.max_gross_exposure_fraction * self._portfolio_mark.mark_equity
+            if gross_after > cap:
+                return "paper gross exposure cap reached"
         if (
             forecast_status is not None
             and self.settings.weather_policy.require_healthy_forecast
@@ -1217,6 +1409,10 @@ class PaperWorker:
             }
             paper_reason = best_ladder.reason
             paper_executed = False
+            # Risk recheck between fills (remediation item 2).
+            entry_block_reason = self._entry_block_reason(
+                prospective_cost=best_ladder.total_cost if best_ladder.tradeable else ZERO,
+            )
             if entry_block_reason is not None:
                 paper_reason = entry_block_reason
             elif event.event_key in self.state.traded_strategy_keys:
@@ -1363,6 +1559,10 @@ class PaperWorker:
                     "execution_sizing_bankroll": str(execution_bankroll),
                     "execution_sizing_budget": str(execution_sizing_budget),
                 })
+            # Risk recheck between fills (remediation item 2).
+            entry_block_reason = self._entry_block_reason(
+                prospective_cost=evaluation.all_in_cost,
+            )
             if entry_block_reason is not None:
                 paper_reason = entry_block_reason
                 candidate.update({"tradeable": False, "reason": entry_block_reason})
@@ -1404,6 +1604,9 @@ class PaperWorker:
                     "all_in_cost": str(evaluation.all_in_cost),
                     "model_probability": str(evaluation.decision.calibrated_probability),
                     "raw_probability": str(evaluation.raw_probability),
+                    "fee_rate": (
+                        None if evaluation.fee_rate is None else str(evaluation.fee_rate)
+                    ),
                     "provider_probabilities": {
                         source: str(probability)
                         for source, probability in evaluation.forecast.provider_probabilities
@@ -1463,6 +1666,51 @@ class PaperWorker:
             observation_errors=result.observation_errors,
         )
 
+    async def _fetch_market_with_retry(self, market_id: str) -> tuple[Any, int]:
+        """Bounded retry with linear backoff around public market reads."""
+        attempts = 0
+        last_error: Exception | None = None
+        while attempts < self.settings.settlement_max_attempts:
+            attempts += 1
+            try:
+                return await self.client.get_market(id=market_id), attempts
+            except Exception as exc:
+                last_error = exc
+                if attempts < self.settings.settlement_max_attempts:
+                    delay = self.settings.settlement_retry_delay_seconds * attempts
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+        assert last_error is not None
+        raise last_error
+
+    def _record_settlement_failure(self, condition_id: str) -> int:
+        failures = self.state.settlement_failures.get(condition_id, 0) + 1
+        self.state.settlement_failures[condition_id] = failures
+        return failures
+
+    def _stuck_positions(self) -> list[dict[str, Any]]:
+        """Positions whose settlement has failed repeatedly, valued at last bid mark."""
+        marks_by_key = {}
+        if self._portfolio_mark is not None:
+            for leg in self._portfolio_mark.legs:
+                marks_by_key.setdefault(leg.key.split(":leg")[0], ZERO)
+                marks_by_key[leg.key.split(":leg")[0]] += leg.value
+        stuck = []
+        for condition_id, failures in sorted(self.state.settlement_failures.items()):
+            if failures < self.settings.settlement_stuck_after_failures:
+                continue
+            if condition_id not in self.state.open_positions:
+                continue
+            position = self.state.open_positions[condition_id]
+            stuck.append({
+                "condition_id": condition_id,
+                "consecutive_failures": failures,
+                "all_in_cost": str(position.get("all_in_cost", "0")),
+                "last_bid_mark_value": str(marks_by_key.get(condition_id, ZERO)),
+                "action": "flagged; no automatic write-off",
+            })
+        return stuck
+
     async def _settle_positions(self, settled_at: str) -> tuple[int, int]:
         settled = 0
         errors = 0
@@ -1474,8 +1722,10 @@ class PaperWorker:
                         continue
                     leg_markets = []
                     all_resolved = True
+                    attempts_total = 0
                     for leg in legs:
-                        market = await self.client.get_market(id=str(leg["market_id"]))
+                        market, attempts = await self._fetch_market_with_retry(str(leg["market_id"]))
+                        attempts_total += attempts
                         if not bool(getattr(market.state, "closed", False)):
                             all_resolved = False
                             break
@@ -1501,7 +1751,9 @@ class PaperWorker:
                     pnl = payout - all_in_cost
                     self.state.cash += payout
                     self.state.realized_pnl += pnl
+                    self.state.realized_settlement_pnl += pnl
                     del self.state.open_positions[condition_id]
+                    self.state.settlement_failures.pop(condition_id, None)
                     self.store.commit_with_audit(
                         self.state,
                         audit_id=f"settlement:{condition_id}",
@@ -1520,6 +1772,8 @@ class PaperWorker:
                                 if yes_price == ONE
                             ],
                             "paper_cash_after": str(self.state.cash),
+                            "settlement_source": "gamma-public-market-outcome-prices",
+                            "settlement_attempts": attempts_total,
                             "public_data_only": True,
                         },
                     )
@@ -1527,17 +1781,20 @@ class PaperWorker:
                     continue
                 except Exception as exc:
                     errors += 1
+                    failures = self._record_settlement_failure(condition_id)
                     self.store.append_record(self.store.settlements_path, {
                         "settled_at": settled_at,
                         "condition_id": condition_id,
                         "strategy": "weather_ladder",
                         "status": "settlement_error",
                         "error": f"{type(exc).__name__}: {exc}",
+                        "attempts": self.settings.settlement_max_attempts,
+                        "consecutive_failures": failures,
                         "public_data_only": True,
                     })
                     continue
             try:
-                market = await self.client.get_market(id=str(position["market_id"]))
+                market, attempts = await self._fetch_market_with_retry(str(position["market_id"]))
                 if not bool(getattr(market.state, "closed", False)):
                     continue
                 yes_price = getattr(market.outcomes.yes, "price", None)
@@ -1590,7 +1847,9 @@ class PaperWorker:
                 pnl = payout - all_in_cost
                 self.state.cash += payout
                 self.state.realized_pnl += pnl
+                self.state.realized_settlement_pnl += pnl
                 del self.state.open_positions[condition_id]
+                self.state.settlement_failures.pop(condition_id, None)
                 settlement = {
                     "settled_at": settled_at,
                     "condition_id": condition_id,
@@ -1601,6 +1860,10 @@ class PaperWorker:
                     "directional_outcome": outcome,
                     "brier_score": None if brier is None else str(brier),
                     "paper_cash_after": str(self.state.cash),
+                    "settlement_source": "gamma-public-market-outcome-prices",
+                    "settlement_attempts": attempts,
+                    "target_date": position.get("target_date"),
+                    "city": position.get("city"),
                     "public_data_only": True,
                 }
                 self.store.commit_with_audit(
@@ -1612,12 +1875,15 @@ class PaperWorker:
                 settled += 1
             except Exception as exc:
                 errors += 1
+                failures = self._record_settlement_failure(condition_id)
                 self.store.append_record(self.store.settlements_path, {
                     "settled_at": settled_at,
                     "condition_id": condition_id,
                     "market_id": str(position.get("market_id", "")),
                     "status": "settlement_error",
                     "error": f"{type(exc).__name__}: {exc}",
+                    "attempts": self.settings.settlement_max_attempts,
+                    "consecutive_failures": failures,
                     "public_data_only": True,
                 })
         return settled, errors
@@ -1715,6 +1981,7 @@ class PaperWorker:
 
                 self.state.cash += net_proceeds
                 self.state.realized_pnl += profit
+                self.state.realized_exit_pnl += profit
                 self.state.total_paper_exits += 1
                 if partial_exit:
                     position["shares"] = str(shares - exit_shares)
@@ -1799,6 +2066,16 @@ class PaperWorker:
         paper_exits, exit_errors = await self._exit_positions(scanned_at)
         errors += exit_errors
         self._refresh_peak_entry_equity()
+        # Executable bid-side mark before any entry decision this cycle.
+        await self._mark_positions(scanned_at)
+        if self._mark_error is not None:
+            errors += 1
+            self.store.append_record(self.store.scans_path, {
+                "scanned_at": scanned_at,
+                "status": "mark_error",
+                "error": self._mark_error,
+                "public_data_only": True,
+            })
         if self.settings.complete_set_enabled:
             try:
                 markets = await self._discover_markets()
@@ -1839,6 +2116,9 @@ class PaperWorker:
         paper_trades += weather.paper_trades
         errors += weather.errors
 
+        # Re-mark after fills so the published equity reflects this cycle's entries.
+        if paper_trades or settlements or paper_exits:
+            await self._mark_positions(scanned_at)
         self.state.cycles += 1
         self.state.total_candidates += candidates
         self.store.save_state(self.state)
@@ -1876,10 +2156,52 @@ class PaperWorker:
             ),
             None,
         )
+        mark = self._portfolio_mark
+        gross_stake = sum(
+            (Decimal(str(row.get("all_in_cost", "0") or "0"))
+             for row in self.store.read_records(self.store.trades_path)
+             if row.get("paper_executed")),
+            ZERO,
+        )
+        unresolved_stake = ZERO if mark is None else mark.unresolved_stake
+        pnl_publishable = (
+            gross_stake > ZERO
+            and unresolved_stake <= self.settings.unresolved_stake_publish_fraction * gross_stake
+        )
+        mark_drawdown = self._mark_drawdown()
         self.store.write_status({
             "mode": "PAPER",
             "running": bool(self.store.current_pid() and self.store._pid_alive(self.store.current_pid() or 0)),
             "healthy": errors == 0,
+            # Remediation item 2: executable marks and breakers.
+            "mark_equity": None if mark is None else str(mark.mark_equity),
+            "mark_position_value": None if mark is None else str(mark.position_value),
+            "gross_exposure": None if mark is None else str(mark.gross_exposure),
+            "gross_exposure_cap_fraction": str(self.settings.max_gross_exposure_fraction),
+            "unresolved_stake": str(unresolved_stake),
+            "unmarkable_legs": None if mark is None else mark.unmarkable_legs,
+            "partial_marked_legs": None if mark is None else mark.partial_legs,
+            "mark_legs": [] if mark is None else [leg.as_dict() for leg in mark.legs],
+            "mark_error": self._mark_error,
+            "peak_mark_equity": (
+                None if self.state.peak_mark_equity is None else str(self.state.peak_mark_equity)
+            ),
+            "peak_mark_equity_migrated": self.state.peak_mark_equity_migrated,
+            "mark_drawdown": None if mark_drawdown is None else str(mark_drawdown),
+            "paper_max_mark_drawdown_fraction": str(self.settings.max_mark_drawdown_fraction),
+            # Remediation item 3: separate settlement/exit P&L and publish gate.
+            "realized_settlement_pnl_since_build": str(self.state.realized_settlement_pnl),
+            "realized_exit_pnl_since_build": str(self.state.realized_exit_pnl),
+            **self._ledger_pnl_split(),
+            "gross_stake_traded": str(gross_stake),
+            "realized_pnl_publishable": pnl_publishable,
+            "realized_pnl_publish_block_reason": (
+                None if pnl_publishable else
+                "unresolved stake exceeds publish threshold of gross stake"
+                if gross_stake > ZERO else "no traded stake"
+            ),
+            "stuck_positions": self._stuck_positions(),
+            "settlement_max_attempts": self.settings.settlement_max_attempts,
             "public_data_only": True,
             "authenticated_client_initialized": False,
             "account_reads_enabled": False,

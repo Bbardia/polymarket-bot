@@ -24,6 +24,11 @@ def test_main_template_is_bounded_hybrid_paper(monkeypatch, tmp_path):
     assert settings.weather_policy.max_open_positions == 5
     assert settings.max_realized_loss == Decimal("5")
     assert settings.max_drawdown_fraction == Decimal("0.10")
+    # 2026-09 remediation item 1: the shipped profile freezes entries.
+    assert not settings.entries_enabled
+    assert settings.max_mark_drawdown_fraction == Decimal("0.10")
+    assert settings.max_gross_exposure_fraction == Decimal("0.30")
+    assert settings.settlement_max_attempts == 3
     assert settings.weather_policy.minimum_provider_count == 2
     assert not settings.complete_set_enabled
     assert os.environ["PAPER_TRADING"] == "true"

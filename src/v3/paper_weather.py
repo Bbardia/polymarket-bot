@@ -24,6 +24,8 @@ from polymarket.models.gamma.market import Market
 from .market_context import MarketContext
 from .maker_shadow import MakerShadowQuote, propose_buy_quote
 from .math import BookLevel, execution_fee, execution_vwap
+from .resolver import parse_resolver_identity
+from .sanity import check_probability
 from .strategies.weather import WeatherDecision, WeatherMarketInput, evaluate_weather_market
 from .weather_surface import EventSurface, SurfaceBucket, analyze_event_surface
 from .weather_ladder import LadderBucket, LadderResult, evaluate_ladder
@@ -221,6 +223,8 @@ AVOID_CITIES = frozenset({
     "beijing",
     "chengdu",
     "chongqing",
+    # Hong Kong markets resolve on a non-METAR authority; refuse explicitly.
+    "hong kong",
     "london",
     "paris",
     "shenzhen",
@@ -1150,14 +1154,21 @@ def _verified_resolution_station(
     contract: HighTemperatureContract,
     source: str | None,
 ) -> str | None:
+    """Remediation item 5: per-market resolver identity, fail closed.
+
+    The station is parsed from the market's own resolution source. Weather
+    Underground and non-METAR authorities are refused, as is any parsed
+    station that disagrees with the mapped station (the map is never guessed
+    into agreement here; disagreements are surfaced by the resolver audit).
+    """
     expected = CITY_STATIONS.get(contract.city)
     if not expected or not source:
         return None
     parsed = urlparse(source)
     if parsed.scheme != "https" or parsed.hostname != "www.weather.gov":
         return None
-    sites = parse_qs(parsed.query).get("site", ())
-    if not sites or sites[0].upper() != expected:
+    identity = parse_resolver_identity(source)
+    if not identity.supported or identity.station != expected:
         return None
     return expected
 
@@ -2146,6 +2157,17 @@ def _side_evaluation(
         and observation.current_high_display is not None
         and yes_probability in {ZERO, ONE}
     )
+    # Remediation item 4: clamp-and-flag, never clamp-and-trade. A model
+    # probability outside [0.01, 0.99] is only tradeable when a resolver-certain
+    # observation bound produced it.
+    sanity = check_probability(
+        raw_probability,
+        whitelist_reason=(
+            "resolver_certain_observation_bound" if resolver_certain else None
+        ),
+    )
+    if sanity.flagged and trade_block_reason is None:
+        trade_block_reason = f"sanity flag: {sanity.reason}"
     outcome = market.outcomes.yes if side == "YES" else market.outcomes.no
     anchor = Decimal(str(outcome.price if outcome.price is not None else ask))
     fee = execution_fee(ask_levels, shares, context.fee_rate)
