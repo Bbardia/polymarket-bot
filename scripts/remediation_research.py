@@ -9,17 +9,19 @@ from src.v3.public_cache import PublicCache
 from src.v3.research import phi_report, extremize_fit
 from src.v3.scoring import evaluate_forecasts
 from src.v3.gates import load_registry, evaluate_gate
+from src.v3.pendulum_archive import fetch_manifest
 
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('command',choices=['acquire-tape','phi','evaluate','extremize','gates','replay','calibrate'])
+    p.add_argument('command',choices=['acquire-tape','archive-manifest','phi','evaluate','extremize','gates','replay','calibrate'])
     p.add_argument('--input',type=Path)
     p.add_argument('--out',type=Path,required=True)
     p.add_argument('--cache-dir',type=Path)
     p.add_argument('--denominator-complete',action='store_true',help='input is a complete quote-intention panel, including unfilled quotes')
     p.add_argument('--lead',type=int,default=1)
     p.add_argument('--as-of')
+    p.add_argument('--hour', help='PendulumFlow UTC hour, YYYY-MM-DDTHH')
     a=p.parse_args()
     payload=json.loads(a.input.read_text()) if a.input else []
     # Research commands consume row lists.  Accept the durable replay report
@@ -31,7 +33,10 @@ def main():
             raise ValueError('replay input events must be a list')
     else:
         rows = payload
-    if a.command=='acquire-tape':
+    if a.command=='archive-manifest':
+        if not a.hour: p.error('--hour required')
+        report=fetch_manifest(a.hour)
+    elif a.command=='acquire-tape':
         if not a.cache_dir: p.error('--cache-dir required')
         cache=PublicCache(a.cache_dir,max_requests=1,max_bytes=2_000_000)
         url='https://data-api.polymarket.com/trades?limit=100&offset=0&takerOnly=false'

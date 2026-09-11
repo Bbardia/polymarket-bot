@@ -50,3 +50,13 @@ Scope: implementation and public/paper-only verification. No live orders, accoun
 ## Operational boundary
 
 The active paper workers remain stopped. Paper entries remain disabled in the explicit campaign profiles. No live-capable path was activated, no authenticated endpoint was used, and no historical ledger was reset or rewritten.
+
+## External research addition — PendulumFlow archive
+
+The V7 research CLI now validates one canonical PendulumFlow V3 hourly manifest
+before any future offline reader consumes its Parquet data. The adapter is
+bounded to a small manifest response and does not download Parquet or alter
+strategy decisions. A real `2026-09-11T17` manifest validated successfully and
+was preserved as external evidence. Full order-book replay remains a separate
+evidence experiment; the archive's own coverage audit is not treated as proof
+of a trading edge.
