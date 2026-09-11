@@ -208,3 +208,73 @@ def test_strict_boolean_env_for_entries(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("V8_ENTRIES_ENABLED", "maybe")
     with pytest.raises(ValueError):
         V8Settings.from_env(tmp_path)
+
+
+def _test_position():
+    from src.v8.worker import Position
+    return Position('p', 'macro', 'e', 'm', 'test', 'YES', 't', 5, .5, 0, 2.5, .6, .1, '2026-09-10T00:00:00Z')
+
+
+def test_disputed_or_proposed_v8_never_settles(tmp_path):
+    worker = V8Worker(V8Settings(root=tmp_path, data_dir=tmp_path))
+    worker.state.positions = [_test_position()]
+    cash = worker.state.cash
+    for status in ('proposed', 'disputed', None):
+        worker.http.get_json = lambda *a, **k: {'closed': True, 'umaResolutionStatus': status, 'outcomePrices': '["1", "0"]'}
+        assert worker.settle_positions() == 0
+        assert worker.state.cash == cash
+
+
+def test_v8_mark_missing_book_zero_and_migrates_peak(tmp_path):
+    worker = V8Worker(V8Settings(root=tmp_path, data_dir=tmp_path, initial_capital=50))
+    worker.state.cash = 47.5
+    worker.state.positions = [_test_position()]
+    worker.market_detail = lambda market_id: {'feesEnabled': False, 'feeSchedule': None}
+    worker.book = lambda token_id: {}
+    mark = worker.mark_positions()
+    assert mark['mark_equity'] == 47.5
+    assert mark['gross_exposure'] == 2.5
+    assert mark['unmarkable_legs'] == 1
+    assert mark['peak_mark_equity'] == 50
+    worker.state.peak_mark_equity = 60
+    assert worker.risk_block_reason(0) == 'mark_drawdown_breaker'
+
+
+def test_v8_partial_depth_is_telemetry_but_whole_leg_marks_zero(tmp_path):
+    worker = V8Worker(V8Settings(root=tmp_path, data_dir=tmp_path, initial_capital=10))
+    worker.state.cash = 7.5
+    worker.state.positions = [_test_position()]
+    worker.book = lambda token_id: {'timestamp': time.time() * 1000, 'bids': [{'price': '.5', 'size': '2'}]}
+    worker.market_detail = lambda market_id: {
+        'feesEnabled': True,
+        'feeSchedule': {'rate': 0.05, 'exponent': 1, 'takerOnly': True},
+    }
+    mark = worker.mark_positions()
+    assert mark['mark_legs'][0]['quoted_partial_value'] == pytest.approx(0.975)
+    assert mark['mark_legs'][0]['unmarkable_shares'] == 3
+    assert mark['mark_legs'][0]['value'] == 0
+    assert mark['mark_equity'] == 7.5
+    worker.state.peak_mark_equity = 7.5
+    assert worker.risk_block_reason(1) == 'gross_exposure_cap'
+
+
+def test_v8_mark_uses_market_fee_schedule_and_fails_closed_when_missing(tmp_path):
+    worker = V8Worker(V8Settings(root=tmp_path, data_dir=tmp_path, initial_capital=10))
+    worker.state.cash = 7.5
+    worker.state.positions = [_test_position()]
+    worker.book = lambda token_id: {
+        'timestamp': time.time() * 1000,
+        'bids': [{'price': '.5', 'size': '5'}],
+    }
+    worker.market_detail = lambda market_id: {
+        'feesEnabled': True,
+        'feeSchedule': {'rate': 0.05, 'exponent': 1, 'takerOnly': True},
+    }
+    mark = worker.mark_positions()
+    assert mark['mark_legs'][0]['value'] == pytest.approx(2.4375)
+    assert mark['mark_legs'][0]['fee_source'] == 'gamma_market_fee_schedule'
+
+    worker.market_detail = lambda market_id: {'feesEnabled': True, 'feeSchedule': None}
+    mark = worker.mark_positions()
+    assert mark['mark_legs'][0]['value'] == 0
+    assert mark['mark_legs'][0]['mark_error'] == 'enabled_fee_schedule_missing'

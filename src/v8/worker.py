@@ -233,6 +233,8 @@ class State:
     trades: int = 0
     settlements: int = 0
     realized_pnl: float = 0.0
+    peak_mark_equity: float | None = None
+    gross_stake: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -242,6 +244,8 @@ class State:
             "trades": self.trades,
             "settlements": self.settlements,
             "realized_pnl": money(self.realized_pnl),
+            "peak_mark_equity": self.peak_mark_equity,
+            "gross_stake": self.gross_stake,
         }
 
     @classmethod
@@ -256,6 +260,8 @@ class State:
             trades=int(data.get("trades", 0)),
             settlements=int(data.get("settlements", 0)),
             realized_pnl=float(data.get("realized_pnl", 0)),
+            peak_mark_equity=data.get("peak_mark_equity"),
+            gross_stake=float(data.get("gross_stake", 0)),
         )
 
 
@@ -638,6 +644,7 @@ class V8Worker:
         self.sports = ClubEloModel(self.http)
         self.lock_path = settings.data_dir / "worker.lock"
         self.last_error: str | None = None
+        self.mark: dict[str, Any] = {}
 
     def acquire_lock(self) -> None:
         self.settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -666,7 +673,10 @@ class V8Worker:
             "open_positions": len(self.state.positions),
             "paper_trades": self.state.trades,
             "settlements": self.state.settlements,
-            "realized_pnl": money(self.state.realized_pnl),
+            "realized_pnl": money(self.state.realized_pnl) if self.mark.get("realized_pnl_publishable", False) else None,
+            "realized_settlement_pnl_provisional": money(self.state.realized_pnl),
+            "realized_exit_pnl": "0.000000",
+            **self.mark,
             "safety": self.settings.safety(),
             "lanes": {"fed": self.settings.fed_enabled, "cpi": self.settings.cpi_enabled, "sports": self.settings.sports_enabled},
             "data_dir": str(self.settings.data_dir),
@@ -732,6 +742,10 @@ class V8Worker:
     def book(self, token_id: str) -> dict[str, Any]:
         return self.http.get_json("https://clob.polymarket.com/book", {"token_id": token_id})
 
+    def market_detail(self, market_id: str) -> dict[str, Any]:
+        """Read public Gamma metadata used for the market-specific fee schedule."""
+        return self.http.get_json(f"https://gamma-api.polymarket.com/markets/{market_id}")
+
     def book_block_reason(self, book: dict[str, Any], *, now: datetime | None = None) -> str | None:
         """Remediation item 4: stale, thin or wide books are hard rejects."""
         asks = sorted(((float(x["price"]), float(x["size"])) for x in book.get("asks", [])), key=lambda row: row[0])
@@ -790,6 +804,76 @@ class V8Worker:
         probability, metadata = sports_probability
         return probability, "clubelo-public-golo", metadata
 
+    def mark_positions(self) -> dict[str, Any]:
+        """Public bid-depth liquidation; missing inventory depth contributes zero."""
+        value, gross, unmarkable = 0.0, 0.0, 0
+        legs = []
+        for position in self.state.positions:
+            gross += position.total_cost
+            remaining, partial_proceeds = position.quantity, 0.0
+            fee_source: str | None = None
+            mark_error: str | None = None
+            try:
+                market = self.market_detail(position.market_id)
+                if market.get("feesEnabled") is True:
+                    schedule = market.get("feeSchedule")
+                    if not isinstance(schedule, dict):
+                        raise ValueError("enabled_fee_schedule_missing")
+                    fee_source = "gamma_market_fee_schedule"
+                elif market.get("feesEnabled") is False:
+                    schedule = None
+                    fee_source = "gamma_market_fees_disabled"
+                else:
+                    raise ValueError("fee_enablement_unknown")
+                book = self.book(position.token_id)
+                stamp = float(book["timestamp"])
+                price_at = datetime.fromtimestamp(stamp / 1000 if stamp > 1e11 else stamp, UTC)
+                check_price_age(decision_at=datetime.now(UTC), price_at=price_at,
+                                max_age_seconds=self.settings.max_price_age_seconds)
+                levels = sorted(book.get("bids", []), key=lambda x: -float(x["price"]))
+                for level in levels:
+                    price, size = float(level["price"]), float(level["size"])
+                    if not all(math.isfinite(x) for x in (price, size)) or not 0 <= price <= 1 or size <= 0:
+                        continue
+                    take = min(remaining, size)
+                    partial_proceeds += take * price - fee_for(take, price, schedule)
+                    remaining -= take
+                    if remaining <= 1e-9:
+                        break
+            except (RuntimeError, ValueError, KeyError, TypeError, OverflowError) as exc:
+                remaining, partial_proceeds = position.quantity, 0.0
+                mark_error = str(exc)
+            unmarkable += int(remaining > 1e-9)
+            # A partial liquidation is telemetry, not executable whole-position equity.
+            proceeds = partial_proceeds if remaining <= 1e-9 else 0.0
+            value += proceeds
+            legs.append({"position_id": position.position_id, "value": proceeds,
+                         "quoted_partial_value": partial_proceeds,
+                         "unmarkable_shares": remaining, "fee_source": fee_source,
+                         "mark_error": mark_error})
+        equity = self.state.cash + value
+        migrated = self.state.peak_mark_equity is None
+        prior = self.state.peak_mark_equity
+        if prior is None:
+            prior = max(self.settings.initial_capital, self.state.cash + gross)
+        self.state.peak_mark_equity = max(prior, equity)
+        peak = self.state.peak_mark_equity
+        self.mark = {"mark_equity": equity, "gross_exposure": gross,
+                     "unresolved_stake": gross, "unmarkable_legs": unmarkable, "mark_legs": legs,
+                     "peak_mark_equity": peak, "peak_migrated_this_cycle": migrated,
+                     "historical_peak_unknown": migrated,
+                     "mark_drawdown": (peak-equity)/peak if peak > 0 else 0,
+                     "realized_pnl_publishable": self.state.gross_stake > 0 and gross <= .05*self.state.gross_stake}
+        return self.mark
+
+    def risk_block_reason(self, prospective_cost: float) -> str | None:
+        mark = self.mark_positions()
+        if mark["mark_drawdown"] >= .10:
+            return "mark_drawdown_breaker"
+        if mark["gross_exposure"] + prospective_cost > .30 * mark["mark_equity"]:
+            return "gross_exposure_cap"
+        return None
+
     def settle_positions(self) -> int:
         settled = 0
         for position in list(self.state.positions):
@@ -800,14 +884,14 @@ class V8Worker:
             except RuntimeError as exc:
                 self.last_error = str(exc)
                 continue
-            if not market.get("closed") or market.get("umaResolutionStatus") not in {"resolved", "proposed", "disputed", None}:
+            if not market.get("closed") or market.get("umaResolutionStatus") != "resolved":
                 continue
             try:
                 prices = json.loads(market.get("outcomePrices", "[]"))
                 selected = float(prices[0 if position.side == "YES" else 1])
             except (ValueError, TypeError, IndexError, json.JSONDecodeError):
                 continue
-            if selected not in {0.0, 1.0} and not (selected <= 0.001 or selected >= 0.999):
+            if selected not in {0.0, 1.0}:
                 continue
             payout = position.quantity if selected >= 0.999 else 0.0
             pnl = payout - position.total_cost
@@ -898,6 +982,10 @@ class V8Worker:
                     # Remediation item 1: real gate. Telemetry continues; no state mutation.
                     blocked_reasons.append({"side": side, "reason": "entries_disabled_by_profile", "edge": edge})
                     continue
+                risk_reason = self.risk_block_reason(all_in)
+                if risk_reason:
+                    blocked_reasons.append({"side": side, "reason": risk_reason})
+                    continue
                 if self.state.cash - all_in < self.settings.initial_capital * self.settings.reserve_fraction:
                     continue
                 position = Position(
@@ -919,6 +1007,8 @@ class V8Worker:
                 self.state.cash -= all_in
                 self.state.positions.append(position)
                 self.state.trades += 1
+                self.state.gross_stake += all_in
+                self.mark_positions()
                 occupied_events.add(str(event.get("id")))
                 lane_counts[lane] = lane_counts.get(lane, 0) + 1
                 record = {
@@ -961,6 +1051,7 @@ class V8Worker:
     def cycle(self) -> dict[str, Any]:
         self.last_error = None
         settled = self.settle_positions()
+        self.mark_positions()
         markets = self.relevant_markets()
         occupied_events = {position.event_id for position in self.state.positions}
         lane_counts: dict[str, int] = {}
@@ -996,7 +1087,10 @@ class V8Worker:
             "open_positions": len(self.state.positions),
             "paper_trades": self.state.trades,
             "cash": money(self.state.cash),
-            "realized_pnl": money(self.state.realized_pnl),
+            "realized_pnl": money(self.state.realized_pnl) if self.mark.get("realized_pnl_publishable", False) else None,
+            "realized_settlement_pnl_provisional": money(self.state.realized_pnl),
+            "realized_exit_pnl": "0.000000",
+            **self.mark,
             "rejections": sum(record.get("status") == "rejected" for record in records),
             "errors": sum(record.get("status") == "error" for record in records),
             "lane_counts": lane_counts,
