@@ -135,6 +135,8 @@ def assert_partition_sums_to_one(
     count = 0
     for value in values:
         decimal_value = _decimal(value)
+        if not decimal_value.is_finite():
+            raise SanityError(f"{name} has nonfinite mass")
         if decimal_value < ZERO:
             raise SanityError(f"{name} has a negative mass {decimal_value}")
         total += decimal_value
@@ -196,11 +198,14 @@ def book_hard_reject(
     """Return a rejection reason for books that cannot support a venue-minimum order."""
     if best_ask is None or best_ask_size is None:
         return "no executable ask"
-    if _decimal(best_ask_size) < min_size:
+    if not _decimal(best_ask_size).is_finite() or _decimal(best_ask_size) < min_size:
         return f"best ask size {best_ask_size} below venue minimum {min_size}"
     if best_bid is None:
         return "no bid; spread undefined"
-    spread = _decimal(best_ask) - _decimal(best_bid)
+    bid, ask, size = _decimal(best_bid), _decimal(best_ask), _decimal(best_ask_size)
+    if not all(v.is_finite() for v in (bid, ask, size)) or not ZERO <= bid <= ONE or not ZERO <= ask <= ONE:
+        return "invalid book values"
+    spread = ask - bid
     if spread < ZERO:
         return "crossed book"
     if spread > max_spread:

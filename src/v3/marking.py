@@ -73,10 +73,12 @@ def mark_leg(
     fee_rate: Decimal | None,
 ) -> LegMark:
     """Depth-aware partial bid quote: fill what the book holds, zero the rest."""
-    if shares <= ZERO:
+    if not shares.is_finite() or shares <= ZERO:
         raise ValueError("shares must be positive")
     assumed = fee_rate is None
     rate = CONSERVATIVE_FEE_RATE if fee_rate is None else fee_rate
+    if not rate.is_finite() or not ZERO <= rate <= Decimal("1"):
+        raise ValueError("invalid fee rate")
     if bids is None:
         return LegMark(
             key=key, token_id=token_id, shares=shares, all_in_cost=all_in_cost,
@@ -90,6 +92,8 @@ def mark_leg(
     for level in sorted(tuple(bids), key=lambda item: item.price, reverse=True):
         if remaining <= ZERO:
             break
+        if not level.price.is_finite() or not level.size.is_finite() or not ZERO <= level.price <= Decimal("1") or level.size <= ZERO:
+            continue
         take = min(level.size, remaining)
         notional += take * level.price
         fee += taker_fee(shares=take, price=level.price, fee_rate=rate)
@@ -155,6 +159,11 @@ def position_legs(position_key: str, position: Mapping[str, object]) -> tuple[tu
                 Decimal(str(leg["all_in_cost"])),
             ))
         return tuple(legs)
+    if str(position.get("strategy", "")) == "complete_set":
+        return tuple((
+            f"{position_key}:{side}", str(position.get(f"{side}_token_id", "")),
+            Decimal(str(position["shares"])), Decimal(str(position["all_in_cost"])) / 2,
+        ) for side in ("yes", "no"))
     token_id = position.get("token_id")
     if not token_id:
         return ()

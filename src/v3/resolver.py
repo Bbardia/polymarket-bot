@@ -14,6 +14,8 @@ import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+from zoneinfo import ZoneInfo
 from typing import Any, Mapping
 
 WEATHER_GOV_TIMESERIES_RE = re.compile(
@@ -48,27 +50,36 @@ class ResolverIdentity:
 
 def parse_resolver_identity(source: str | None, description: str | None = None) -> ResolverIdentity:
     """Return the METAR station a market resolves on, or an unsupported identity."""
-    haystack = " ".join(part for part in (source or "", description or "") if part)
-    if not haystack.strip():
-        return ResolverIdentity(None, "none", False, "no resolution source or description")
-    lowered = haystack.lower()
-    for marker in NON_METAR_AUTHORITY_MARKERS:
-        if marker in lowered:
-            return ResolverIdentity(None, "non-metar", False, f"non-METAR authority {marker} refused")
-    match = WEATHER_GOV_TIMESERIES_RE.search(haystack)
-    if match:
-        return ResolverIdentity(match.group(1).upper(), "weather.gov-timeseries", True, "METAR station parsed")
-    match = WUNDERGROUND_RE.search(haystack)
-    if match:
-        return ResolverIdentity(
-            match.group(1).upper(),
-            "wunderground",
-            False,
-            "Weather Underground resolver is not a supported METAR authority",
-        )
-    if "weather.gov" in lowered:
-        return ResolverIdentity(None, "weather.gov-unparsed", False, "weather.gov source without a site parameter")
-    return ResolverIdentity(None, "unknown", False, "unrecognised resolution authority")
+    texts = [source or "", description or ""]
+    identities = []
+    for text in texts:
+        urls = re.findall(r"https?://[^\s\"'<>]+", text)
+        for url in urls:
+            parsed = urlparse(url.rstrip(".,);"))
+            host = (parsed.hostname or "").lower()
+            if parsed.scheme != "https" or parsed.username or parsed.password:
+                continue
+            if host in {"weather.gov", "www.weather.gov"} and parsed.path.rstrip("/") == "/wrh/timeseries":
+                stations = parse_qs(parsed.query).get("site", [])
+                if len(stations) == 1 and re.fullmatch(r"[A-Za-z0-9]{3,4}", stations[0]):
+                    identities.append(ResolverIdentity(stations[0].upper(), "weather.gov-timeseries", True, "METAR station parsed"))
+                else:
+                    identities.append(ResolverIdentity(None, "weather.gov-unparsed", False, "invalid or ambiguous site"))
+            elif host in {"wunderground.com", "www.wunderground.com"}:
+                match = WUNDERGROUND_RE.search(url)
+                identities.append(ResolverIdentity(match.group(1).upper() if match else None,
+                    "wunderground", False, "Weather Underground requires a separate validated resolver"))
+            elif any(host == h or host.endswith("."+h) for h in NON_METAR_AUTHORITY_MARKERS):
+                identities.append(ResolverIdentity(None, "non-metar", False, "non-METAR authority refused"))
+        # An explicit unsupported source cannot be rescued by incidental description URLs.
+        if text == (source or "") and text.strip() and not identities:
+            return ResolverIdentity(None, "unknown", False, "unrecognised explicit resolution authority")
+    if not identities:
+        return ResolverIdentity(None, "none", False, "no supported resolver URL")
+    if any(not i.supported for i in identities) or len({i.station for i in identities}) != 1:
+        return next((i for i in identities if not i.supported),
+                    ResolverIdentity(None, "ambiguous", False, "conflicting resolver stations"))
+    return identities[0]
 
 
 @dataclass(frozen=True)
@@ -79,6 +90,7 @@ class StationRecord:
     elevation_m: float | None
     name: str
     source: str
+    timezone: str | None = None
 
 
 class StationMetadata:
@@ -102,6 +114,11 @@ class StationMetadata:
                 longitude = float(row["lon"])
             except (KeyError, TypeError, ValueError):
                 continue
+            if not math.isfinite(latitude) or not math.isfinite(longitude) or not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+                continue
+            zone = row.get("timezone")
+            if zone is not None:
+                ZoneInfo(zone)
             elevation = row.get("elev")
             records[icao] = StationRecord(
                 icao=icao,
@@ -110,6 +127,7 @@ class StationMetadata:
                 elevation_m=float(elevation) if elevation is not None else None,
                 name=str(row.get("site") or row.get("name") or ""),
                 source=str(row.get("source") or "aviationweather.gov/api/data/stationinfo"),
+                timezone=zone,
             )
         return cls(records, source_path=Path(path))
 
@@ -173,7 +191,7 @@ def verify_station_for_city(
             f"resolver station {parsed.station} differs from mapped {expected_station}; map fix requires evidence",
         )
     if metadata is None:
-        return StationVerification(city, expected_station, parsed, False, None, True, "station matches map; metadata unavailable")
+        return StationVerification(city, expected_station, parsed, False, None, False, "metadata unavailable; refuse")
     record = metadata.get(parsed.station)
     if record is None:
         return StationVerification(city, expected_station, parsed, False, None, False, "station missing from metadata; refuse")

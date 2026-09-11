@@ -110,7 +110,7 @@ def book(
         market=condition_id,
         condition_id=condition_id,
         token_id=token_id,
-        timestamp=None,
+        timestamp=datetime.now(timezone.utc),
         bids=(SimpleNamespace(price=D(bid), size=D("100")),),
         asks=(SimpleNamespace(price=D(ask), size=D("100")),),
         min_order_size=D("5"),
@@ -122,7 +122,14 @@ def book(
 
 
 def settings(tmp_path, **overrides) -> PaperSettings:
+    # Synthetic metadata for entry integration fixtures, never production evidence.
+    from src.v3.paper_weather import CITY_STATIONS, CITY_COORDS, CITY_TIMEZONES
+    metadata = tmp_path / 'synthetic-stations.json'
+    metadata.write_text(json.dumps([{'icao': station, 'lat': CITY_COORDS[city][0],
+        'lon': CITY_COORDS[city][1], 'timezone': CITY_TIMEZONES.get(city), 'source': 'synthetic-test'}
+        for city, station in CITY_STATIONS.items() if city in CITY_COORDS]))
     values = {
+        "station_metadata_path": metadata,
         "data_dir": tmp_path,
         "paper_trading": True,
         "live_enabled": False,
@@ -130,6 +137,7 @@ def settings(tmp_path, **overrides) -> PaperSettings:
         # Entries are disabled by default since the 2026-09 remediation;
         # these tests exercise the entry path, so opt in explicitly.
         "entries_enabled": True,
+        "complete_set_enabled": True,
         "scan_interval_seconds": 60.0,
         "market_limit": 5,
         "min_liquidity": D("1000"),

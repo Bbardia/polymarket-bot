@@ -1,0 +1,12 @@
+# Documentation template only. Not installed; no service changes authorized.
+[Unit]
+Description=Never-submitted maker shadow recorder
+[Service]
+Type=notify
+WorkingDirectory=<REPOSITORY>
+EnvironmentFile=<EXTERNAL_ENV_FILE>
+ExecStart=<PYTHON> <REPOSITORY>/scripts/maker_shadow_tick.py --input <SNAPSHOT> --out-dir <EVIDENCE_DIR>
+Restart=always
+WatchdogSec=30
+# A future long-running wrapper must implement sd_notify READY/WATCHDOG.
+# The one-shot CLI above does not implement it: this template is NOT deployable.

@@ -28,6 +28,8 @@ from .marking import (
     position_legs,
 )
 from .math import BookLevel, execution_bid_vwap, execution_fee
+from .sanity import SanityError, book_hard_reject, check_price_age
+from .resolver import StationMetadata, ResolverIdentity, verify_station_for_city
 from .paper_weather import (
     ForecastProvider,
     MetNoLocationForecast,
@@ -82,6 +84,7 @@ class PaperSettings:
     account_reads_enabled: bool = False
     # Remediation item 1: entries are disabled unless a campaign profile opts in.
     entries_enabled: bool = False
+    station_metadata_path: Path | None = None
     max_realized_loss: Decimal = ZERO
     max_drawdown_fraction: Decimal = ZERO
     # Remediation item 2: breakers driven off executable bid-side marks.
@@ -101,7 +104,7 @@ class PaperSettings:
     reserve_fraction: Decimal = Decimal("0.25")
     max_order_notional: Decimal = Decimal("5")
     max_open_positions: int = 10
-    complete_set_enabled: bool = True
+    complete_set_enabled: bool = False
     open_meteo_max_requests_per_day: int = 24
     open_meteo_cache_seconds: float = 21_600.0
     early_exit_enabled: bool = False
@@ -178,6 +181,7 @@ class PaperSettings:
             live_enabled=_env_bool("ENABLE_V3_LIVE_TRADING", False),
             account_reads_enabled=_env_bool("ENABLE_V3_ACCOUNT_READS", False),
             entries_enabled=_strict_env_bool("V3_PAPER_ENTRIES_ENABLED", False),
+            station_metadata_path=Path(os.environ["V3_STATION_METADATA_PATH"]) if os.getenv("V3_STATION_METADATA_PATH") else None,
             max_realized_loss=_decimal_env("V3_PAPER_MAX_REALIZED_LOSS", "0"),
             max_drawdown_fraction=_decimal_env(
                 "V3_PAPER_MAX_DRAWDOWN_FRACTION", "0"
@@ -204,7 +208,7 @@ class PaperSettings:
             reserve_fraction=_decimal_env("V3_RESERVE_FRACTION", "0.25"),
             max_order_notional=_decimal_env("V3_PAPER_MAX_ORDER_NOTIONAL", "5"),
             max_open_positions=int(os.getenv("V3_PAPER_MAX_OPEN_POSITIONS", "10")),
-            complete_set_enabled=_env_bool("V3_PAPER_COMPLETE_SET_ENABLED", True),
+            complete_set_enabled=_env_bool("V3_PAPER_COMPLETE_SET_ENABLED", False),
             open_meteo_max_requests_per_day=int(
                 os.getenv("V3_PAPER_OPEN_METEO_MAX_REQUESTS_PER_DAY", "24")
             ),
@@ -860,6 +864,50 @@ class PaperWorker:
             self._entry_equity(),
         )
 
+    def _station_metadata_reason(self, city: str) -> str | None:
+        from .paper_weather import CITY_STATIONS, CITY_COORDS, CITY_TIMEZONES
+        if self.settings.station_metadata_path is None:
+            return "station metadata unavailable; entries refused"
+        try:
+            metadata = StationMetadata.from_path(self.settings.station_metadata_path)
+            station = CITY_STATIONS.get(city)
+            result = verify_station_for_city(city=city, expected_station=station,
+                city_coordinates=CITY_COORDS.get(city),
+                parsed=ResolverIdentity(station, "weather.gov-timeseries", station is not None, "upstream per-market rules verified"),
+                metadata=metadata)
+            record = metadata.get(station) if station else None
+            if not result.verified:
+                return result.reason
+            if record is None or record.timezone != CITY_TIMEZONES.get(city):
+                return "station metadata timezone missing or differs from configured zone"
+            return None
+        except (ValueError, OSError, TypeError) as exc:
+            return f"invalid station metadata: {exc}"
+
+    async def _entry_books_reason(self, token_ids: list[str]) -> str | None:
+        """Recheck public source timestamps and executable top levels at fill time."""
+        try:
+            books = await self.client.get_order_books(token_ids=token_ids)
+            by_token = {str(b.token_id): b for b in books}
+            for token in token_ids:
+                book = by_token[token]
+                stamp = getattr(book, "timestamp", None)
+                if stamp is not None and not isinstance(stamp, datetime):
+                    number = float(stamp)
+                    stamp = datetime.fromtimestamp(number/1000 if number > 1e11 else number, timezone.utc)
+                check_price_age(decision_at=datetime.now(timezone.utc), price_at=stamp,
+                                max_age_seconds=self.settings.scan_interval_seconds)
+                bids = sorted(book.bids, key=lambda x: x.price, reverse=True)
+                asks = sorted(book.asks, key=lambda x: x.price)
+                reason = book_hard_reject(best_bid=bids[0].price if bids else None,
+                    best_ask=asks[0].price if asks else None,
+                    best_ask_size=asks[0].size if asks else None)
+                if reason:
+                    return reason
+            return None
+        except (Exception,) as exc:
+            return f"entry book sanity: {type(exc).__name__}: {exc}"
+
     def _entry_block_reason(
         self,
         *,
@@ -1036,7 +1084,11 @@ class PaperWorker:
         candidate["candidate_id"] = f"complete-set:{condition_id}:{scanned_at}"
         paper_reason = "paper candidate"
         paper_executed = False
-        entry_block_reason = self._entry_block_reason()
+        entry_block_reason = self._entry_block_reason(
+            prospective_cost=opportunity.gross_cost + opportunity.fees,
+        )
+        if entry_block_reason is None:
+            entry_block_reason = await self._entry_books_reason([yes_token, no_token])
         if entry_block_reason is not None:
             paper_reason = entry_block_reason
             candidate.update({"tradeable": False, "reason": entry_block_reason})
@@ -1072,6 +1124,7 @@ class PaperWorker:
                     "yes_token_id": yes_token,
                     "no_token_id": no_token,
                 }
+                await self._mark_positions(scanned_at)
                 self.state.total_paper_trades += 1
                 trade = dict(candidate)
                 trade.update({
@@ -1413,6 +1466,10 @@ class PaperWorker:
             entry_block_reason = self._entry_block_reason(
                 prospective_cost=best_ladder.total_cost if best_ladder.tradeable else ZERO,
             )
+            if entry_block_reason is None:
+                entry_block_reason = self._station_metadata_reason(event.event_key.split(":")[-2])
+            if entry_block_reason is None:
+                entry_block_reason = await self._entry_books_reason([leg.token_id for leg in best_ladder.legs])
             if entry_block_reason is not None:
                 paper_reason = entry_block_reason
             elif event.event_key in self.state.traded_strategy_keys:
@@ -1456,6 +1513,7 @@ class PaperWorker:
                         for leg in best_ladder.legs
                     ],
                 }
+                await self._mark_positions(scanned_at)
                 self.state.total_paper_trades += 1
                 trade = dict(candidate)
                 trade.update({
@@ -1563,6 +1621,10 @@ class PaperWorker:
             entry_block_reason = self._entry_block_reason(
                 prospective_cost=evaluation.all_in_cost,
             )
+            if entry_block_reason is None:
+                entry_block_reason = self._station_metadata_reason(evaluation.city)
+            if entry_block_reason is None:
+                entry_block_reason = await self._entry_books_reason([evaluation.token_id])
             if entry_block_reason is not None:
                 paper_reason = entry_block_reason
                 candidate.update({"tradeable": False, "reason": entry_block_reason})
@@ -1615,6 +1677,7 @@ class PaperWorker:
                     "city": evaluation.city,
                     "target_date": evaluation.target_date,
                 }
+                await self._mark_positions(scanned_at)
                 self.state.total_paper_trades += 1
                 trade = dict(candidate)
                 trade.update({
@@ -1727,6 +1790,9 @@ class PaperWorker:
                         market, attempts = await self._fetch_market_with_retry(str(leg["market_id"]))
                         attempts_total += attempts
                         if not bool(getattr(market.state, "closed", False)):
+                            all_resolved = False
+                            break
+                        if "DISPUTED" in str(getattr(market.resolution, "uma_resolution_status", None)).upper():
                             all_resolved = False
                             break
                         yes_price = getattr(market.outcomes.yes, "price", None)
@@ -2158,7 +2224,7 @@ class PaperWorker:
         )
         mark = self._portfolio_mark
         gross_stake = sum(
-            (Decimal(str(row.get("all_in_cost", "0") or "0"))
+            (Decimal(str(row.get("all_in_cost", row.get("ladder", {}).get("total_cost", row.get("opportunity", {}).get("all_in_cost", "0"))) or "0"))
              for row in self.store.read_records(self.store.trades_path)
              if row.get("paper_executed")),
             ZERO,
@@ -2281,7 +2347,8 @@ class PaperWorker:
             "total_candidates": self.state.total_candidates,
             "total_paper_trades": self.state.total_paper_trades,
             "total_paper_exits": self.state.total_paper_exits,
-            "realized_pnl": str(self.state.realized_pnl),
+            "realized_pnl": str(self.state.realized_pnl) if pnl_publishable else None,
+            "realized_pnl_provisional": str(self.state.realized_pnl),
             "weather_resolved": self.state.weather_resolved,
             "weather_brier_score": (
                 None

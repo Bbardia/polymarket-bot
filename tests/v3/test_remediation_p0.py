@@ -303,3 +303,75 @@ def test_station_verification_fails_closed_on_map_disagreement_and_distance():
         parsed=parsed, metadata=metadata,
     )
     assert not far.verified
+
+
+def test_complete_set_marks_both_tokens_and_preserves_total_cost():
+    from src.v3.marking import position_legs
+    legs = position_legs('basket', {'strategy': 'complete_set', 'shares': '5',
+        'all_in_cost': '4.5', 'yes_token_id': 'yes', 'no_token_id': 'no'})
+    assert {leg[1] for leg in legs} == {'yes', 'no'}
+    assert sum(leg[3] for leg in legs) == D('4.5')
+
+
+def test_complete_set_prospective_exposure_is_rejected(tmp_path):
+    client = FakePublicClient([market()], [book('yes-token', ask='.45'), book('no-token', ask='.45')])
+    worker = PaperWorker(client=client, settings=settings(tmp_path, max_gross_exposure_fraction=D('.01')),
+                         store=PaperStore(tmp_path))
+    result = asyncio.run(worker.run_cycle())
+    assert result.paper_trades == 0
+    assert not worker.state.open_positions
+
+
+def test_stale_or_missing_timestamp_blocks_entry(tmp_path):
+    books = [book('yes-token', ask='.45'), book('no-token', ask='.45')]
+    books[0].timestamp = datetime.now(timezone.utc) - timedelta(seconds=3590)
+    worker = PaperWorker(client=FakePublicClient([market()], books), settings=settings(tmp_path), store=PaperStore(tmp_path))
+    assert asyncio.run(worker.run_cycle()).paper_trades == 0
+    books[0].timestamp = None
+    assert asyncio.run(worker.run_cycle()).paper_trades == 0
+
+
+def test_missing_station_metadata_is_never_verified():
+    result = verify_station_for_city(city='chicago', expected_station='KORD',
+        city_coordinates=(41.98, -87.9), parsed=parse_resolver_identity('https://www.weather.gov/wrh/timeseries?site=KORD'), metadata=None)
+    assert not result.verified
+
+
+@pytest.mark.parametrize('value', ['NaN', 'Infinity', '-Infinity'])
+def test_partition_nonfinite_fails_closed(value):
+    with pytest.raises(SanityError):
+        assert_partition_sums_to_one([value])
+
+
+def test_shadow_repeated_trades_are_preserved_and_ambiguous_exits_refused(tmp_path):
+    from src.v3.shadow_settlement import load_cohort
+    row = {'paper_executed': True, 'condition_id': 'c', 'shares': '5', 'all_in_cost': '2', 'side': 'YES'}
+    (tmp_path/'paper_trades.jsonl').write_text(json.dumps(row)+'\n'+json.dumps(row)+'\n')
+    assert len(load_cohort(tmp_path)) == 2
+    (tmp_path/'paper_exits.jsonl').write_text(json.dumps({'condition_id':'c','shares':'5','realized_pnl':'1'})+'\n')
+    with pytest.raises(ValueError, match='ambiguous'):
+        load_cohort(tmp_path)
+
+
+def test_shadow_incomplete_cohort_does_not_publish_selected_statistics():
+    from src.v3.shadow_settlement import TradeOutcome, reconcile
+    cohort = {str(i): TradeOutcome(str(i), 'weather_directional', 'YES', D(5), D(2), '2026-09-09', 'x', D('.6')) for i in range(2)}
+    report = reconcile(cohort, getter=lambda url: {'tokens':[{'outcome':'YES', 'winner':url.endswith('/0')} ]})
+    assert not report['realized_pnl_publishable']
+    assert report['cohort']['hit_rate'] is None
+    assert report['cohort']['brier'] is None
+    assert report['statistics_status'] == 'insufficient_data'
+
+
+@pytest.mark.parametrize('source', [
+    'https://evil-weather.gov/wrh/timeseries?site=KORD',
+    'https://www.weather.gov/wrh/timeseries?site=KORD5',
+    'https://www.weather.gov/wrh/timeseries?site=KORD&site=KMDW',
+])
+def test_resolver_rejects_spoofed_or_ambiguous_source(source):
+    assert not parse_resolver_identity(source).supported
+
+
+def test_resolver_conflicting_description_fails_closed():
+    assert not parse_resolver_identity('https://www.weather.gov/wrh/timeseries?site=KORD',
+        'Resolves at https://www.weather.gov/wrh/timeseries?site=KMDW').supported

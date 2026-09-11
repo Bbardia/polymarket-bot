@@ -218,6 +218,38 @@ CITY_TIMEZONES: Mapping[str, str] = {
     "guangzhou": "Asia/Shanghai",
 }
 
+# Station corrections from public AviationWeather station metadata, 2026-09-10.
+# Historical runtime ledgers are unchanged; source identity is still parsed per market.
+LEGACY_CITY_STATIONS = dict(CITY_STATIONS)
+LEGACY_CITY_COORDS = dict(CITY_COORDS)
+CITY_STATIONS = {**CITY_STATIONS, 'chicago': 'KORD'}
+CITY_COORDS = {**CITY_COORDS, 'chicago': (41.96017, -87.93161)}
+CITY_TIMEZONES = {**CITY_TIMEZONES, 'chicago': 'America/Chicago'}
+CITY_STATIONS = {**CITY_STATIONS, 'dallas': 'KDAL'}
+CITY_COORDS = {**CITY_COORDS, 'dallas': (32.83836, -96.83584)}
+CITY_TIMEZONES = {**CITY_TIMEZONES, 'dallas': 'America/Chicago'}
+CITY_STATIONS = {**CITY_STATIONS, 'paris': 'LFPB'}
+CITY_COORDS = {**CITY_COORDS, 'paris': (48.967, 2.428)}
+CITY_TIMEZONES = {**CITY_TIMEZONES, 'paris': 'Europe/Paris'}
+CITY_STATIONS = {**CITY_STATIONS, 'moscow': 'UUWW'}
+CITY_COORDS = {**CITY_COORDS, 'moscow': (55.592, 37.261)}
+CITY_TIMEZONES = {**CITY_TIMEZONES, 'moscow': 'Europe/Moscow'}
+CITY_STATIONS = {**CITY_STATIONS, 'panama city': 'MPMG'}
+CITY_COORDS = {**CITY_COORDS, 'panama city': (8.967, -79.555)}
+CITY_TIMEZONES = {**CITY_TIMEZONES, 'panama city': 'America/Panama'}
+CITY_STATIONS = {**CITY_STATIONS, 'taipei': 'RCSS'}
+CITY_COORDS = {**CITY_COORDS, 'taipei': (25.069, 121.552)}
+CITY_TIMEZONES = {**CITY_TIMEZONES, 'taipei': 'Asia/Taipei'}
+CITY_STATIONS = {**CITY_STATIONS, 'istanbul': 'LTFM'}
+CITY_COORDS = {**CITY_COORDS, 'istanbul': (41.262, 28.74)}
+CITY_TIMEZONES = {**CITY_TIMEZONES, 'istanbul': 'Europe/Istanbul'}
+CITY_STATIONS = {**CITY_STATIONS, 'qingdao': 'ZSQD'}
+CITY_COORDS = {**CITY_COORDS, 'qingdao': (36.362, 120.087)}
+CITY_TIMEZONES = {**CITY_TIMEZONES, 'qingdao': 'Asia/Shanghai'}
+CITY_STATIONS = {**CITY_STATIONS, 'manila': 'RPLL'}
+CITY_COORDS = {**CITY_COORDS, 'manila': (14.507, 121.004)}
+CITY_TIMEZONES = {**CITY_TIMEZONES, 'manila': 'Asia/Manila'}
+
 # Keep known station/model mismatches out until resolved paper history proves calibration.
 AVOID_CITIES = frozenset({
     "beijing",

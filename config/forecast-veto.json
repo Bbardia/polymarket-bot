@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "usage": "veto_telemetry_only",
+  "df": 7,
+  "global_offset_by_lead": [0.58, 0.64, 0.66],
+  "sigma_by_lead": [1.38, 1.40, 1.58],
+  "sigma_floor": 1.25,
+  "market_pool_weight": 0,
+  "city_offsets": {},
+  "city_offset_status": "insufficient_data: original IEM panel and fitted parameters unavailable; do not double count total city bias as residual offset",
+  "seven_timer_decision_enabled": false
+}

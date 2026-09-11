@@ -1,0 +1,192 @@
+{
+  "source": "https://aviationweather.gov/api/data/stationinfo",
+  "acquired_at": "2026-09-10T19:45:26.058032+00:00",
+  "raw_sha256": "c21edce9a90ecf50e5436901ab114ed3f453121b6bf50efedb7440b7a859ef27",
+  "stations": [
+    {
+      "id": "KORD",
+      "icaoId": "KORD",
+      "iataId": "ORD",
+      "faaId": "ORD",
+      "wmoId": "72530",
+      "site": "Chicago/O'Hare Intl",
+      "lat": 41.96017,
+      "lon": -87.93161,
+      "elev": 202,
+      "state": "IL",
+      "country": "US",
+      "priority": 0,
+      "siteType": [
+        "METAR",
+        "TAF"
+      ],
+      "city": "chicago",
+      "timezone": "America/Chicago"
+    },
+    {
+      "id": "KDAL",
+      "icaoId": "KDAL",
+      "iataId": "DAL",
+      "faaId": "DAL",
+      "wmoId": "72258",
+      "site": "Dallas/Love Fld",
+      "lat": 32.83836,
+      "lon": -96.83584,
+      "elev": 148,
+      "state": "TX",
+      "country": "US",
+      "priority": 6,
+      "siteType": [
+        "METAR",
+        "TAF"
+      ],
+      "city": "dallas",
+      "timezone": "America/Chicago"
+    },
+    {
+      "id": "LFPB",
+      "icaoId": "LFPB",
+      "iataId": "LBG",
+      "faaId": null,
+      "wmoId": "07150",
+      "site": "Paris/Le Bourge Arpt",
+      "lat": 48.967,
+      "lon": 2.428,
+      "elev": 50,
+      "state": "ID",
+      "country": "FR",
+      "priority": 6,
+      "siteType": [
+        "METAR",
+        "TAF"
+      ],
+      "city": "paris",
+      "timezone": "Europe/Paris"
+    },
+    {
+      "id": "UUWW",
+      "icaoId": "UUWW",
+      "iataId": "VKO",
+      "faaId": null,
+      "wmoId": null,
+      "site": "Moscow/Vnukovo Arpt",
+      "lat": 55.592,
+      "lon": 37.261,
+      "elev": 195,
+      "state": "MO",
+      "country": "RU",
+      "priority": 5,
+      "siteType": [
+        "METAR",
+        "TAF"
+      ],
+      "city": "moscow",
+      "timezone": "Europe/Moscow"
+    },
+    {
+      "id": "MPMG",
+      "icaoId": "MPMG",
+      "iataId": "PAC",
+      "faaId": null,
+      "wmoId": null,
+      "site": "Panama/Gelabert Intl",
+      "lat": 8.967,
+      "lon": -79.555,
+      "elev": 6,
+      "state": "PA",
+      "country": "PA",
+      "priority": 6,
+      "siteType": [
+        "METAR",
+        "TAF"
+      ],
+      "city": "panama city",
+      "timezone": "America/Panama"
+    },
+    {
+      "id": "RCSS",
+      "icaoId": "RCSS",
+      "iataId": "TSA",
+      "faaId": null,
+      "wmoId": "46696",
+      "site": "Taipei/Songshan Arpt",
+      "lat": 25.069,
+      "lon": 121.552,
+      "elev": 8,
+      "state": "TP",
+      "country": "TW",
+      "priority": 5,
+      "siteType": [
+        "METAR",
+        "TAF"
+      ],
+      "city": "taipei",
+      "timezone": "Asia/Taipei"
+    },
+    {
+      "id": "LTFM",
+      "icaoId": "LTFM",
+      "iataId": "IST",
+      "faaId": null,
+      "wmoId": null,
+      "site": "Istanbul Arpt",
+      "lat": 41.262,
+      "lon": 28.74,
+      "elev": 99,
+      "state": "IS",
+      "country": "TR",
+      "priority": 0,
+      "siteType": [
+        "METAR",
+        "TAF"
+      ],
+      "city": "istanbul",
+      "timezone": "Europe/Istanbul"
+    },
+    {
+      "id": "ZSQD",
+      "icaoId": "ZSQD",
+      "iataId": "TAO",
+      "faaId": null,
+      "wmoId": "54857",
+      "site": "Qingdao/Jiaodong Arpt",
+      "lat": 36.362,
+      "lon": 120.087,
+      "elev": 2,
+      "state": "SD",
+      "country": "CN",
+      "priority": 1,
+      "siteType": [
+        "METAR",
+        "TAF"
+      ],
+      "city": "qingdao",
+      "timezone": "Asia/Shanghai"
+    },
+    {
+      "id": "RPLL",
+      "icaoId": "RPLL",
+      "iataId": "MNL",
+      "faaId": null,
+      "wmoId": "98429",
+      "site": "Manila/Aquino Intl",
+      "lat": 14.507,
+      "lon": 121.004,
+      "elev": 15,
+      "state": "NC",
+      "country": "PH",
+      "priority": 0,
+      "siteType": [
+        "METAR",
+        "TAF"
+      ],
+      "city": "manila",
+      "timezone": "Asia/Manila"
+    }
+  ],
+  "refused_authorities": [
+    "hong kong",
+    "wunderground"
+  ],
+  "unidentified_dead_cities": "review does not name six; retain legacy names behind entry freeze"
+}

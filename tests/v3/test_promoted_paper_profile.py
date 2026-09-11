@@ -1,4 +1,4 @@
-"""The shipped main profile promotes hybrid paper, never live execution."""
+"""The shipped main profile parks legacy exits and entries, never live execution."""
 from decimal import Decimal
 from pathlib import Path
 
@@ -6,7 +6,7 @@ from run_v3 import load_paper_environment
 from src.v3.paper import PaperSettings
 
 
-def test_main_template_is_bounded_hybrid_paper(monkeypatch, tmp_path):
+def test_main_template_is_frozen_hold_to_resolution(monkeypatch, tmp_path):
     import os
     monkeypatch.setattr(os, "environ", os.environ.copy())
     for key in tuple(os.environ):
@@ -15,8 +15,8 @@ def test_main_template_is_bounded_hybrid_paper(monkeypatch, tmp_path):
     template = Path(__file__).resolve().parents[2] / ".env.template"
     load_paper_environment(template)
     settings = PaperSettings.from_env(tmp_path)
-    assert settings.early_exit_enabled
-    assert settings.hybrid_exit_enabled
+    assert not settings.early_exit_enabled
+    assert not settings.hybrid_exit_enabled
     assert settings.early_exit_target_return == Decimal("0.28")
     assert settings.hybrid_exit_fraction == Decimal("0.75")
     assert settings.hybrid_runner_target_return == Decimal("0.50")

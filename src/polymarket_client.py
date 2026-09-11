@@ -8,15 +8,7 @@ from loguru import logger
 
 from src.config import Config
 
-# CLOB client for authenticated trading
-try:
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
-    from py_clob_client.order_builder.constants import BUY, SELL
-    HAS_CLOB = True
-except ImportError:
-    HAS_CLOB = False
-    logger.warning("py-clob-client not installed — trading disabled")
+# Legacy V1 SDK removed. Discovery and historical parsing remain available.
 
 
 class WeatherMarket:
@@ -414,19 +406,12 @@ class PolymarketClient:
     # ── Order Book (CLOB — read-only) ──
 
     def get_order_book(self, token_id: str):
-        """Get order book for a specific token."""
-        if not self.clob_client:
-            # Use read-only client
-            client = ClobClient(Config.CLOB_HOST)
-            return client.get_order_book(token_id)
-        return self.clob_client.get_order_book(token_id)
+        """V1 public execution adapter retired; use the V3 public SDK."""
+        raise RuntimeError("Legacy V1 order-book adapter parked; use src.v3.api")
 
     def get_price(self, token_id: str, side: str = "BUY") -> float:
-        """Get current best price for a token."""
-        if not self.clob_client:
-            client = ClobClient(Config.CLOB_HOST)
-            return float(client.get_price(token_id, side=side))
-        return float(self.clob_client.get_price(token_id, side=side))
+        """V1 public execution adapter retired; historical prices stay in ledgers."""
+        raise RuntimeError("Legacy V1 price adapter parked; use src.v3.api")
 
     # ── Trading (CLOB — authenticated) ──
 
@@ -443,11 +428,5 @@ class PolymarketClient:
         return {"error": "Legacy live trading disabled"}
 
     def get_positions(self) -> list:
-        """Get current open positions."""
-        if not self._api_creds_set:
-            return []
-        try:
-            return self.clob_client.get_trades()
-        except Exception as e:
-            logger.error(f"Failed to get positions: {e}")
-            return []
+        """Legacy account access permanently disabled."""
+        return []

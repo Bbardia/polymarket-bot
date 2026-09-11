@@ -380,3 +380,93 @@ def load_replay_events(
             raise ValueError(f"missing replay field: {exc.args[0]}") from exc
         events.append(event)
     return tuple(events)
+
+
+class TapeReplay:
+    """Timestamped maker-side replay, separate from historical aggressor replay.
+
+    Queue events must be observed or explicitly labelled model assumptions.
+    Aggregate public trades cannot generate the quote denominator. Markouts use
+    the first bid at/after each horizon, within 60 seconds; absent marks are null.
+    """
+    def __init__(self, *, ghost_probability=0., seed=7, queue_decay_per_second=0.):
+        import random
+        if not 0<=ghost_probability<=1 or not 0<=queue_decay_per_second<=1:
+            raise ValueError('invalid simulation probability')
+        self.ghost_probability=ghost_probability
+        self.decay=queue_decay_per_second
+        self.rng=random.Random(seed)
+
+    def run(self, events):
+        import math
+        if len(events)>DEFAULT_MAX_RECORDS: raise ValueError('event budget exceeded')
+        quotes={}; fills=[]; marks=[]; previous=float('-inf')
+        for event in events:
+            at=float(event['at'])
+            if not math.isfinite(at) or at<previous: raise ValueError('tape must be time ordered')
+            if previous!=float('-inf'):
+                for q in quotes.values(): q['queue_ahead']*=((1-self.decay)**(at-previous))
+            previous=at
+            for q in quotes.values():
+                if at>=q['expires_at']: q['active']=False
+            kind=event['type']
+            if kind=='quote':
+                q=dict(event)
+                if q['quote_id'] in quotes: raise ValueError('duplicate quote id; explicit cancel and new id on repricing')
+                if not all(math.isfinite(q[k]) for k in ('price','size','queue_ahead','expires_at')) or not 0<q['price']<1 or q['size']<=0 or q['queue_ahead']<0 or q['expires_at']<=at:
+                    raise ValueError('invalid quote')
+                # Multiple simultaneous hypothetical orders at the same level would double-count queue.
+                if any(x['active'] and x['token_id']==q['token_id'] and x['price']==q['price'] for x in quotes.values()):
+                    raise ValueError('one hypothetical quote per token/level')
+                q.update(remaining=q['size'],active=True)
+                quotes[q['quote_id']]=q
+            elif kind in ('cancel','cancel_ahead','join_ahead'):
+                q=quotes[event['quote_id']]
+                if kind=='cancel': q['active']=False
+                else:
+                    size=float(event['size'])
+                    if not math.isfinite(size) or size<0: raise ValueError('invalid queue delta')
+                    q['queue_ahead']=max(0,q['queue_ahead']+size*(1 if kind=='join_ahead' else -1))
+            elif kind=='maker_fill':
+                if event['maker_side'] not in ('BUY','SELL'): raise ValueError('explicit maker side required')
+                if event['maker_side']!='BUY': continue
+                volume=float(event['size'])
+                if not math.isfinite(volume) or volume<=0: raise ValueError('invalid maker fill')
+                for q in quotes.values():
+                    if not q['active'] or q['token_id']!=event['token_id'] or q['price']!=event['price']: continue
+                    ahead=q['queue_ahead']; q['queue_ahead']=max(0,ahead-volume)
+                    size=min(q['remaining'],max(0,volume-ahead))
+                    if size and self.rng.random()>=self.ghost_probability:
+                        q['remaining']-=size
+                        fills.append({'quote_id':q['quote_id'],'token_id':q['token_id'],'at':at,'price':q['price'],'size':size,'markouts':{}})
+                        if q['remaining']==0: q['active']=False
+            elif kind=='mark': marks.append(event)
+            else: raise ValueError('unknown tape event')
+        for fill in fills:
+            for horizon in (300,3600,10800):
+                matches=[m for m in marks if m['token_id']==fill['token_id'] and fill['at']+horizon<=m['at']<=fill['at']+horizon+60]
+                fill['markouts'][str(horizon)]=matches[0]['bid']-fill['price'] if matches else None
+        return {'quotes':len(quotes),'fills':fills,'filled_size':sum(f['size'] for f in fills),'maker_fee':0,'rewards':0,
+                'calibration_status':'insufficient_data','parameters_usable':False,'queue_decay_per_second':self.decay,'ghost_probability':self.ghost_probability}
+
+
+def calibration_report(panel):
+    """Compare independent held-out observed/modelled metrics, never fit and grade same tape."""
+    required=('population_markout','simulated_markout','observed_fill_curve','simulated_fill_curve','winner_fill','loser_fill','fills','held_out','denominator_complete')
+    if not panel or any(k not in panel for k in required):
+        return {'status':'insufficient_data','parameters_usable':False,'reason':'independent held-out tape and quote denominator required'}
+    if panel['denominator_complete'] is not True:
+        return {'status':'identifiability_blocked','parameters_usable':False}
+    if panel['held_out'] is not True or panel['fills']<65932:
+        return {'status':'insufficient_data','parameters_usable':False}
+    observed=panel['observed_fill_curve']; simulated=panel['simulated_fill_curve']
+    if set(observed)!=set(simulated) or not observed:
+        raise ValueError('matched queue strata required')
+    import math
+    values=[panel['population_markout'],panel['simulated_markout'],panel['winner_fill'],panel['loser_fill'],*observed.values(),*simulated.values()]
+    if not all(math.isfinite(v) for v in values): raise ValueError('nonfinite calibration')
+    mark_error=abs(panel['population_markout']-panel['simulated_markout'])
+    curve_error=max(abs(observed[k]-simulated[k]) for k in observed)
+    asymmetry=abs(panel['winner_fill']-.88)<=.05 and abs(panel['loser_fill']-1)<=.05
+    passed=mark_error<=.005 and curve_error<=.05 and asymmetry
+    return {'status':'pass' if passed else 'fail','parameters_usable':passed,'markout_error':mark_error,'fill_curve_error':curve_error,'asymmetry_reproduced':asymmetry}

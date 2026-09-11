@@ -90,3 +90,43 @@ def test_executor_never_calls_api_when_risk_rejects(tmp_path):
     result = asyncio.run(executor.submit(order_intent(post_only=False), account_state()))
     assert not result.accepted
     assert "post-only" in result.reason
+
+
+def test_ttl_minimum_rejected_before_api(tmp_path):
+    class Client:
+        async def place_limit_order(self, **kwargs): raise AssertionError('no API')
+    executor=V3OrderExecutor(Client(),risk_engine(),EventLedger(tmp_path/'ttl.db'),live_execution_authorized=True)
+    result=asyncio.run(executor.submit(order_intent(ttl_seconds=60),account_state()))
+    assert not result.accepted and '121' in result.reason
+
+
+def test_bounded_retry_and_kill_switch(tmp_path):
+    calls=[]
+    class Client:
+        async def place_limit_order(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(ok=False,code=425,message='retry') if len(calls)<3 else SimpleNamespace(ok=True,order_id='o',status='live')
+        async def cancel_all(self): return {'canceled':['o'],'not_canceled':{}}
+    async def sleep(_): pass
+    executor=V3OrderExecutor(Client(),risk_engine(),EventLedger(tmp_path/'retry.db'),live_execution_authorized=True,sleep=sleep)
+    result=asyncio.run(executor.submit(order_intent(ttl_seconds=121),account_state()))
+    assert result.accepted and len(calls)==3
+    assert asyncio.run(executor.kill_switch())['status']=='cancel_requested'
+    assert not asyncio.run(executor.submit(order_intent(),account_state())).accepted
+
+
+def test_post_only_mode_retry_exhaustion_and_ambiguous_transport(tmp_path):
+    import pytest
+    count=[]
+    class Client:
+        async def place_limit_order(self, **kwargs):
+            count.append(1)
+            return SimpleNamespace(ok=False,code=503,message='post_only_mode')
+    async def sleep(_): pass
+    executor=V3OrderExecutor(Client(),risk_engine(),EventLedger(tmp_path/'503.db'),live_execution_authorized=True,sleep=sleep)
+    assert not asyncio.run(executor.submit(order_intent(),account_state())).accepted
+    assert len(count)==3
+    class Ambiguous:
+        async def place_limit_order(self, **kwargs): raise TimeoutError('unknown acceptance')
+    executor=V3OrderExecutor(Ambiguous(),risk_engine(),EventLedger(tmp_path/'ambiguous.db'),live_execution_authorized=True,sleep=sleep)
+    with pytest.raises(TimeoutError): asyncio.run(executor.submit(order_intent(),account_state()))
