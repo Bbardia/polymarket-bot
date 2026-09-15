@@ -56,6 +56,35 @@ None of the repositories establishes a reproducible net profit advantage.
 V7 therefore does not loosen entry thresholds, disable provider gates, copy
 calibration constants, change exits, or enable live execution.
 
+## 2026-09-15 follow-up scan
+
+A fresh GitHub search found several newly active repositories. They remain
+hypothesis and infrastructure sources, not strategy evidence:
+
+- `qkkqk1234/weather-market-lab` (MIT, created 2026-09-12): 174 settled days;
+  its calibrated baseline and gated strategy lose to the market. Use its
+  negative-control methodology and settlement-source-change checks.
+- `marketlenstrade/polymarket-historical-data` (CC-BY-4.0, created 2026-09-12):
+  includes 33 resolved NYC weather markets and advertised order-book/trade
+  history. Use only a bounded offline reader for executable replay; preserve
+  attribution and keep it outside the decision path initially.
+- `PredictionMarketTrader/openthomas` (MIT): station bias, as-of hindcasts,
+  market blending, and block-bootstrap evaluation are useful designs. Its
+  latest reported results are negative or within noise, so no coefficients or
+  LLM policy are imported.
+- `erikw03/polymarket-weather-seminar`: read-only append-only ingestion only;
+  useful raw-tape pattern, not a trading strategy.
+- `BallesJr/polymarket-weather-edge`: actively updated paper bot with no clear
+  license and open-position bankroll claims; inspect station mapping only and
+  do not treat its marks as realized performance.
+- `yangyuan-zhen/PolyWeather`: technically substantial but AGPL-3.0 and
+  service-oriented; no code is copied.
+
+The bounded replay experiment is specified in
+`docs/experiments/20260915-weather-replay/PLAN.md`. A 33-market metadata sample
+and one compact Parquet file were validated outside the repository; no V7
+ledger, profile, or entry policy was changed.
+
 ## Evaluation gate
 
 Run V7 as a fresh, isolated paper campaign. Compare it with the unchanged V6

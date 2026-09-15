@@ -89,11 +89,12 @@ def test_paper_env_loader_does_not_export_credentials(tmp_path, monkeypatch):
     dotenv.write_text(
         "PAPER_TRADING=true\n"
         "ENABLE_V3_LIVE_TRADING=false\n"
+        "V3_STATION_METADATA_PATH=/tmp/stations.json\n"
         "POLY_PRIVATE_KEY=must_not_enter_paper_environment\n"
         "POLY_BUILDER_SECRET=must_not_enter_paper_environment\n"
     )
     for name in (
-        "PAPER_TRADING", "ENABLE_V3_LIVE_TRADING",
+        "PAPER_TRADING", "ENABLE_V3_LIVE_TRADING", "V3_STATION_METADATA_PATH",
         "POLY_PRIVATE_KEY", "POLY_BUILDER_SECRET",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -103,6 +104,7 @@ def test_paper_env_loader_does_not_export_credentials(tmp_path, monkeypatch):
 
     assert os.environ["PAPER_TRADING"] == "true"
     assert os.environ["ENABLE_V3_LIVE_TRADING"] == "false"
+    assert os.environ["V3_STATION_METADATA_PATH"] == "/tmp/stations.json"
     assert "POLY_PRIVATE_KEY" not in os.environ
     assert "POLY_BUILDER_SECRET" not in os.environ
 

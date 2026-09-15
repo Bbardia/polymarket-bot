@@ -1278,7 +1278,9 @@ class OpenMeteoEnsemble:
         *,
         fetch_json: JsonFetcher = _default_fetch_json,
         min_members: int = 10,
-        cache_seconds: float = 21_600,
+        # Match the rolling 24-hour quota window; a six-hour cache causes
+        # repeated refresh bursts for the same city/date keys.
+        cache_seconds: float = 86_400,
         timeout_seconds: float = 20,
         failure_backoff_seconds: float = 300,
         max_requests_per_day: int = 24,
@@ -1306,6 +1308,7 @@ class OpenMeteoEnsemble:
         self._request_times: list[float] = []
         self._failure_until: dict[tuple[str, str], float] = {}
         self._failure_messages: dict[tuple[str, str], str] = {}
+        self._stale_cache_grace_seconds = 86_400
         self._load_quota_state()
 
     def _load_quota_state(self) -> None:
@@ -1333,7 +1336,10 @@ class OpenMeteoEnsemble:
                 continue
             expires_at = raw_value.get("expires_at")
             raw_members = raw_value.get("members")
-            if not isinstance(expires_at, (int, float)) or expires_at <= now:
+            if (
+                not isinstance(expires_at, (int, float))
+                or expires_at <= now - self._stale_cache_grace_seconds
+            ):
                 continue
             if not isinstance(raw_members, list):
                 continue
@@ -1408,7 +1414,20 @@ class OpenMeteoEnsemble:
         cache_key = (contract.city, contract.target_date)
         monotonic_now = time.monotonic()
         cached = self._cache.get(cache_key)
-        if cached is not None and cached[0] > time.time():
+        current_time = time.time()
+        # Keep recently expired cache entries available for bounded fallback;
+        # _prune() would discard them before the quota check below.
+        self._request_times = [
+            value for value in self._request_times if current_time - value < 86_400
+        ]
+        quota_exhausted = len(self._request_times) >= self._max_requests_per_day
+        if cached is not None and (
+            cached[0] > current_time
+            or (
+                quota_exhausted
+                and cached[0] > current_time - self._stale_cache_grace_seconds
+            )
+        ):
             model_members = cached[1]
         else:
             failure_until = self._failure_until.get(cache_key, 0.0)

@@ -14,7 +14,7 @@ Scope: implementation and public/paper-only verification. No live orders, accoun
 
 | Item | Status | Implementation / evidence | Remaining gate |
 |---|---|---|---|
-| 1 | implemented/tested | Entries default to disabled for directional, ladder, and V8 paper profiles; scanners and historical ledgers remain readable. | User authorization would be required for any future opt-in campaign. |
+| 1 | implemented/tested | Entries default to disabled for directional, ladder, and versioned paper profiles; scanners and historical ledgers remain readable. | User authorization would be required for any future opt-in campaign. |
 | 2 | implemented/tested | Bid-side executable VWAP/fee marking, zero mark for insufficient depth, MTM drawdown, gross exposure, persistent peak migration, partial-depth telemetry, and between-fill risk checks. | Re-run against a fresh campaign only after code review; do not use old ledgers as a new sample. |
 | 3 | implemented/tested | Additive full-cohort public CLOB winner reconciliation with bounded retries, provenance, lot ambiguity checks, hold-versus-exit P&L, and unresolved-stake publication gate. | Historical point-in-time labels and any failed public fetches still need replay. |
 | 4 | implemented/tested | Chronology, geography, probability, partition, timestamp-age, spread, depth, and finite-value sanity checks; BLS/Fed regression fixtures. | No promotion until all upstream data sources provide the required provenance. |
@@ -37,10 +37,10 @@ Scope: implementation and public/paper-only verification. No live orders, accoun
 
 ## Verification executed
 
-- Main remediation suite: **280 passed, 1 skipped**.
-- V8 remediation suite: **236 passed, 1 skipped**.
+- Main remediation suite: **287 passed, 1 skipped**.
+- Archived V8 remediation suite: historical result **236 passed, 1 skipped**; V8 is no longer an active worker.
 - Main syntax compilation: passed for `src`, `scripts`, and `run_v3.py`.
-- V8 syntax compilation: passed for `src`, `tests`, and `run_v8.py`.
+- Archived V8 syntax compilation: historical result passed for `src`, `tests`, and `run_v8.py`; V8 is no longer active.
 - Station collector smoke: 2 public events, 2 labels, 0 winner validations, gate `insufficient_data`.
 - Gate registry CLI: all blocked/insufficient-data verdicts returned fail-closed statuses.
 - Maker tape calibration CLI: `insufficient_data`; parameters not usable.
@@ -49,7 +49,12 @@ Scope: implementation and public/paper-only verification. No live orders, accoun
 
 ## Operational boundary
 
-The active paper workers remain stopped. Paper entries remain disabled in the explicit campaign profiles. No live-capable path was activated, no authenticated endpoint was used, and no historical ledger was reset or rewritten.
+The active V7 paper worker remains the only running strategy worker. Paper entries
+remain enabled only in the explicit V7 profile. No live-capable path was
+activated, no authenticated endpoint was used, and no historical ledger was
+reset or rewritten. V8 services are retired; their ledgers and uncommitted diff
+are preserved in the external archive recorded at
+`/home/rasbardi/polymarket-v8-archive-20260915`.
 
 ## External research addition — PendulumFlow archive
 

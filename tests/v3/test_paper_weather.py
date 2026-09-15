@@ -1339,6 +1339,34 @@ def test_open_meteo_enforces_persistent_daily_request_cap(tmp_path):
         asyncio.run(provider.forecast(contract))
 
 
+def test_open_meteo_uses_bounded_stale_cache_when_quota_is_exhausted(tmp_path):
+    contract = parse_exact_high_contract(
+        "Will the highest temperature in Tokyo be 32°C on August 25?",
+        end_date=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
+    )
+    assert contract is not None
+    calls = []
+
+    def fetch_json(url, *, params, timeout):
+        calls.append(url)
+        raise AssertionError("quota fallback must not refresh Open-Meteo")
+
+    provider = OpenMeteoEnsemble(
+        fetch_json=fetch_json,
+        quota_path=tmp_path / "open_meteo_quota.json",
+        max_requests_per_day=1,
+        cache_seconds=10,
+    )
+    members = tuple((30.0, 31.0) for _ in range(4))
+    provider._cache[(contract.city, contract.target_date)] = (time.time() - 1, members)
+    provider._request_times = [time.time()]
+
+    result = asyncio.run(provider.forecast(contract))
+
+    assert result.source == "open-meteo"
+    assert calls == []
+
+
 def test_jma_forecast_parses_tokyo_daily_maximum_and_rejects_other_cities():
     contract = parse_exact_high_contract(
         "Will the highest temperature in Tokyo be 32°C on August 25?",
