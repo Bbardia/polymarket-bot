@@ -14,7 +14,7 @@ from src.v3.pendulum_archive import fetch_manifest
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('command',choices=['acquire-tape','archive-manifest','phi','evaluate','extremize','gates','replay','calibrate'])
+    p.add_argument('command',choices=['acquire-tape','archive-manifest','registry','phi','evaluate','extremize','gates','replay','calibrate'])
     p.add_argument('--input',type=Path)
     p.add_argument('--out',type=Path,required=True)
     p.add_argument('--cache-dir',type=Path)
@@ -22,6 +22,8 @@ def main():
     p.add_argument('--lead',type=int,default=1)
     p.add_argument('--as-of')
     p.add_argument('--hour', help='PendulumFlow UTC hour, YYYY-MM-DDTHH')
+    p.add_argument('--fetched-at')
+    p.add_argument('--source-url')
     a=p.parse_args()
     payload=json.loads(a.input.read_text()) if a.input else []
     # Research commands consume row lists.  Accept the durable replay report
@@ -33,7 +35,18 @@ def main():
             raise ValueError('replay input events must be a list')
     else:
         rows = payload
-    if a.command=='archive-manifest':
+    if a.command == 'registry':
+        from src.v3.resolver_registry import registry_entry_from_gamma
+        if not isinstance(payload, dict):
+            raise ValueError('registry input must be one raw Gamma object')
+        if not a.fetched_at or not a.source_url:
+            p.error('registry requires --fetched-at and --source-url')
+        report = registry_entry_from_gamma(
+            payload,
+            fetched_at=a.fetched_at,
+            source_url=a.source_url,
+        ).as_dict()
+    elif a.command=='archive-manifest':
         if not a.hour: p.error('--hour required')
         report=fetch_manifest(a.hour)
     elif a.command=='acquire-tape':
