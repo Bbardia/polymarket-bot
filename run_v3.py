@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from src.v3.api import UnifiedPolymarketAPI
 from src.v3.config import V3Settings
 from src.v3.paper import PaperSettings, paper_status, run_paper
+from src.v3.paper_mirror import run_paper_mirror
 from src.v3.simulation import (
     evaluate_shadow_candidates,
     load_replay_events,
@@ -147,6 +148,18 @@ def paper_run(*, cycles: int, interval: float | None) -> int:
     return 0
 
 
+def paper_mirror(*, source_data_dir: Path, cycles: int, interval: float) -> int:
+    load_paper_environment(ROOT / ".env")
+    settings = PaperSettings.from_env(ROOT)
+    asyncio.run(run_paper_mirror(
+        settings,
+        source_data_dir=source_data_dir,
+        cycles=cycles,
+        interval=interval,
+    ))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Operate the paper-first Polymarket V3 foundation.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -174,6 +187,13 @@ def main() -> int:
         "--interval", type=float,
         help="Override seconds between scans.",
     )
+    mirror_parser = subparsers.add_parser(
+        "paper-mirror",
+        help="Run paired exit-policy mirrors from a V7 paper trade ledger (no weather providers).",
+    )
+    mirror_parser.add_argument("--source-data-dir", type=Path, required=True)
+    mirror_parser.add_argument("--cycles", type=int, default=0)
+    mirror_parser.add_argument("--interval", type=float, default=60.0)
     subparsers.add_parser(
         "paper-status",
         help="Show local paper-worker health without network or account access.",
@@ -190,6 +210,12 @@ def main() -> int:
             return replay_report(args.path)
         if args.command == "paper-status":
             return paper_status_report()
+        if args.command == "paper-mirror":
+            return paper_mirror(
+                source_data_dir=args.source_data_dir,
+                cycles=args.cycles,
+                interval=args.interval,
+            )
         return paper_run(cycles=args.cycles, interval=args.interval)
     except (OSError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))
