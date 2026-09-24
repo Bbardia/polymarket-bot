@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Mapping
 from urllib.parse import urlparse
 
@@ -63,15 +65,24 @@ def _canonical_sha256(record: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _validate_source_url(source_url: str) -> str:
+def _validate_source_url(source_url: str, market_id: str) -> str:
     parsed = urlparse(source_url)
     if parsed.scheme != "https" or parsed.hostname not in _ALLOWED_GAMMA_HOSTS:
         raise ValueError("source_url must be an HTTPS Gamma API URL")
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ValueError("source_url must not contain credentials, query, or fragment")
-    if not parsed.path.startswith("/markets/") or parsed.path == "/markets/":
-        raise ValueError("source_url must identify a Gamma market record")
+    if parsed.port not in (None, 443) or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("source_url must not contain a nonstandard port, credentials, query, or fragment")
+    if parsed.path != f"/markets/{market_id}":
+        raise ValueError("source_url market_id must match the Gamma record")
     return source_url
+
+
+def _validate_fetched_at(fetched_at: str) -> None:
+    try:
+        timestamp = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("fetched_at must be an ISO-8601 timestamp") from exc
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("fetched_at must include a timezone")
 
 
 @dataclass(frozen=True)
@@ -94,7 +105,7 @@ class ResolverRegistryEntry:
             raise ValueError("outcomes and token_ids must have the same length")
         if len(self.outcomes) < 2:
             raise ValueError("a market must have at least two outcomes")
-        if len(self.raw_sha256) != 64:
+        if len(self.raw_sha256) != 64 or re.fullmatch(r"[0-9a-f]{64}", self.raw_sha256) is None:
             raise ValueError("raw_sha256 must be a SHA-256 hex digest")
 
     def as_dict(self) -> dict[str, Any]:
@@ -118,7 +129,7 @@ def registry_entry_from_gamma(
     record: Mapping[str, Any],
     *,
     fetched_at: str = "",
-    source_url: str = "https://gamma-api.polymarket.com/markets/unknown",
+    source_url: str | None = None,
 ) -> ResolverRegistryEntry:
     """Normalize one already-fetched Gamma record; fail closed on uncertainty."""
     if not isinstance(record, Mapping):
@@ -135,7 +146,10 @@ def registry_entry_from_gamma(
     description = str(record.get("description") or "")
     if not fetched_at.strip():
         raise ValueError("fetched_at is required for provenance")
-    source_url = _validate_source_url(source_url)
+    _validate_fetched_at(fetched_at)
+    if source_url is None:
+        source_url = f"https://gamma-api.polymarket.com/markets/{market_id}"
+    source_url = _validate_source_url(source_url, market_id)
     resolver = parse_resolver_identity(resolution_source, description)
     if not resolver.supported or not resolver.station:
         raise ValueError(f"resolver metadata is unsupported or ambiguous: {resolver.reason}")

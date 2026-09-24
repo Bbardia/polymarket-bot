@@ -72,6 +72,28 @@ def test_registry_rejects_non_gamma_source_url():
         )
 
 
+def test_registry_rejects_source_url_for_different_market():
+    with pytest.raises(ValueError, match="market_id"):
+        registry_entry_from_gamma(
+            gamma_record(),
+            fetched_at="2026-09-18T10:00:00+00:00",
+            source_url="https://gamma-api.polymarket.com/markets/999",
+        )
+
+
+def test_registry_rejects_invalid_fetch_timestamp():
+    with pytest.raises(ValueError, match="fetched_at"):
+        registry_entry_from_gamma(gamma_record(), fetched_at="yesterday")
+
+
+def test_registry_entry_requires_hex_sha256():
+    entry = registry_entry_from_gamma(gamma_record(), fetched_at="2026-09-18T10:00:00+00:00")
+    from dataclasses import replace
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        replace(entry, raw_sha256="z" * 64)
+
+
 def test_registry_serializes_without_raw_payload_or_credentials():
     entry = registry_entry_from_gamma(gamma_record(), fetched_at="2026-09-18T10:00:00+00:00")
     payload = entry.as_dict()
