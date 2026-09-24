@@ -38,8 +38,6 @@ class LadderBucket:
             raise ValueError("ladder buckets must be exact outcomes")
         if not ZERO <= self.model_probability <= ONE:
             raise ValueError("ladder probability must be in [0, 1]")
-        if not self.yes_asks:
-            raise ValueError("ladder YES ask depth is required")
         if self.minimum_size <= ZERO or self.fee_rate < ZERO:
             raise ValueError("ladder size and fee rate must be nonnegative/positive")
 
@@ -140,6 +138,8 @@ def evaluate_ladder(
     total_cost = ZERO
     try:
         for bucket in ordered:
+            if not bucket.yes_asks:
+                return _invalid(event_key, unit, width, "ladder depth unavailable: missing YES ask depth")
             execution = execution_vwap(bucket.yes_asks, shares)
             fee = execution_fee(bucket.yes_asks, shares, bucket.fee_rate)
             cost = execution.notional + fee

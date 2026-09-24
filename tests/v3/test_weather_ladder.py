@@ -76,3 +76,17 @@ def test_ladder_rejects_gaps() -> None:
     assert result.tradeable is False
     assert result.executable is False
     assert "adjacent" in result.reason
+
+
+def test_ladder_missing_ask_depth_fails_closed() -> None:
+    missing = LadderBucket(
+        **{**bucket("b", 30, "0.30", "0.10").__dict__, "yes_asks": ()}
+    )
+    result = evaluate_ladder(
+        event_key="city:2026-09-10",
+        unit="C",
+        buckets=(bucket("a", 29, "0.30", "0.10"), missing, bucket("c", 31, "0.30", "0.10")),
+    )
+    assert result.tradeable is False
+    assert result.executable is False
+    assert "missing YES ask depth" in result.reason
