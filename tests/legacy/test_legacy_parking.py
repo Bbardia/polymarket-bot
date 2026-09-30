@@ -1,5 +1,5 @@
 import pytest
-from src.polymarket_client import PolymarketClient
+from legacy.polymarket_client import PolymarketClient
 
 
 def test_legacy_v1_path_never_constructs_client_or_reads_account():

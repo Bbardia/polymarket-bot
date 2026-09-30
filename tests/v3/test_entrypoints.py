@@ -12,7 +12,7 @@ PYTHON = sys.executable
 
 def test_legacy_live_entrypoint_is_permanently_disabled():
     result = subprocess.run(
-        [str(PYTHON), "run_full_loop.py", "--live"],
+        [str(PYTHON), "legacy/run_full_loop.py", "--live"],
         cwd=ROOT,
         text=True,
         capture_output=True,
@@ -138,8 +138,8 @@ def test_v3_cli_reports_shadow_and_replay_files_without_network(tmp_path):
 
 
 def test_all_legacy_side_effect_boundaries_are_hard_disabled():
-    import run_full_loop
-    from src.polymarket_client import PolymarketClient
+    import legacy.run_full_loop as run_full_loop
+    from legacy.polymarket_client import PolymarketClient
 
     class EmptyPortfolio:
         positions = {}

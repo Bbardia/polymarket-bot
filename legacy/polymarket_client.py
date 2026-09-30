@@ -6,7 +6,7 @@ from typing import Optional
 import requests
 from loguru import logger
 
-from src.config import Config
+from legacy.config import Config
 
 # Legacy V1 SDK removed. Discovery and historical parsing remain available.
 

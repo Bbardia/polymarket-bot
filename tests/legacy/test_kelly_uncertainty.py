@@ -1,6 +1,6 @@
 import pytest
 
-from src.kelly import KellySizer
+from legacy.kelly import KellySizer
 
 
 def test_kelly_sizer_uses_uncertainty_adjusted_probability_when_n_eff_given():

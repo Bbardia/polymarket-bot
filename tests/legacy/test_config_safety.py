@@ -1,6 +1,6 @@
 import pytest
 
-from src.config import Config
+from legacy.config import Config
 
 
 def test_live_trading_refuses_template_placeholders(monkeypatch):
@@ -47,7 +47,7 @@ def test_live_trading_allowed_when_all_guards_configured(monkeypatch):
 
 
 def test_dry_run_housekeeping_returns_before_private_side_effects(monkeypatch):
-    import run_full_loop
+    import legacy.run_full_loop as run_full_loop
 
     class DummyPosition:
         market_type = "FORECAST"
