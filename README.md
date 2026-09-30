@@ -139,6 +139,13 @@ treating correlated members as independent by using the cluster design effect:
 n_eff = n / (1 + (n - 1) × rho)
 ```
 
+Each model's daily-high distribution is normal with a lead-dependent predictive
+floor on its standard deviation (`forecast_sigma_floor_c`): `1.6 + 0.4 × lead`
+°C for single-value providers (NWS, MET Norway, JMA, 7Timer), which carry no
+spread of their own, and `1.0 + 0.25 × lead` °C for raw ensembles, which are
+under-dispersive at station scale. These are conservative priors until
+per-station calibration replaces them.
+
 The decision threshold is the maximum of the base edge, probability standard
 error, half-spread, lead-time penalty, and tail penalty. Fractional Kelly is
 recorded as diagnostic telemetry; paper entries deliberately use the CLOB
