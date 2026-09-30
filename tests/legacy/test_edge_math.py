@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from src.edge_math import (
+from legacy.edge_math import (
     conservative_probability,
     dynamic_min_edge,
     executable_buy_price,

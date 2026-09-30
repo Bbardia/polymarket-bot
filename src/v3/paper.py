@@ -39,6 +39,8 @@ from .paper_weather import (
     OpenMeteoEnsemble,
     ObservationProvider,
     OffsetWeatherPublicClient,
+    CALIBRATION_FILENAME,
+    FORECAST_MODEL_VERSION,
     ProbabilityCalibration,
     ResilientForecastEnsemble,
     SevenTimerForecast,
@@ -732,7 +734,7 @@ class PaperWorker:
         self.store.flush_pending_audits(self.state)
         self.forecast = forecast
         if self.forecast is None and settings.weather_policy.enabled:
-            calibrator = ProbabilityCalibration(store.data_dir / "weather_calibration.json")
+            calibrator = ProbabilityCalibration(store.data_dir / CALIBRATION_FILENAME)
             self.forecast = ResilientForecastEnsemble(
                 (
                     OpenMeteoEnsemble(
@@ -1177,6 +1179,7 @@ class PaperWorker:
         forecast = evaluation.forecast
         return {
             "scanned_at": scanned_at,
+            "forecast_model_version": FORECAST_MODEL_VERSION,
             "strategy": evaluation.strategy,
             "event_key": evaluation.event_key,
             "market_id": evaluation.market_id,
@@ -1884,30 +1887,15 @@ class PaperWorker:
                         yes_price if side == "YES" else no_price
                     ))
                     outcome = int(winning_price == ONE)
-                    calibration_outcome = int(Decimal(str(yes_price)) == ONE)
                     payout = shares if outcome else ZERO
                     probability = Decimal(str(position["model_probability"]))
                     brier = (probability - Decimal(outcome)) ** 2
                     self.state.weather_resolved += 1
                     self.state.weather_brier_sum += brier
-                    record_outcome = getattr(self.forecast, "record_outcome", None)
-                    if callable(record_outcome):
-                        provider_probabilities = tuple(
-                            (
-                                str(source),
-                                Decimal(str(probability)),
-                            )
-                            for source, probability in dict(
-                                position.get("provider_probabilities", {})
-                            ).items()
-                        )
-                        if provider_probabilities:
-                            record_outcome(
-                                city=str(position.get("city", "")),
-                                lead_days=int(position.get("lead_days", 0)),
-                                outcome=calibration_outcome,
-                                provider_probabilities=provider_probabilities,
-                            )
+                    # Calibration is rebuilt offline from every scanned market
+                    # (scripts/rebuild_weather_calibration.py); recording only
+                    # traded outcomes here would re-introduce selection bias
+                    # and double count markets already in the rebuild.
                 else:
                     payout = shares
                 pnl = payout - all_in_cost

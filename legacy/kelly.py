@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Optional
 from loguru import logger
 
-from src.edge_math import conservative_probability
+from legacy.edge_math import conservative_probability
 
 
 @dataclass

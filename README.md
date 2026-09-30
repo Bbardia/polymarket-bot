@@ -1,8 +1,14 @@
-# Polymarket Trading Bot — V6 Hybrid Paper
+# Polymarket Weather Bot — V7 Paper Worker
 
-Paper-first Polymarket research and trading infrastructure for a small,
-risk-capped account. The April-era execution loop is retained only for offline
-research compatibility; its live path is permanently disabled.
+Paper-first Polymarket weather research and simulated-trading infrastructure
+for a small, risk-capped account. The current entrypoint is the V7 paper worker
+(`run_v3.py paper-run`, code in `src/v3/`). Since the 2026-09 remediation, new
+paper entries are frozen by default; existing positions are still managed. See
+[docs/remediation-status.md](docs/remediation-status.md) for the current state.
+
+The April-era execution loop now lives in `legacy/` (`legacy/run_full_loop.py`
+and its supporting modules). It is retained only for offline research
+compatibility; its live path is permanently disabled.
 
 > Experimental software, not financial advice. No strategy is enabled for live
 > trading in this foundation.
@@ -50,11 +56,24 @@ research compatibility; its live path is permanently disabled.
   positions. The main profile keeps a 5 pUSD realized-loss breaker, a 10%
   entry-cost drawdown breaker, five-position cap, and two-provider entry gate.
   Promotion is a paper-policy decision, not proof of statistical superiority.
-- Legacy `run_full_loop.py --live` exits before constructing a client.
+- Legacy `legacy/run_full_loop.py --live` exits before constructing a client.
 - Repository watchdog is status-only and cannot launch the bot.
 - No Polymarket Hermes/Claude cron is required or configured.
 - Manual positions can be marked observe-only through the ignored local `.env`;
   reconciliation never sells, cancels, merges, or redeems them.
+
+## Repository layout
+
+```text
+src/v3/        Current paper worker, math, risk, ledger, weather research
+run_v3.py      CLI entrypoint (validate-config, paper-run, paper-status, reports)
+scripts/       Status, reporting, reconciliation and research helpers
+config/        Gate registry and other static configuration
+legacy/        April-era loop (run_full_loop.py) and its modules; live disabled
+tests/         Test suite (tests/v3 for current code, tests/legacy for old loop)
+docs/          Remediation status and historical notes
+.github/       CI workflow (compile check + pytest)
+```
 
 ## V3 architecture
 
@@ -119,6 +138,13 @@ treating correlated members as independent by using the cluster design effect:
 ```text
 n_eff = n / (1 + (n - 1) × rho)
 ```
+
+Each model's daily-high distribution is normal with a lead-dependent predictive
+floor on its standard deviation (`forecast_sigma_floor_c`): `1.6 + 0.4 × lead`
+°C for single-value providers (NWS, MET Norway, JMA, 7Timer), which carry no
+spread of their own, and `1.0 + 0.25 × lead` °C for raw ensembles, which are
+under-dispersive at station scale. These are conservative priors until
+per-station calibration replaces them.
 
 The decision threshold is the maximum of the base edge, probability standard
 error, half-spread, lead-time penalty, and tail penalty. Fractional Kelly is
@@ -208,11 +234,42 @@ of it, including earlier simulated quotes at the same level:
 Runtime JSONL files belong under ignored local state such as `data/`; do not
 commit account-derived events or candidate records.
 
+### Rebuilding weather calibration from all scans
+
+Forecast calibration is built offline from every evaluated market in
+`weather_scans.jsonl`, not from settled traded positions (which are
+selection-biased). The rebuild fetches resolutions from the public Gamma API,
+caches them in `scan_outcomes.json`, and writes
+`weather_calibration.<model-version>.json`:
+
+```bash
+python scripts/rebuild_weather_calibration.py --data-dir data/v6-main-paper --dry-run
+python scripts/rebuild_weather_calibration.py --data-dir data/v6-main-paper
+```
+
+- The rebuild is the only writer; the paper worker re-reads the file when it
+  changes, so run it periodically (e.g. daily from cron) without restarting.
+- Only scan rows tagged with the current `FORECAST_MODEL_VERSION` are used, and
+  the file name carries that version, so probabilities from an older forecast
+  model never calibrate newer ones.
+- Failed Gamma batches are retried one market at a time. If more than 5% of
+  markets still fail, the calibration file is left untouched and the command
+  exits 1. Markets Gamma still reports unresolved 14 days after first being seen that
+  way are given up on; fetch failures never count toward this
+  (`scan_outcome_attempts.json`).
+- Each bin stores the sum of forecast probabilities. The shrunk reliability
+  offset is measured at the bin's average forecast and applied as a log-odds
+  shift. City bins are shrunk toward a pooled `source:*:lead:bucket` offset that
+  excludes that city's own data.
+- Until the first rebuild for the current model version, no calibration is
+  applied (raw provider probabilities are used). A missing or unreadable file
+  also means no calibration.
+
 ## Tests
 
 ```bash
 python -m pytest tests -q
-python -m py_compile src/v3/*.py src/v3/strategies/*.py run_v3.py
+python -m compileall -q src scripts legacy run_v3.py
 ```
 
 V3 tests cover fee curves, depth-aware VWAP, complete-set net edge, correlated

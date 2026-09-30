@@ -445,13 +445,56 @@ class EnsembleForecast:
     provider_weights: tuple[tuple[str, Decimal], ...] = ()
 
 
-class ProbabilityCalibration:
-    """Small, persistent, shrinkage calibrator for resolved paper forecasts.
+POOLED_CITY = "*"
+# Bump whenever the raw-probability model changes scale (e.g. sigma floors),
+# so calibration built from older probabilities is never applied to new ones.
+FORECAST_MODEL_VERSION = "sigma-v2"
+CALIBRATION_FILENAME = f"weather_calibration.{FORECAST_MODEL_VERSION}.json"
 
-    Calibration is deliberately conservative: until a source/city/horizon bucket
-    has 20 resolved outcomes, its empirical rate is blended only partially with
-    the raw model probability. This makes outages safe and prevents a handful of
-    paper outcomes from overfitting the next forecast.
+
+def write_json_atomic(payload: Any, path: Path) -> None:
+    """Durably replace ``path`` with JSON: unique tmp file, fsync, rename."""
+    import os
+    import tempfile
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+    )
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, sort_keys=True, indent=2) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+class ProbabilityCalibration:
+    """Persistent hierarchical reliability-offset calibrator.
+
+    Each ``source:city:lead:bucket`` bin stores outcomes and the sum of the
+    raw probabilities that produced them, so it measures the average
+    miscalibration ``successes - probability_sum`` of that bin. Pooled
+    ``source:*:lead:bucket`` bins aggregate all cities.
+
+    * the pooled offset excludes the target city's own data (no double
+      counting) and is shrunk toward zero with prior strength ``min_samples``;
+    * the city offset is shrunk toward that pooled offset with the same
+      strength, so sparse cities borrow strength instead of adding noise;
+    * the offset is anchored at the bin's average forecast (where it was
+      measured) and applied to the forecast as a log-odds shift, so the curve
+      stays smooth and monotone rather than a per-bucket step function.
+
+    The file on disk is the source of truth: it is re-read when it changes,
+    and a missing or unreadable file means no calibration.
     """
 
     def __init__(self, path: Path | None = None, *, min_samples: int = 20) -> None:
@@ -459,22 +502,74 @@ class ProbabilityCalibration:
             raise ValueError("calibration minimum samples must be positive")
         self.path = path
         self.min_samples = min_samples
-        self._bins: dict[str, dict[str, int]] = {}
-        if path is not None and path.is_file():
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                payload = {}
-            if isinstance(payload, dict):
-                for key, value in payload.items():
-                    if isinstance(value, dict):
-                        try:
-                            self._bins[str(key)] = {
-                                "successes": int(value.get("successes", 0)),
-                                "total": int(value.get("total", 0)),
-                            }
-                        except (TypeError, ValueError):
-                            continue
+        self._bins: dict[str, dict[str, Any]] = {}
+        self._samples = 0
+        self._loaded_state: object = None
+        self.load_error: str | None = None
+        self._reload_if_changed()
+
+    @staticmethod
+    def _parse_bin(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        try:
+            total = int(value["total"])
+            successes = int(value["successes"])
+            probability_sum = Decimal(str(value["probability_sum"]))
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            return None
+        if total <= 0 or not 0 <= successes <= total:
+            return None
+        if not probability_sum.is_finite() or not ZERO <= probability_sum <= total:
+            return None
+        return {"successes": successes, "total": total, "probability_sum": probability_sum}
+
+    def _set_bins(self, bins: dict[str, dict[str, Any]]) -> None:
+        self._bins = bins
+        self._samples = sum(
+            item["total"] for key, item in bins.items() if not self._is_pooled_key(key)
+        )
+
+    def _reload_if_changed(self) -> None:
+        if self.path is None:
+            return
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            state: object = "missing"
+            if state != self._loaded_state:
+                self._set_bins({})
+                self.load_error = None
+                self._loaded_state = state
+            return
+        except OSError as exc:
+            self.load_error = f"{type(exc).__name__}: {exc}"
+            return
+        state = (stat.st_mtime_ns, stat.st_size)
+        if state == self._loaded_state:
+            return
+        # Record the state first so an unreadable file is parsed once, not
+        # on every forecast; it fails closed to no calibration.
+        self._loaded_state = state
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("calibration file is not a JSON object")
+        except (OSError, ValueError) as exc:
+            self._set_bins({})
+            self.load_error = f"{type(exc).__name__}: {exc}"
+            return
+        bins: dict[str, dict[str, Any]] = {}
+        for key, value in payload.items():
+            parsed = self._parse_bin(value)
+            if parsed is not None:
+                bins[str(key)] = parsed
+        self._set_bins(bins)
+        self.load_error = None
+
+    @staticmethod
+    def _is_pooled_key(key: str) -> bool:
+        return key.split(":")[1:2] == [POOLED_CITY]
 
     @staticmethod
     def _bucket(probability: Decimal) -> int:
@@ -482,6 +577,16 @@ class ProbabilityCalibration:
 
     def _key(self, source: str, city: str, lead_days: int, probability: Decimal) -> str:
         return f"{source}:{city}:{lead_days}:{self._bucket(probability)}"
+
+    def _pooled_key(self, source: str, lead_days: int, probability: Decimal) -> str:
+        return self._key(source, POOLED_CITY, lead_days, probability)
+
+    @staticmethod
+    def _stats(bucket: dict[str, Any] | None) -> tuple[Decimal, Decimal, int]:
+        """(successes, probability_sum, total) of a bin, zeros when absent."""
+        if not bucket:
+            return ZERO, ZERO, 0
+        return Decimal(bucket["successes"]), bucket["probability_sum"], bucket["total"]
 
     def calibrate(
         self,
@@ -492,13 +597,44 @@ class ProbabilityCalibration:
     ) -> Decimal:
         if not ZERO <= probability <= ONE:
             raise ValueError("forecast probability must be in [0, 1]")
-        bucket = self._bins.get(self._key(source, city, lead_days, probability))
-        if not bucket or bucket["total"] <= 0:
+        self._reload_if_changed()
+        strength = Decimal(self.min_samples)
+        local_s, local_p, local_n = self._stats(
+            self._bins.get(self._key(source, city, lead_days, probability)),
+        )
+        other_s = other_p = ZERO
+        other_n = 0
+        if city != POOLED_CITY:
+            pooled_s, pooled_p, pooled_n = self._stats(
+                self._bins.get(self._pooled_key(source, lead_days, probability)),
+            )
+            if pooled_n > local_n:
+                other_s, other_p, other_n = (
+                    pooled_s - local_s, pooled_p - local_p, pooled_n - local_n,
+                )
+        if local_n + other_n == 0:
             return probability
-        total = bucket["total"]
-        empirical = Decimal(bucket["successes"] + 1) / Decimal(total + 2)
-        blend = min(ONE, Decimal(total) / Decimal(self.min_samples))
-        return min(ONE, max(ZERO, probability * (ONE - blend) + empirical * blend))
+        pooled_offset = (other_s - other_p) / (other_n + strength) if other_n else ZERO
+        offset = (local_s - local_p + strength * pooled_offset) / (local_n + strength)
+        if offset == ZERO or probability in (ZERO, ONE):
+            return probability
+        # The offset was measured at the bin's average forecast; convert it to
+        # a log-odds shift there and apply that shift to this forecast.
+        anchor = float((local_p + other_p) / (local_n + other_n))
+        anchor = min(0.999, max(0.001, anchor))
+        corrected = min(0.999, max(0.001, anchor + float(offset)))
+        shift = math.log(corrected / (1 - corrected)) - math.log(anchor / (1 - anchor))
+        raw = float(probability)
+        logit = math.log(raw / (1 - raw)) + shift
+        return Decimal(str(1 / (1 + math.exp(-logit))))
+
+    def _increment(self, key: str, probability: Decimal, outcome: int) -> None:
+        bucket = self._bins.setdefault(
+            key, {"successes": 0, "total": 0, "probability_sum": ZERO},
+        )
+        bucket["successes"] += outcome
+        bucket["total"] += 1
+        bucket["probability_sum"] += probability
 
     def record(
         self,
@@ -508,23 +644,36 @@ class ProbabilityCalibration:
         probability: Decimal,
         outcome: int,
     ) -> None:
+        """Add one resolved observation; persists when a path is configured.
+
+        The paper worker never calls this: the offline rebuild builds an
+        in-memory calibrator and writes the file once.
+        """
         if outcome not in {0, 1} or not ZERO <= probability <= ONE:
             raise ValueError("invalid calibration observation")
-        key = self._key(source, city, lead_days, probability)
-        bucket = self._bins.setdefault(key, {"successes": 0, "total": 0})
-        bucket["successes"] += outcome
-        bucket["total"] += 1
+        self._reload_if_changed()
+        self._increment(self._key(source, city, lead_days, probability), probability, outcome)
+        if city != POOLED_CITY:
+            self._increment(self._pooled_key(source, lead_days, probability), probability, outcome)
+            self._samples += 1
         if self.path is not None:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-            temporary.write_text(
-                json.dumps(self._bins, sort_keys=True, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            temporary.replace(self.path)
+            write_json_atomic(self.to_json(), self.path)
+            stat = self.path.stat()
+            self._loaded_state = (stat.st_mtime_ns, stat.st_size)
+
+    def to_json(self) -> dict[str, dict[str, Any]]:
+        return {
+            key: {
+                "successes": item["successes"],
+                "total": item["total"],
+                "probability_sum": str(item["probability_sum"]),
+            }
+            for key, item in self._bins.items()
+        }
 
     def samples(self) -> int:
-        return sum(item["total"] for item in self._bins.values())
+        self._reload_if_changed()
+        return self._samples
 
 
 @dataclass(frozen=True)
@@ -1212,12 +1361,35 @@ def _resolution_station_matches(
     return _verified_resolution_station(contract, source) is not None
 
 
+# Predictive-error floors for station daily-maximum temperature, in degrees C.
+# A single deterministic value carries no spread of its own; published
+# day-1 daily-max errors at airport stations are roughly 1.5-2 C RMSE and
+# grow with lead. Raw ensembles are also under-dispersive at station scale
+# (grid vs. point, no station bias correction), so they get a smaller floor.
+# These are conservative priors until per-station calibration replaces them.
+DETERMINISTIC_SIGMA_BASE_C = 1.6
+DETERMINISTIC_SIGMA_PER_LEAD_DAY_C = 0.4
+ENSEMBLE_SIGMA_FLOOR_BASE_C = 1.0
+ENSEMBLE_SIGMA_FLOOR_PER_LEAD_DAY_C = 0.25
+
+
+def forecast_sigma_floor_c(lead_days: int, *, deterministic: bool) -> float:
+    """Minimum predictive standard deviation for one model's daily maximum."""
+    lead = max(0, lead_days)
+    if deterministic:
+        return DETERMINISTIC_SIGMA_BASE_C + DETERMINISTIC_SIGMA_PER_LEAD_DAY_C * lead
+    return ENSEMBLE_SIGMA_FLOOR_BASE_C + ENSEMBLE_SIGMA_FLOOR_PER_LEAD_DAY_C * lead
+
+
 def _ensemble_probability(
     contract: HighTemperatureContract,
     model_members: tuple[tuple[float, ...], ...],
     lead_days: int,
+    *,
+    deterministic: bool = False,
 ) -> EnsembleForecast:
     inflation = 1.05 + 0.15 * max(0, lead_days)
+    sigma_floor = forecast_sigma_floor_c(lead_days, deterministic=deterministic)
     lower_c = (
         float(contract.probability_lower_c)
         if contract.probability_lower_c is not None
@@ -1234,7 +1406,7 @@ def _ensemble_probability(
     for members in model_members:
         model_mean = statistics.mean(members)
         model_std = statistics.stdev(members) if len(members) >= 2 else 0.0
-        sigma = max(model_std * inflation, 0.5)
+        sigma = max(model_std * inflation, sigma_floor)
         distribution = NormalDist(mu=model_mean, sigma=sigma)
         if lower_c is None:
             assert upper_c is not None
@@ -1245,7 +1417,8 @@ def _ensemble_probability(
             probability = distribution.cdf(upper_c) - distribution.cdf(lower_c)
         model_probabilities.append(probability)
         model_means.append(model_mean)
-        model_variances.append(model_std ** 2)
+        # Report the predictive spread actually used for the probability.
+        model_variances.append(sigma ** 2)
     distribution_probability = statistics.mean(model_probabilities)
     directional_probability = min(
         0.999,
@@ -1949,6 +2122,7 @@ def _deterministic_forecast(
         contract,
         ((maximum_c,),),
         lead_days,
+        deterministic=True,
     )
     return replace(
         result,
@@ -2106,17 +2280,6 @@ class ResilientForecastEnsemble:
                 for name, _result, _probability, weight in values
             ),
         )
-
-    def record_outcome(
-        self,
-        *,
-        city: str,
-        lead_days: int,
-        outcome: int,
-        provider_probabilities: Sequence[tuple[str, Decimal]],
-    ) -> None:
-        for source, probability in provider_probabilities:
-            self.calibrator.record(source, city, lead_days, probability, outcome)
 
 
 def _best_price(levels: Any, *, ask: bool) -> Decimal | None:

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from loguru import logger
 
-from src.edge_math import (
+from legacy.edge_math import (
     dynamic_min_edge,
     effective_ensemble_size,
     probability_standard_error,
@@ -125,7 +125,7 @@ class ForecastScanner:
         Returns:
             List of ForecastSignal with positive edge, sorted by edge descending.
         """
-        from src.weather_forecast import parse_market_title
+        from legacy.weather_forecast import parse_market_title
 
         if existing_tokens is None:
             existing_tokens = set()
