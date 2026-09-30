@@ -208,6 +208,21 @@ of it, including earlier simulated quotes at the same level:
 Runtime JSONL files belong under ignored local state such as `data/`; do not
 commit account-derived events or candidate records.
 
+### Rebuilding weather calibration from all scans
+
+`weather_calibration.json` is otherwise updated only from settled *traded*
+positions, which is selection-biased. To rebuild it from every evaluated market
+in `weather_scans.jsonl` (resolutions fetched from the public Gamma API, cached
+in `scan_outcomes.json`):
+
+```bash
+python scripts/rebuild_weather_calibration.py --data-dir data/v6-main-paper --dry-run
+python scripts/rebuild_weather_calibration.py --data-dir data/v6-main-paper
+```
+
+The rebuild replaces the traded-only records; run it periodically. Bins include
+pooled `source:*:lead:bucket` keys used as a fallback for sparse city bins.
+
 ## Tests
 
 ```bash

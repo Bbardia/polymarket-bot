@@ -445,6 +445,9 @@ class EnsembleForecast:
     provider_weights: tuple[tuple[str, Decimal], ...] = ()
 
 
+POOLED_CITY = "*"
+
+
 class ProbabilityCalibration:
     """Small, persistent, shrinkage calibrator for resolved paper forecasts.
 
@@ -483,6 +486,16 @@ class ProbabilityCalibration:
     def _key(self, source: str, city: str, lead_days: int, probability: Decimal) -> str:
         return f"{source}:{city}:{lead_days}:{self._bucket(probability)}"
 
+    def _pooled_key(self, source: str, lead_days: int, probability: Decimal) -> str:
+        return self._key(source, POOLED_CITY, lead_days, probability)
+
+    @staticmethod
+    def _smoothed(bucket: dict[str, int] | None) -> tuple[Decimal, int] | None:
+        if not bucket or bucket["total"] <= 0:
+            return None
+        total = bucket["total"]
+        return Decimal(bucket["successes"] + 1) / Decimal(total + 2), total
+
     def calibrate(
         self,
         source: str,
@@ -492,13 +505,23 @@ class ProbabilityCalibration:
     ) -> Decimal:
         if not ZERO <= probability <= ONE:
             raise ValueError("forecast probability must be in [0, 1]")
-        bucket = self._bins.get(self._key(source, city, lead_days, probability))
-        if not bucket or bucket["total"] <= 0:
-            return probability
-        total = bucket["total"]
-        empirical = Decimal(bucket["successes"] + 1) / Decimal(total + 2)
+        base = probability
+        # Pooled (city-wildcard) evidence first: it is denser, so it becomes the
+        # base that sparse city-specific evidence is layered on top of.
+        if city != POOLED_CITY:
+            pooled = self._smoothed(
+                self._bins.get(self._pooled_key(source, lead_days, probability))
+            )
+            if pooled is not None:
+                rate, total = pooled
+                weight = min(ONE, Decimal(total) / Decimal(self.min_samples))
+                base = probability * (ONE - weight) + rate * weight
+        local = self._smoothed(self._bins.get(self._key(source, city, lead_days, probability)))
+        if local is None:
+            return min(ONE, max(ZERO, base))
+        rate, total = local
         blend = min(ONE, Decimal(total) / Decimal(self.min_samples))
-        return min(ONE, max(ZERO, probability * (ONE - blend) + empirical * blend))
+        return min(ONE, max(ZERO, base * (ONE - blend) + rate * blend))
 
     def record(
         self,
@@ -510,10 +533,13 @@ class ProbabilityCalibration:
     ) -> None:
         if outcome not in {0, 1} or not ZERO <= probability <= ONE:
             raise ValueError("invalid calibration observation")
-        key = self._key(source, city, lead_days, probability)
-        bucket = self._bins.setdefault(key, {"successes": 0, "total": 0})
-        bucket["successes"] += outcome
-        bucket["total"] += 1
+        keys = [self._key(source, city, lead_days, probability)]
+        if city != POOLED_CITY:
+            keys.append(self._pooled_key(source, lead_days, probability))
+        for key in keys:
+            bucket = self._bins.setdefault(key, {"successes": 0, "total": 0})
+            bucket["successes"] += outcome
+            bucket["total"] += 1
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.path.with_suffix(self.path.suffix + ".tmp")
@@ -524,7 +550,12 @@ class ProbabilityCalibration:
             temporary.replace(self.path)
 
     def samples(self) -> int:
-        return sum(item["total"] for item in self._bins.values())
+        # Pooled keys duplicate city-specific observations; count each once.
+        return sum(
+            item["total"]
+            for key, item in self._bins.items()
+            if key.split(":")[1:2] != [POOLED_CITY]
+        )
 
 
 @dataclass(frozen=True)
