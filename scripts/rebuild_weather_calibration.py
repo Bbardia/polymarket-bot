@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""Rebuild weather_calibration.json from the FULL scan universe.
+"""Rebuild the weather calibration from the FULL scan universe.
 
-Reads ``<data_dir>/weather_scans.jsonl`` (every evaluated market, not just
-traded ones), fetches resolutions of past-dated markets from the public Gamma
-API, caches them in ``<data_dir>/scan_outcomes.json`` and atomically rewrites
-``<data_dir>/weather_calibration.json``.
+Streams ``<data_dir>/weather_scans.jsonl`` (every evaluated market, not just
+traded ones), keeps rows produced by the current forecast model version,
+fetches resolutions of past-dated markets from the public Gamma API, caches
+them in ``<data_dir>/scan_outcomes.json`` and atomically rewrites
+``<data_dir>/weather_calibration.<model-version>.json``.
 
-NOTE: this rebuild REPLACES the traded-only records written at settlement time
-by ``ProbabilityCalibration.record``. Running it periodically removes the
-selection bias (only strongly-disagreeing, traded cases) of those records.
+This rebuild is the only writer of the calibration file. The paper worker
+re-reads it when it changes, so no restart is needed. Run it periodically
+(e.g. daily from cron).
+
+If any Gamma batch fails, the outcome cache is still saved but the
+calibration file is left untouched and the exit code is 1, so a partial
+fetch never replaces a fuller calibration.
 
 Usage:
     python scripts/rebuild_weather_calibration.py [--data-dir DIR] [--dry-run]
@@ -27,12 +32,13 @@ from typing import Any, Callable, Sequence
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from src.v3.paper_weather import CALIBRATION_FILENAME, write_json_atomic  # noqa: E402
 from src.v3.scan_calibration import (  # noqa: E402
-    build_bins,
+    build_calibration,
     dedupe_observations,
-    load_scan_rows,
+    iter_scan_rows,
     parse_gamma_outcome,
-    write_json_atomic,
+    past_condition_ids,
 )
 
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
@@ -52,20 +58,6 @@ def gamma_fetcher(condition_ids: Sequence[str]) -> list:
     return data if isinstance(data, list) else []
 
 
-def _past_condition_ids(rows: Sequence[dict[str, Any]], today: date) -> list[str]:
-    found: set[str] = set()
-    for row in rows:
-        cid, target = row.get("condition_id"), row.get("target_date")
-        if not cid or not target or not isinstance(row.get("provider_probabilities"), dict):
-            continue
-        try:
-            if date.fromisoformat(str(target)[:10]) < today:
-                found.add(str(cid))
-        except ValueError:
-            continue
-    return sorted(found)
-
-
 def _load_cache(path: Path) -> dict[str, int]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -83,41 +75,55 @@ def run(
     fetcher: Fetcher = gamma_fetcher,
     today: date | None = None,
     batch_size: int = BATCH_SIZE,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     today = today or datetime.now(timezone.utc).date()
-    rows = load_scan_rows(data_dir / "weather_scans.jsonl")
-    observations = dedupe_observations(rows)
+    counter = {"rows": 0}
+
+    def counted_rows():
+        for row in iter_scan_rows(data_dir / "weather_scans.jsonl"):
+            counter["rows"] += 1
+            yield row
+
+    observations = dedupe_observations(counted_rows())
     cache_path = data_dir / "scan_outcomes.json"
     outcomes = _load_cache(cache_path)
-    todo = [c for c in _past_condition_ids(rows, today) if c not in outcomes]
+    todo = [c for c in past_condition_ids(observations, today) if c not in outcomes]
+    failed_batches = 0
     for start in range(0, len(todo), batch_size):
         batch = todo[start:start + batch_size]
         try:
             markets = fetcher(batch)
-        except Exception as exc:  # network failure: keep what we already have
-            print(f"warning: fetch failed for batch at {start}: {type(exc).__name__}: {exc}",
+        except Exception as exc:
+            failed_batches += 1
+            print(f"error: fetch failed for batch at {start}: {type(exc).__name__}: {exc}",
                   file=sys.stderr)
             continue
+        wanted = set(batch)
         for market in markets:
             if not isinstance(market, dict):
                 continue
             cid = str(market.get("conditionId") or "")
-            if cid in batch:
+            if cid in wanted:
                 outcome = parse_gamma_outcome(market)
                 if outcome is not None:
                     outcomes[cid] = outcome
-    bins = build_bins(observations, outcomes)
-    stats = {
-        "rows_read": len(rows),
+    calibration = build_calibration(observations, outcomes)
+    bins = calibration.to_json()
+    stats: dict[str, Any] = {
+        "rows_read": counter["rows"],
         "observations_total": len(observations),
         "observations_used": sum(1 for o in observations if o.condition_id in outcomes),
         "resolved_markets": len(outcomes),
         "bins": len(bins),
+        "failed_batches": failed_batches,
+        "calibration_written": False,
     }
     if not dry_run:
         write_json_atomic(outcomes, cache_path)
-        if bins:  # never clobber an existing calibration with an empty one
-            write_json_atomic(bins, data_dir / "weather_calibration.json")
+        # Never replace a calibration with an empty or partially fetched one.
+        if bins and not failed_batches:
+            write_json_atomic(bins, data_dir / CALIBRATION_FILENAME)
+            stats["calibration_written"] = True
     return stats
 
 
@@ -137,8 +143,13 @@ def main(argv: Sequence[str] | None = None, *, fetcher: Fetcher = gamma_fetcher,
     print(f"bins:               {stats['bins']}")
     if args.dry_run:
         print("dry run: nothing written")
-    elif stats["bins"] == 0:
-        print("no bins produced: existing weather_calibration.json left untouched")
+    elif stats["failed_batches"]:
+        print(f"{stats['failed_batches']} fetch batch(es) failed: calibration left untouched")
+        return 1
+    elif not stats["calibration_written"]:
+        print(f"no bins produced: existing {CALIBRATION_FILENAME} left untouched")
+    else:
+        print(f"wrote {CALIBRATION_FILENAME}")
     return 0
 
 

@@ -446,15 +446,54 @@ class EnsembleForecast:
 
 
 POOLED_CITY = "*"
+# Bump whenever the raw-probability model changes scale (e.g. sigma floors),
+# so calibration built from older probabilities is never applied to new ones.
+FORECAST_MODEL_VERSION = "sigma-v2"
+CALIBRATION_FILENAME = f"weather_calibration.{FORECAST_MODEL_VERSION}.json"
+
+
+def write_json_atomic(payload: Any, path: Path) -> None:
+    """Durably replace ``path`` with JSON: unique tmp file, fsync, rename."""
+    import os
+    import tempfile
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+    )
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, sort_keys=True, indent=2) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 class ProbabilityCalibration:
-    """Small, persistent, shrinkage calibrator for resolved paper forecasts.
+    """Persistent hierarchical reliability-offset calibrator.
 
-    Calibration is deliberately conservative: until a source/city/horizon bucket
-    has 20 resolved outcomes, its empirical rate is blended only partially with
-    the raw model probability. This makes outages safe and prevents a handful of
-    paper outcomes from overfitting the next forecast.
+    Each ``source:city:lead:bucket`` bin stores outcomes and the sum of the
+    raw probabilities that produced them, so it measures the average
+    miscalibration ``successes - probability_sum`` of that bin. Pooled
+    ``source:*:lead:bucket`` bins aggregate all cities. A forecast is shifted
+    in log-odds by a shrunk offset rather than replaced by a bin rate, which
+    keeps within-bucket resolution (no step function):
+
+    * pooled offset excludes the target city's own data (no double counting)
+      and is shrunk toward zero with prior strength ``min_samples``;
+    * the city offset is shrunk toward that pooled offset with the same
+      strength, so sparse cities borrow strength instead of adding noise.
+
+    The file is re-read whenever it changes on disk, so an offline rebuild
+    reaches a running worker without a restart.
     """
 
     def __init__(self, path: Path | None = None, *, min_samples: int = 20) -> None:
@@ -462,22 +501,58 @@ class ProbabilityCalibration:
             raise ValueError("calibration minimum samples must be positive")
         self.path = path
         self.min_samples = min_samples
-        self._bins: dict[str, dict[str, int]] = {}
-        if path is not None and path.is_file():
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                payload = {}
-            if isinstance(payload, dict):
-                for key, value in payload.items():
-                    if isinstance(value, dict):
-                        try:
-                            self._bins[str(key)] = {
-                                "successes": int(value.get("successes", 0)),
-                                "total": int(value.get("total", 0)),
-                            }
-                        except (TypeError, ValueError):
-                            continue
+        self._bins: dict[str, dict[str, Any]] = {}
+        self._samples = 0
+        self._loaded_mtime: int | None = None
+        self._reload_if_changed()
+
+    @staticmethod
+    def _parse_bin(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        try:
+            total = int(value.get("total", 0))
+            successes = int(value.get("successes", 0))
+            raw_sum = value.get("probability_sum")
+            probability_sum = None if raw_sum is None else Decimal(str(raw_sum))
+        except (TypeError, ValueError, ArithmeticError):
+            return None
+        if total < 0 or not 0 <= successes <= total:
+            return None
+        if probability_sum is not None and (
+            not probability_sum.is_finite() or not ZERO <= probability_sum <= total
+        ):
+            return None
+        return {"successes": successes, "total": total, "probability_sum": probability_sum}
+
+    def _reload_if_changed(self) -> None:
+        if self.path is None:
+            return
+        try:
+            mtime = self.path.stat().st_mtime_ns
+        except OSError:
+            return
+        if mtime == self._loaded_mtime:
+            return
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        bins: dict[str, dict[str, Any]] = {}
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                parsed = self._parse_bin(value)
+                if parsed is not None:
+                    bins[str(key)] = parsed
+        self._bins = bins
+        self._samples = sum(
+            item["total"] for key, item in bins.items() if not self._is_pooled_key(key)
+        )
+        self._loaded_mtime = mtime
+
+    @staticmethod
+    def _is_pooled_key(key: str) -> bool:
+        return key.split(":")[1:2] == [POOLED_CITY]
 
     @staticmethod
     def _bucket(probability: Decimal) -> int:
@@ -490,11 +565,15 @@ class ProbabilityCalibration:
         return self._key(source, POOLED_CITY, lead_days, probability)
 
     @staticmethod
-    def _smoothed(bucket: dict[str, int] | None) -> tuple[Decimal, int] | None:
+    def _residual(bucket: dict[str, Any] | None, midpoint: Decimal) -> tuple[Decimal, int]:
+        """(sum of outcome - probability, count); legacy bins use the midpoint."""
         if not bucket or bucket["total"] <= 0:
-            return None
+            return ZERO, 0
         total = bucket["total"]
-        return Decimal(bucket["successes"] + 1) / Decimal(total + 2), total
+        probability_sum = bucket["probability_sum"]
+        if probability_sum is None:
+            probability_sum = midpoint * total
+        return Decimal(bucket["successes"]) - probability_sum, total
 
     def calibrate(
         self,
@@ -505,23 +584,43 @@ class ProbabilityCalibration:
     ) -> Decimal:
         if not ZERO <= probability <= ONE:
             raise ValueError("forecast probability must be in [0, 1]")
-        base = probability
-        # Pooled (city-wildcard) evidence first: it is denser, so it becomes the
-        # base that sparse city-specific evidence is layered on top of.
+        self._reload_if_changed()
+        strength = Decimal(self.min_samples)
+        midpoint = (Decimal(self._bucket(probability)) + Decimal("0.5")) / Decimal("10")
+        local_residual, local_total = self._residual(
+            self._bins.get(self._key(source, city, lead_days, probability)), midpoint,
+        )
+        pooled_offset = ZERO
         if city != POOLED_CITY:
-            pooled = self._smoothed(
-                self._bins.get(self._pooled_key(source, lead_days, probability))
+            pooled_residual, pooled_total = self._residual(
+                self._bins.get(self._pooled_key(source, lead_days, probability)), midpoint,
             )
-            if pooled is not None:
-                rate, total = pooled
-                weight = min(ONE, Decimal(total) / Decimal(self.min_samples))
-                base = probability * (ONE - weight) + rate * weight
-        local = self._smoothed(self._bins.get(self._key(source, city, lead_days, probability)))
-        if local is None:
-            return min(ONE, max(ZERO, base))
-        rate, total = local
-        blend = min(ONE, Decimal(total) / Decimal(self.min_samples))
-        return min(ONE, max(ZERO, base * (ONE - blend) + rate * blend))
+            other_total = max(0, pooled_total - local_total)
+            if other_total:
+                pooled_offset = (pooled_residual - local_residual) / (other_total + strength)
+        offset = (local_residual + strength * pooled_offset) / (local_total + strength)
+        if offset == ZERO or probability in (ZERO, ONE):
+            return probability
+        # The offset is measured around the bucket centre; apply it as a
+        # log-odds shift so the curve stays smooth and monotone and tail
+        # probabilities are scaled rather than pushed through 0 or 1.
+        centre = float(midpoint)
+        corrected = min(0.999, max(0.001, centre + float(offset)))
+        shift = math.log(corrected / (1 - corrected)) - math.log(centre / (1 - centre))
+        raw = float(probability)
+        logit = math.log(raw / (1 - raw)) + shift
+        return Decimal(str(1 / (1 + math.exp(-logit))))
+
+    def _increment(self, key: str, probability: Decimal, outcome: int) -> None:
+        bucket = self._bins.setdefault(
+            key, {"successes": 0, "total": 0, "probability_sum": ZERO},
+        )
+        if bucket["probability_sum"] is None:  # legacy bin: approximate history
+            midpoint = (Decimal(self._bucket(probability)) + Decimal("0.5")) / Decimal("10")
+            bucket["probability_sum"] = midpoint * bucket["total"]
+        bucket["successes"] += outcome
+        bucket["total"] += 1
+        bucket["probability_sum"] += probability
 
     def record(
         self,
@@ -533,29 +632,32 @@ class ProbabilityCalibration:
     ) -> None:
         if outcome not in {0, 1} or not ZERO <= probability <= ONE:
             raise ValueError("invalid calibration observation")
-        keys = [self._key(source, city, lead_days, probability)]
+        self._reload_if_changed()
+        self._increment(self._key(source, city, lead_days, probability), probability, outcome)
         if city != POOLED_CITY:
-            keys.append(self._pooled_key(source, lead_days, probability))
-        for key in keys:
-            bucket = self._bins.setdefault(key, {"successes": 0, "total": 0})
-            bucket["successes"] += outcome
-            bucket["total"] += 1
+            self._increment(self._pooled_key(source, lead_days, probability), probability, outcome)
+            self._samples += 1
         if self.path is not None:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-            temporary.write_text(
-                json.dumps(self._bins, sort_keys=True, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            temporary.replace(self.path)
+            write_json_atomic(self.to_json(), self.path)
+            self._loaded_mtime = self.path.stat().st_mtime_ns
+
+    def to_json(self) -> dict[str, dict[str, Any]]:
+        return {
+            key: {
+                "successes": item["successes"],
+                "total": item["total"],
+                **(
+                    {}
+                    if item["probability_sum"] is None
+                    else {"probability_sum": str(item["probability_sum"])}
+                ),
+            }
+            for key, item in self._bins.items()
+        }
 
     def samples(self) -> int:
-        # Pooled keys duplicate city-specific observations; count each once.
-        return sum(
-            item["total"]
-            for key, item in self._bins.items()
-            if key.split(":")[1:2] != [POOLED_CITY]
-        )
+        self._reload_if_changed()
+        return self._samples
 
 
 @dataclass(frozen=True)
@@ -2162,17 +2264,6 @@ class ResilientForecastEnsemble:
                 for name, _result, _probability, weight in values
             ),
         )
-
-    def record_outcome(
-        self,
-        *,
-        city: str,
-        lead_days: int,
-        outcome: int,
-        provider_probabilities: Sequence[tuple[str, Decimal]],
-    ) -> None:
-        for source, probability in provider_probabilities:
-            self.calibrator.record(source, city, lead_days, probability, outcome)
 
 
 def _best_price(levels: Any, *, ask: bool) -> Decimal | None:

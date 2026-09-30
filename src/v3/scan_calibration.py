@@ -1,23 +1,27 @@
 """Pure, network-free calibration bins built from the full scan universe.
 
-``ProbabilityCalibration`` is otherwise fed only by settled *traded* positions,
-which is selection-biased. Every evaluated market is logged to
-``weather_scans.jsonl``; joining those rows with resolved outcomes yields an
-unbiased calibration set. Output uses the exact ``ProbabilityCalibration``
-JSON format and key scheme, plus pooled ``source:*:lead:bucket`` keys.
+Settled *traded* positions are a selection-biased calibration sample: they are
+exactly the cases where the model disagreed most with the market. Every
+evaluated market is logged to ``weather_scans.jsonl``; joining those rows with
+resolved outcomes yields an unbiased calibration set.
+
+Only rows tagged with the current ``FORECAST_MODEL_VERSION`` are used, so
+probabilities produced by an older forecast model never calibrate newer ones.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 
-from src.v3.paper_weather import POOLED_CITY, ProbabilityCalibration
+from src.v3.paper_weather import FORECAST_MODEL_VERSION, ProbabilityCalibration
 
-_KEYER = ProbabilityCalibration(None)
+ZERO = Decimal(0)
+ONE = Decimal(1)
 
 
 @dataclass(frozen=True)
@@ -27,15 +31,15 @@ class Observation:
     lead_days: int
     source: str
     probability: Decimal  # YES-outcome raw probability
+    target_date: str
 
 
-def load_scan_rows(path: Path) -> list[dict[str, Any]]:
-    """Read JSONL rows, skipping blank/malformed lines and non-objects."""
-    rows: list[dict[str, Any]] = []
+def iter_scan_rows(path: Path) -> Iterator[dict[str, Any]]:
+    """Stream JSONL rows, skipping blank/malformed lines and non-objects."""
     try:
         handle = path.open("r", encoding="utf-8", errors="replace")
     except OSError:
-        return rows
+        return
     with handle:
         for line in handle:
             line = line.strip()
@@ -46,76 +50,83 @@ def load_scan_rows(path: Path) -> list[dict[str, Any]]:
             except ValueError:
                 continue
             if isinstance(row, dict):
-                rows.append(row)
-    return rows
+                yield row
 
 
-def is_evaluation_row(row: Mapping[str, Any]) -> bool:
+def is_evaluation_row(
+    row: Mapping[str, Any], *, model_version: str = FORECAST_MODEL_VERSION,
+) -> bool:
     probs = row.get("provider_probabilities")
     return (
-        bool(row.get("condition_id"))
+        row.get("forecast_model_version") == model_version
+        and bool(row.get("condition_id"))
         and bool(row.get("city"))
+        and bool(row.get("target_date"))
         and isinstance(probs, dict)
         and bool(probs)
         and row.get("lead_days") is not None
     )
 
 
-def dedupe_observations(rows: Iterable[Mapping[str, Any]]) -> list[Observation]:
-    """One observation per (condition_id, lead_days, source): the latest scan."""
-    latest: dict[tuple[str, int, str], tuple[str, int, Observation]] = {}
+def dedupe_observations(
+    rows: Iterable[Mapping[str, Any]], *, model_version: str = FORECAST_MODEL_VERSION,
+) -> list[Observation]:
+    """One observation per (condition_id, lead_days, source): the latest scan.
+
+    Consumes ``rows`` in a single pass; memory is bounded by unique keys.
+    """
+    latest: dict[tuple[str, int, str], tuple[tuple[str, int], Observation]] = {}
     for index, row in enumerate(rows):
-        if not is_evaluation_row(row):
+        if not is_evaluation_row(row, model_version=model_version):
             continue
         try:
             lead = int(row["lead_days"])
         except (TypeError, ValueError):
             continue
         condition_id = str(row["condition_id"])
-        stamp = str(row.get("scanned_at") or "")
+        rank = (str(row.get("scanned_at") or ""), index)
         for source, raw in row["provider_probabilities"].items():
             try:
                 probability = Decimal(str(raw))
             except (InvalidOperation, ValueError):
                 continue
-            if not probability.is_finite() or not Decimal(0) <= probability <= Decimal(1):
+            if not probability.is_finite() or not ZERO <= probability <= ONE:
                 continue
             key = (condition_id, lead, str(source))
-            rank = (stamp, index)
             current = latest.get(key)
-            if current is None or rank >= (current[0], current[1]):
-                latest[key] = (
-                    stamp,
-                    index,
-                    Observation(condition_id, str(row["city"]), lead, str(source), probability),
-                )
-    return [item[2] for item in latest.values()]
+            if current is None or rank >= current[0]:
+                latest[key] = (rank, Observation(
+                    condition_id, str(row["city"]), lead, str(source), probability,
+                    str(row["target_date"])[:10],
+                ))
+    return [item[1] for item in latest.values()]
 
 
-def build_bins(
+def past_condition_ids(observations: Iterable[Observation], today: date) -> list[str]:
+    """Condition IDs of usable observations whose target date has passed."""
+    found: set[str] = set()
+    for obs in observations:
+        try:
+            if date.fromisoformat(obs.target_date) < today:
+                found.add(obs.condition_id)
+        except ValueError:
+            continue
+    return sorted(found)
+
+
+def build_calibration(
     observations: Iterable[Observation],
     outcomes: Mapping[str, int],
-) -> dict[str, dict[str, int]]:
-    """Bins in ProbabilityCalibration format, with city and pooled keys."""
-    bins: dict[str, dict[str, int]] = {}
+    *,
+    min_samples: int = 20,
+) -> ProbabilityCalibration:
+    """In-memory calibrator fed with every resolved observation."""
+    calibration = ProbabilityCalibration(None, min_samples=min_samples)
     for obs in observations:
         outcome = outcomes.get(obs.condition_id)
-        if outcome not in (0, 1):
-            continue
-        for city in (obs.city, POOLED_CITY):
-            key = _KEYER._key(obs.source, city, obs.lead_days, obs.probability)
-            bucket = bins.setdefault(key, {"successes": 0, "total": 0})
-            bucket["successes"] += int(outcome)
-            bucket["total"] += 1
-    return bins
-
-
-def write_json_atomic(payload: Mapping[str, Any], path: Path) -> None:
-    """Atomically write JSON (tmp + replace)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
+        if outcome in (0, 1):
+            calibration.record(obs.source, obs.city, obs.lead_days, obs.probability, int(outcome))
+    return calibration
 
 
 def parse_gamma_outcome(market: Mapping[str, Any]) -> int | None:
@@ -140,7 +151,7 @@ def parse_gamma_outcome(market: Mapping[str, Any]) -> int | None:
         values = [Decimal(str(p)) for p in prices]
     except (ValueError, InvalidOperation, TypeError):
         return None
-    if sorted(values) != [Decimal(0), Decimal(1)]:
+    if sorted(values) != [ZERO, ONE]:
         return None
     yes_index = 0
     if isinstance(outcomes, list) and len(outcomes) == 2:

@@ -1019,7 +1019,7 @@ def test_paper_hybrid_exit_keeps_runner_then_exits_at_higher_target(tmp_path):
     assert exits[1]["reason"] == "paper hybrid runner profit target"
 
 
-def test_weather_settlement_calibrates_provider_probability_against_yes_outcome(tmp_path):
+def test_weather_settlement_does_not_feed_traded_only_calibration(tmp_path):
     resolved = market(closed=True)
     resolved.id = "weather-calibration"
     resolved.condition_id = "weather-calibration-condition"
@@ -1060,12 +1060,10 @@ def test_weather_settlement_calibrates_provider_probability_against_yes_outcome(
     )
 
     assert asyncio.run(worker._settle_positions("2026-08-26T00:00:00+00:00")) == (1, 0)
-    assert forecast.calls == [{
-        "city": "singapore",
-        "lead_days": 1,
-        "outcome": 1,
-        "provider_probabilities": (("met-no", D("0.20")),),
-    }]
+    # Calibration is rebuilt offline from every scanned market; settling a
+    # traded position must not add a selection-biased (and duplicate) record.
+    assert forecast.calls == []
+    assert store.load_state().weather_resolved == 1
 
 
 def test_run_paper_refuses_unsafe_settings_before_client_construction(tmp_path):

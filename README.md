@@ -236,18 +236,27 @@ commit account-derived events or candidate records.
 
 ### Rebuilding weather calibration from all scans
 
-`weather_calibration.json` is otherwise updated only from settled *traded*
-positions, which is selection-biased. To rebuild it from every evaluated market
-in `weather_scans.jsonl` (resolutions fetched from the public Gamma API, cached
-in `scan_outcomes.json`):
+Forecast calibration is built offline from every evaluated market in
+`weather_scans.jsonl`, not from settled traded positions (which are
+selection-biased). The rebuild fetches resolutions from the public Gamma API,
+caches them in `scan_outcomes.json`, and writes
+`weather_calibration.<model-version>.json`:
 
 ```bash
 python scripts/rebuild_weather_calibration.py --data-dir data/v6-main-paper --dry-run
 python scripts/rebuild_weather_calibration.py --data-dir data/v6-main-paper
 ```
 
-The rebuild replaces the traded-only records; run it periodically. Bins include
-pooled `source:*:lead:bucket` keys used as a fallback for sparse city bins.
+- The rebuild is the only writer; the paper worker re-reads the file when it
+  changes, so run it periodically (e.g. daily from cron) without restarting.
+- Only scan rows tagged with the current `FORECAST_MODEL_VERSION` are used, and
+  the file name carries that version, so probabilities from an older forecast
+  model never calibrate newer ones.
+- If any Gamma batch fails, the calibration file is left untouched and the
+  command exits 1.
+- Each bin stores the sum of forecast probabilities, and forecasts are shifted in
+  log-odds by a shrunk reliability offset. City bins are shrunk toward a pooled
+  `source:*:lead:bucket` offset that excludes that city's own data.
 
 ## Tests
 
