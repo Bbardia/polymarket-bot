@@ -252,11 +252,17 @@ python scripts/rebuild_weather_calibration.py --data-dir data/v6-main-paper
 - Only scan rows tagged with the current `FORECAST_MODEL_VERSION` are used, and
   the file name carries that version, so probabilities from an older forecast
   model never calibrate newer ones.
-- If any Gamma batch fails, the calibration file is left untouched and the
-  command exits 1.
-- Each bin stores the sum of forecast probabilities, and forecasts are shifted in
-  log-odds by a shrunk reliability offset. City bins are shrunk toward a pooled
-  `source:*:lead:bucket` offset that excludes that city's own data.
+- Failed Gamma batches are retried one market at a time. If more than 5% of
+  markets still fail, the calibration file is left untouched and the command
+  exits 1. Markets unresolved after 7 runs are given up on
+  (`scan_outcome_attempts.json`).
+- Each bin stores the sum of forecast probabilities. The shrunk reliability
+  offset is measured at the bin's average forecast and applied as a log-odds
+  shift. City bins are shrunk toward a pooled `source:*:lead:bucket` offset that
+  excludes that city's own data.
+- Until the first rebuild for the current model version, no calibration is
+  applied (raw provider probabilities are used). A missing or unreadable file
+  also means no calibration.
 
 ## Tests
 

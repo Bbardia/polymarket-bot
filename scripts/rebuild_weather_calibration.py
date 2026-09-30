@@ -11,9 +11,12 @@ This rebuild is the only writer of the calibration file. The paper worker
 re-reads it when it changes, so no restart is needed. Run it periodically
 (e.g. daily from cron).
 
-If any Gamma batch fails, the outcome cache is still saved but the
-calibration file is left untouched and the exit code is 1, so a partial
-fetch never replaces a fuller calibration.
+A failed Gamma batch is retried one market at a time. If more than 5% of the
+markets to fetch still fail, the outcome cache is saved but the calibration
+file is left untouched and the exit code is 1, so a largely failed fetch never
+replaces a fuller calibration. A market that stays unresolved or unfetchable
+for 7 runs is given up on (tracked in ``scan_outcome_attempts.json``), so one
+bad id cannot block rebuilds or grow the request volume forever.
 
 Usage:
     python scripts/rebuild_weather_calibration.py [--data-dir DIR] [--dry-run]
@@ -43,6 +46,8 @@ from src.v3.scan_calibration import (  # noqa: E402
 
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 BATCH_SIZE = 20
+MAX_ATTEMPTS = 7
+MAX_FAILED_FRACTION = 0.05
 
 Fetcher = Callable[[Sequence[str]], list]
 
@@ -58,14 +63,49 @@ def gamma_fetcher(condition_ids: Sequence[str]) -> list:
     return data if isinstance(data, list) else []
 
 
-def _load_cache(path: Path) -> dict[str, int]:
+def _load_int_map(path: Path) -> dict[str, int]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     if not isinstance(payload, dict):
         return {}
-    return {str(k): int(v) for k, v in payload.items() if v in (0, 1)}
+    return {str(k): v for k, v in payload.items() if isinstance(v, int) and not isinstance(v, bool)}
+
+
+def _load_cache(path: Path) -> dict[str, int]:
+    return {k: v for k, v in _load_int_map(path).items() if v in (0, 1)}
+
+
+def _fetch_outcomes(
+    ids: Sequence[str], fetcher: Fetcher,
+) -> tuple[dict[str, int], set[str]]:
+    """Resolved outcomes for ``ids`` and the ids that could not be fetched."""
+    try:
+        markets = fetcher(ids)
+    except Exception as exc:
+        if len(ids) == 1:
+            print(f"error: fetch failed for {ids[0]}: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+            return {}, set(ids)
+        resolved: dict[str, int] = {}
+        failed: set[str] = set()
+        for cid in ids:  # isolate the bad id(s) instead of losing the batch
+            one, bad = _fetch_outcomes([cid], fetcher)
+            resolved.update(one)
+            failed |= bad
+        return resolved, failed
+    wanted = set(ids)
+    resolved = {}
+    for market in markets:
+        if not isinstance(market, dict):
+            continue
+        cid = str(market.get("conditionId") or "")
+        if cid in wanted:
+            outcome = parse_gamma_outcome(market)
+            if outcome is not None:
+                resolved[cid] = outcome
+    return resolved, set()
 
 
 def run(
@@ -86,27 +126,24 @@ def run(
 
     observations = dedupe_observations(counted_rows())
     cache_path = data_dir / "scan_outcomes.json"
+    attempts_path = data_dir / "scan_outcome_attempts.json"
     outcomes = _load_cache(cache_path)
-    todo = [c for c in past_condition_ids(observations, today) if c not in outcomes]
-    failed_batches = 0
+    attempts = _load_int_map(attempts_path)
+    todo = [
+        c for c in past_condition_ids(observations, today)
+        if c not in outcomes and attempts.get(c, 0) < MAX_ATTEMPTS
+    ]
+    failed: set[str] = set()
     for start in range(0, len(todo), batch_size):
         batch = todo[start:start + batch_size]
-        try:
-            markets = fetcher(batch)
-        except Exception as exc:
-            failed_batches += 1
-            print(f"error: fetch failed for batch at {start}: {type(exc).__name__}: {exc}",
-                  file=sys.stderr)
-            continue
-        wanted = set(batch)
-        for market in markets:
-            if not isinstance(market, dict):
-                continue
-            cid = str(market.get("conditionId") or "")
-            if cid in wanted:
-                outcome = parse_gamma_outcome(market)
-                if outcome is not None:
-                    outcomes[cid] = outcome
+        resolved, bad = _fetch_outcomes(batch, fetcher)
+        outcomes.update(resolved)
+        failed |= bad
+        for cid in batch:
+            if cid in resolved:
+                attempts.pop(cid, None)
+            else:  # unresolved or unfetchable this run
+                attempts[cid] = attempts.get(cid, 0) + 1
     calibration = build_calibration(observations, outcomes)
     bins = calibration.to_json()
     stats: dict[str, Any] = {
@@ -115,13 +152,18 @@ def run(
         "observations_used": sum(1 for o in observations if o.condition_id in outcomes),
         "resolved_markets": len(outcomes),
         "bins": len(bins),
-        "failed_batches": failed_batches,
+        "fetch_attempted": len(todo),
+        "fetch_failed": len(failed),
+        "gave_up": sum(1 for count in attempts.values() if count >= MAX_ATTEMPTS),
         "calibration_written": False,
     }
+    too_many_failures = len(failed) > MAX_FAILED_FRACTION * len(todo)
+    stats["too_many_failures"] = too_many_failures
     if not dry_run:
         write_json_atomic(outcomes, cache_path)
-        # Never replace a calibration with an empty or partially fetched one.
-        if bins and not failed_batches:
+        write_json_atomic(attempts, attempts_path)
+        # Never replace a calibration with an empty or largely unfetched one.
+        if bins and not too_many_failures:
             write_json_atomic(bins, data_dir / CALIBRATION_FILENAME)
             stats["calibration_written"] = True
     return stats
@@ -141,10 +183,12 @@ def main(argv: Sequence[str] | None = None, *, fetcher: Fetcher = gamma_fetcher,
     print(f"observations used:  {stats['observations_used']} (of {stats['observations_total']} deduped)")
     print(f"resolved markets:   {stats['resolved_markets']}")
     print(f"bins:               {stats['bins']}")
+    print(f"fetch failures:     {stats['fetch_failed']} of {stats['fetch_attempted']}"
+          f" (gave up on {stats['gave_up']} after {MAX_ATTEMPTS} runs)")
     if args.dry_run:
         print("dry run: nothing written")
-    elif stats["failed_batches"]:
-        print(f"{stats['failed_batches']} fetch batch(es) failed: calibration left untouched")
+    elif stats["too_many_failures"]:
+        print("too many fetch failures: calibration left untouched")
         return 1
     elif not stats["calibration_written"]:
         print(f"no bins produced: existing {CALIBRATION_FILENAME} left untouched")

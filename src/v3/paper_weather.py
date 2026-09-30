@@ -483,17 +483,18 @@ class ProbabilityCalibration:
     Each ``source:city:lead:bucket`` bin stores outcomes and the sum of the
     raw probabilities that produced them, so it measures the average
     miscalibration ``successes - probability_sum`` of that bin. Pooled
-    ``source:*:lead:bucket`` bins aggregate all cities. A forecast is shifted
-    in log-odds by a shrunk offset rather than replaced by a bin rate, which
-    keeps within-bucket resolution (no step function):
+    ``source:*:lead:bucket`` bins aggregate all cities.
 
-    * pooled offset excludes the target city's own data (no double counting)
-      and is shrunk toward zero with prior strength ``min_samples``;
+    * the pooled offset excludes the target city's own data (no double
+      counting) and is shrunk toward zero with prior strength ``min_samples``;
     * the city offset is shrunk toward that pooled offset with the same
-      strength, so sparse cities borrow strength instead of adding noise.
+      strength, so sparse cities borrow strength instead of adding noise;
+    * the offset is anchored at the bin's average forecast (where it was
+      measured) and applied to the forecast as a log-odds shift, so the curve
+      stays smooth and monotone rather than a per-bucket step function.
 
-    The file is re-read whenever it changes on disk, so an offline rebuild
-    reaches a running worker without a restart.
+    The file on disk is the source of truth: it is re-read when it changes,
+    and a missing or unreadable file means no calibration.
     """
 
     def __init__(self, path: Path | None = None, *, min_samples: int = 20) -> None:
@@ -503,7 +504,8 @@ class ProbabilityCalibration:
         self.min_samples = min_samples
         self._bins: dict[str, dict[str, Any]] = {}
         self._samples = 0
-        self._loaded_mtime: int | None = None
+        self._loaded_state: object = None
+        self.load_error: str | None = None
         self._reload_if_changed()
 
     @staticmethod
@@ -511,44 +513,59 @@ class ProbabilityCalibration:
         if not isinstance(value, dict):
             return None
         try:
-            total = int(value.get("total", 0))
-            successes = int(value.get("successes", 0))
-            raw_sum = value.get("probability_sum")
-            probability_sum = None if raw_sum is None else Decimal(str(raw_sum))
-        except (TypeError, ValueError, ArithmeticError):
+            total = int(value["total"])
+            successes = int(value["successes"])
+            probability_sum = Decimal(str(value["probability_sum"]))
+        except (KeyError, TypeError, ValueError, ArithmeticError):
             return None
-        if total < 0 or not 0 <= successes <= total:
+        if total <= 0 or not 0 <= successes <= total:
             return None
-        if probability_sum is not None and (
-            not probability_sum.is_finite() or not ZERO <= probability_sum <= total
-        ):
+        if not probability_sum.is_finite() or not ZERO <= probability_sum <= total:
             return None
         return {"successes": successes, "total": total, "probability_sum": probability_sum}
+
+    def _set_bins(self, bins: dict[str, dict[str, Any]]) -> None:
+        self._bins = bins
+        self._samples = sum(
+            item["total"] for key, item in bins.items() if not self._is_pooled_key(key)
+        )
 
     def _reload_if_changed(self) -> None:
         if self.path is None:
             return
         try:
-            mtime = self.path.stat().st_mtime_ns
-        except OSError:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            state: object = "missing"
+            if state != self._loaded_state:
+                self._set_bins({})
+                self.load_error = None
+                self._loaded_state = state
             return
-        if mtime == self._loaded_mtime:
+        except OSError as exc:
+            self.load_error = f"{type(exc).__name__}: {exc}"
             return
+        state = (stat.st_mtime_ns, stat.st_size)
+        if state == self._loaded_state:
+            return
+        # Record the state first so an unreadable file is parsed once, not
+        # on every forecast; it fails closed to no calibration.
+        self._loaded_state = state
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            if not isinstance(payload, dict):
+                raise ValueError("calibration file is not a JSON object")
+        except (OSError, ValueError) as exc:
+            self._set_bins({})
+            self.load_error = f"{type(exc).__name__}: {exc}"
             return
         bins: dict[str, dict[str, Any]] = {}
-        if isinstance(payload, dict):
-            for key, value in payload.items():
-                parsed = self._parse_bin(value)
-                if parsed is not None:
-                    bins[str(key)] = parsed
-        self._bins = bins
-        self._samples = sum(
-            item["total"] for key, item in bins.items() if not self._is_pooled_key(key)
-        )
-        self._loaded_mtime = mtime
+        for key, value in payload.items():
+            parsed = self._parse_bin(value)
+            if parsed is not None:
+                bins[str(key)] = parsed
+        self._set_bins(bins)
+        self.load_error = None
 
     @staticmethod
     def _is_pooled_key(key: str) -> bool:
@@ -565,15 +582,11 @@ class ProbabilityCalibration:
         return self._key(source, POOLED_CITY, lead_days, probability)
 
     @staticmethod
-    def _residual(bucket: dict[str, Any] | None, midpoint: Decimal) -> tuple[Decimal, int]:
-        """(sum of outcome - probability, count); legacy bins use the midpoint."""
-        if not bucket or bucket["total"] <= 0:
-            return ZERO, 0
-        total = bucket["total"]
-        probability_sum = bucket["probability_sum"]
-        if probability_sum is None:
-            probability_sum = midpoint * total
-        return Decimal(bucket["successes"]) - probability_sum, total
+    def _stats(bucket: dict[str, Any] | None) -> tuple[Decimal, Decimal, int]:
+        """(successes, probability_sum, total) of a bin, zeros when absent."""
+        if not bucket:
+            return ZERO, ZERO, 0
+        return Decimal(bucket["successes"]), bucket["probability_sum"], bucket["total"]
 
     def calibrate(
         self,
@@ -586,27 +599,31 @@ class ProbabilityCalibration:
             raise ValueError("forecast probability must be in [0, 1]")
         self._reload_if_changed()
         strength = Decimal(self.min_samples)
-        midpoint = (Decimal(self._bucket(probability)) + Decimal("0.5")) / Decimal("10")
-        local_residual, local_total = self._residual(
-            self._bins.get(self._key(source, city, lead_days, probability)), midpoint,
+        local_s, local_p, local_n = self._stats(
+            self._bins.get(self._key(source, city, lead_days, probability)),
         )
-        pooled_offset = ZERO
+        other_s = other_p = ZERO
+        other_n = 0
         if city != POOLED_CITY:
-            pooled_residual, pooled_total = self._residual(
-                self._bins.get(self._pooled_key(source, lead_days, probability)), midpoint,
+            pooled_s, pooled_p, pooled_n = self._stats(
+                self._bins.get(self._pooled_key(source, lead_days, probability)),
             )
-            other_total = max(0, pooled_total - local_total)
-            if other_total:
-                pooled_offset = (pooled_residual - local_residual) / (other_total + strength)
-        offset = (local_residual + strength * pooled_offset) / (local_total + strength)
+            if pooled_n > local_n:
+                other_s, other_p, other_n = (
+                    pooled_s - local_s, pooled_p - local_p, pooled_n - local_n,
+                )
+        if local_n + other_n == 0:
+            return probability
+        pooled_offset = (other_s - other_p) / (other_n + strength) if other_n else ZERO
+        offset = (local_s - local_p + strength * pooled_offset) / (local_n + strength)
         if offset == ZERO or probability in (ZERO, ONE):
             return probability
-        # The offset is measured around the bucket centre; apply it as a
-        # log-odds shift so the curve stays smooth and monotone and tail
-        # probabilities are scaled rather than pushed through 0 or 1.
-        centre = float(midpoint)
-        corrected = min(0.999, max(0.001, centre + float(offset)))
-        shift = math.log(corrected / (1 - corrected)) - math.log(centre / (1 - centre))
+        # The offset was measured at the bin's average forecast; convert it to
+        # a log-odds shift there and apply that shift to this forecast.
+        anchor = float((local_p + other_p) / (local_n + other_n))
+        anchor = min(0.999, max(0.001, anchor))
+        corrected = min(0.999, max(0.001, anchor + float(offset)))
+        shift = math.log(corrected / (1 - corrected)) - math.log(anchor / (1 - anchor))
         raw = float(probability)
         logit = math.log(raw / (1 - raw)) + shift
         return Decimal(str(1 / (1 + math.exp(-logit))))
@@ -615,9 +632,6 @@ class ProbabilityCalibration:
         bucket = self._bins.setdefault(
             key, {"successes": 0, "total": 0, "probability_sum": ZERO},
         )
-        if bucket["probability_sum"] is None:  # legacy bin: approximate history
-            midpoint = (Decimal(self._bucket(probability)) + Decimal("0.5")) / Decimal("10")
-            bucket["probability_sum"] = midpoint * bucket["total"]
         bucket["successes"] += outcome
         bucket["total"] += 1
         bucket["probability_sum"] += probability
@@ -630,6 +644,11 @@ class ProbabilityCalibration:
         probability: Decimal,
         outcome: int,
     ) -> None:
+        """Add one resolved observation; persists when a path is configured.
+
+        The paper worker never calls this: the offline rebuild builds an
+        in-memory calibrator and writes the file once.
+        """
         if outcome not in {0, 1} or not ZERO <= probability <= ONE:
             raise ValueError("invalid calibration observation")
         self._reload_if_changed()
@@ -639,18 +658,15 @@ class ProbabilityCalibration:
             self._samples += 1
         if self.path is not None:
             write_json_atomic(self.to_json(), self.path)
-            self._loaded_mtime = self.path.stat().st_mtime_ns
+            stat = self.path.stat()
+            self._loaded_state = (stat.st_mtime_ns, stat.st_size)
 
     def to_json(self) -> dict[str, dict[str, Any]]:
         return {
             key: {
                 "successes": item["successes"],
                 "total": item["total"],
-                **(
-                    {}
-                    if item["probability_sum"] is None
-                    else {"probability_sum": str(item["probability_sum"])}
-                ),
+                "probability_sum": str(item["probability_sum"]),
             }
             for key, item in self._bins.items()
         }

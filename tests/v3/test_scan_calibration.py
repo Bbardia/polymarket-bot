@@ -110,10 +110,10 @@ def test_city_evidence_is_not_double_counted_through_pool():
     for _ in range(5):
         cal.record("gfs", "Rome", 1, D("0.50"), 0)
     # Paris offset = (15*0.5 + 10*pooled_ex_paris) / 25 where the pool
-    # excludes Paris; at the bucket centre (0.55) that is a plain shift.
+    # excludes Paris; at the bins' average forecast (0.50) it is a plain shift.
     pooled_ex_paris = (D(0) - D("2.5")) / D(15)
     offset = (D("7.5") + 10 * pooled_ex_paris) / D(25)
-    assert abs(cal.calibrate("gfs", "Paris", 1, D("0.55")) - (D("0.55") + offset)) < D("1e-9")
+    assert abs(cal.calibrate("gfs", "Paris", 1, D("0.50")) - (D("0.50") + offset)) < D("1e-9")
     # Counting Paris twice (old behaviour) would give a larger shift.
     double_counted = (D("7.5") + 10 * (D("5") / D(30))) / D(25)
     assert offset < double_counted
@@ -125,13 +125,43 @@ def test_no_evidence_leaves_probability_unchanged():
     assert cal.calibrate("gfs", "Paris", 1, D("0.37")) == D("0.37")
 
 
-def test_legacy_bins_without_probability_sum_use_bucket_midpoint(tmp_path):
+def test_bins_without_probability_sum_are_ignored(tmp_path):
     path = tmp_path / "c.json"
     path.write_text(json.dumps({"gfs:Paris:1:7": {"successes": 5, "total": 10}}))
     cal = ProbabilityCalibration(path, min_samples=10)
-    # residual = 5 - 0.75*10 = -2.5, shrunk by 10/(10+10), at the centre
-    assert abs(cal.calibrate("gfs", "Paris", 1, D("0.75")) - D("0.625")) < D("1e-9")
-    assert cal.samples() == 10
+    assert cal.calibrate("gfs", "Paris", 1, D("0.75")) == D("0.75")
+    assert cal.samples() == 0
+
+
+def test_off_centre_bin_calibrates_to_observed_rate():
+    # Review finding: anchoring at the bucket centre (0.05) instead of the
+    # bin's average forecast (0.09) drove this to ~0.002.
+    cal = ProbabilityCalibration(None)
+    for index in range(500):
+        cal.record("gfs", f"city{index % 25}", 1, D("0.09"), int(index % 50 == 0))
+    calibrated = cal.calibrate("gfs", "unseen", 1, D("0.09"))
+    assert D("0.018") < calibrated < D("0.03")
+
+
+def test_deleted_or_corrupt_file_resets_running_calibrator(tmp_path):
+    path = tmp_path / CALIBRATION_FILENAME
+    source = ProbabilityCalibration(None)
+    for _ in range(40):
+        source.record("gfs", "Paris", 1, D("0.50"), 1)
+    write_json_atomic(source.to_json(), path)
+    cal = ProbabilityCalibration(path)
+    assert cal.calibrate("gfs", "Paris", 1, D("0.50")) > D("0.80")
+
+    path.write_text("{truncated")
+    assert cal.calibrate("gfs", "Paris", 1, D("0.50")) == D("0.50")
+    assert cal.load_error is not None and cal.samples() == 0
+
+    write_json_atomic(source.to_json(), path)
+    os.utime(path, ns=(2, 2))
+    assert cal.calibrate("gfs", "Paris", 1, D("0.50")) > D("0.80")
+    path.unlink()
+    assert cal.calibrate("gfs", "Paris", 1, D("0.50")) == D("0.50")
+    assert cal.load_error is None
 
 
 def test_running_calibrator_picks_up_rebuilt_file(tmp_path):
@@ -238,3 +268,34 @@ def test_rebuild_ignores_rows_from_older_forecast_model(tmp_path):
                         today=date(2026, 6, 1)) == 0
     assert calls == []
     assert not (tmp_path / CALIBRATION_FILENAME).exists()
+
+
+def test_cli_isolates_one_bad_id_and_still_writes(tmp_path):
+    # Review finding: one permanently failing id used to block every rebuild.
+    scans = tmp_path / "weather_scans.jsonl"
+    scans.write_text("\n".join(json.dumps(row(f"c{i:02d}", "a")) for i in range(30)) + "\n")
+
+    def fetcher(ids):
+        if "c07" in ids:
+            raise OSError("422 for c07")
+        return [{"conditionId": c, "closed": True, "outcomePrices": '["0","1"]'} for c in ids]
+
+    assert rebuild.main(["--data-dir", str(tmp_path)], fetcher=fetcher,
+                        today=date(2026, 6, 1)) == 0
+    assert (tmp_path / CALIBRATION_FILENAME).exists()
+    assert len(json.loads((tmp_path / "scan_outcomes.json").read_text())) == 29
+    assert json.loads((tmp_path / "scan_outcome_attempts.json").read_text()) == {"c07": 1}
+
+
+def test_cli_gives_up_on_never_resolving_market(tmp_path):
+    _write_scans(tmp_path)
+    calls = []
+
+    def fetcher(ids):
+        calls.append(list(ids))
+        return [{"conditionId": c, "closed": True, "outcomePrices": '["1","0"]'}
+                for c in ids if c != "c3"]
+
+    for _ in range(rebuild.MAX_ATTEMPTS + 2):
+        rebuild.main(["--data-dir", str(tmp_path)], fetcher=fetcher, today=date(2026, 6, 1))
+    assert sum(1 for batch in calls if "c3" in batch) == rebuild.MAX_ATTEMPTS
