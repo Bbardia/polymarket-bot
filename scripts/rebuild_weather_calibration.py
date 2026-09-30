@@ -14,9 +14,10 @@ re-reads it when it changes, so no restart is needed. Run it periodically
 A failed Gamma batch is retried one market at a time. If more than 5% of the
 markets to fetch still fail, the outcome cache is saved but the calibration
 file is left untouched and the exit code is 1, so a largely failed fetch never
-replaces a fuller calibration. A market that stays unresolved or unfetchable
-for 7 runs is given up on (tracked in ``scan_outcome_attempts.json``), so one
-bad id cannot block rebuilds or grow the request volume forever.
+replaces a fuller calibration. A market that Gamma keeps reporting as
+unresolved is given up on 14 days after it was first seen unresolved (tracked
+in ``scan_outcome_attempts.json``), independent of how often this runs. Fetch
+failures never count toward that, so an outage cannot abandon markets.
 
 Usage:
     python scripts/rebuild_weather_calibration.py [--data-dir DIR] [--dry-run]
@@ -46,7 +47,7 @@ from src.v3.scan_calibration import (  # noqa: E402
 
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 BATCH_SIZE = 20
-MAX_ATTEMPTS = 7
+GIVE_UP_AFTER_DAYS = 14
 MAX_FAILED_FRACTION = 0.05
 
 Fetcher = Callable[[Sequence[str]], list]
@@ -75,6 +76,22 @@ def _load_int_map(path: Path) -> dict[str, int]:
 
 def _load_cache(path: Path) -> dict[str, int]:
     return {k: v for k, v in _load_int_map(path).items() if v in (0, 1)}
+
+
+def _load_first_unresolved(path: Path) -> dict[str, date]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    found: dict[str, date] = {}
+    for key, value in payload.items():
+        try:
+            found[str(key)] = date.fromisoformat(str(value))
+        except ValueError:
+            continue
+    return found
 
 
 def _fetch_outcomes(
@@ -128,10 +145,15 @@ def run(
     cache_path = data_dir / "scan_outcomes.json"
     attempts_path = data_dir / "scan_outcome_attempts.json"
     outcomes = _load_cache(cache_path)
-    attempts = _load_int_map(attempts_path)
+    first_unresolved = _load_first_unresolved(attempts_path)
+
+    def given_up(cid: str) -> bool:
+        seen = first_unresolved.get(cid)
+        return seen is not None and (today - seen).days >= GIVE_UP_AFTER_DAYS
+
     todo = [
         c for c in past_condition_ids(observations, today)
-        if c not in outcomes and attempts.get(c, 0) < MAX_ATTEMPTS
+        if c not in outcomes and not given_up(c)
     ]
     failed: set[str] = set()
     for start in range(0, len(todo), batch_size):
@@ -141,9 +163,9 @@ def run(
         failed |= bad
         for cid in batch:
             if cid in resolved:
-                attempts.pop(cid, None)
-            else:  # unresolved or unfetchable this run
-                attempts[cid] = attempts.get(cid, 0) + 1
+                first_unresolved.pop(cid, None)
+            elif cid not in bad:  # Gamma answered, market still unresolved
+                first_unresolved.setdefault(cid, today)
     calibration = build_calibration(observations, outcomes)
     bins = calibration.to_json()
     stats: dict[str, Any] = {
@@ -154,14 +176,17 @@ def run(
         "bins": len(bins),
         "fetch_attempted": len(todo),
         "fetch_failed": len(failed),
-        "gave_up": sum(1 for count in attempts.values() if count >= MAX_ATTEMPTS),
+        "gave_up": sum(1 for cid in first_unresolved if given_up(cid)),
         "calibration_written": False,
     }
     too_many_failures = len(failed) > MAX_FAILED_FRACTION * len(todo)
     stats["too_many_failures"] = too_many_failures
     if not dry_run:
         write_json_atomic(outcomes, cache_path)
-        write_json_atomic(attempts, attempts_path)
+        write_json_atomic(
+            {cid: seen.isoformat() for cid, seen in sorted(first_unresolved.items())},
+            attempts_path,
+        )
         # Never replace a calibration with an empty or largely unfetched one.
         if bins and not too_many_failures:
             write_json_atomic(bins, data_dir / CALIBRATION_FILENAME)
@@ -184,7 +209,7 @@ def main(argv: Sequence[str] | None = None, *, fetcher: Fetcher = gamma_fetcher,
     print(f"resolved markets:   {stats['resolved_markets']}")
     print(f"bins:               {stats['bins']}")
     print(f"fetch failures:     {stats['fetch_failed']} of {stats['fetch_attempted']}"
-          f" (gave up on {stats['gave_up']} after {MAX_ATTEMPTS} runs)")
+          f" (gave up on {stats['gave_up']} unresolved after {GIVE_UP_AFTER_DAYS} days)")
     if args.dry_run:
         print("dry run: nothing written")
     elif stats["too_many_failures"]:

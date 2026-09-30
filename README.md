@@ -254,7 +254,8 @@ python scripts/rebuild_weather_calibration.py --data-dir data/v6-main-paper
   model never calibrate newer ones.
 - Failed Gamma batches are retried one market at a time. If more than 5% of
   markets still fail, the calibration file is left untouched and the command
-  exits 1. Markets unresolved after 7 runs are given up on
+  exits 1. Markets Gamma still reports unresolved 14 days after first being seen that
+  way are given up on; fetch failures never count toward this
   (`scan_outcome_attempts.json`).
 - Each bin stores the sum of forecast probabilities. The shrunk reliability
   offset is measured at the bin's average forecast and applied as a log-odds

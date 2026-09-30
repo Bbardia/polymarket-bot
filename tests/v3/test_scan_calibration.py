@@ -284,10 +284,11 @@ def test_cli_isolates_one_bad_id_and_still_writes(tmp_path):
                         today=date(2026, 6, 1)) == 0
     assert (tmp_path / CALIBRATION_FILENAME).exists()
     assert len(json.loads((tmp_path / "scan_outcomes.json").read_text())) == 29
-    assert json.loads((tmp_path / "scan_outcome_attempts.json").read_text()) == {"c07": 1}
+    # A fetch failure is not evidence the market is unresolved.
+    assert json.loads((tmp_path / "scan_outcome_attempts.json").read_text()) == {}
 
 
-def test_cli_gives_up_on_never_resolving_market(tmp_path):
+def test_cli_gives_up_on_unresolved_market_by_age_not_run_count(tmp_path):
     _write_scans(tmp_path)
     calls = []
 
@@ -296,6 +297,26 @@ def test_cli_gives_up_on_never_resolving_market(tmp_path):
         return [{"conditionId": c, "closed": True, "outcomePrices": '["1","0"]'}
                 for c in ids if c != "c3"]
 
-    for _ in range(rebuild.MAX_ATTEMPTS + 2):
-        rebuild.main(["--data-dir", str(tmp_path)], fetcher=fetcher, today=date(2026, 6, 1))
-    assert sum(1 for batch in calls if "c3" in batch) == rebuild.MAX_ATTEMPTS
+    start = date(2026, 6, 1)
+    for _ in range(20):  # many runs on the same day never give up
+        rebuild.main(["--data-dir", str(tmp_path)], fetcher=fetcher, today=start)
+    assert calls[-1] == ["c3"]
+    first_seen = json.loads((tmp_path / "scan_outcome_attempts.json").read_text())
+    assert first_seen == {"c3": "2026-06-01"}
+    rebuild.main(["--data-dir", str(tmp_path)], fetcher=fetcher, today=date(2026, 6, 14))
+    assert calls[-1] == ["c3"]
+    calls.clear()
+    rebuild.main(["--data-dir", str(tmp_path)], fetcher=fetcher, today=date(2026, 6, 15))
+    assert calls == []
+
+
+def test_outage_never_abandons_pending_markets(tmp_path):
+    _write_scans(tmp_path)
+
+    def down(ids):
+        raise OSError("gamma down")
+
+    for day in range(1, 30):
+        assert rebuild.main(["--data-dir", str(tmp_path)], fetcher=down,
+                            today=date(2026, 6, day)) == 1
+    assert json.loads((tmp_path / "scan_outcome_attempts.json").read_text()) == {}
