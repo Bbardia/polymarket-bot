@@ -1212,12 +1212,35 @@ def _resolution_station_matches(
     return _verified_resolution_station(contract, source) is not None
 
 
+# Predictive-error floors for station daily-maximum temperature, in degrees C.
+# A single deterministic value carries no spread of its own; published
+# day-1 daily-max errors at airport stations are roughly 1.5-2 C RMSE and
+# grow with lead. Raw ensembles are also under-dispersive at station scale
+# (grid vs. point, no station bias correction), so they get a smaller floor.
+# These are conservative priors until per-station calibration replaces them.
+DETERMINISTIC_SIGMA_BASE_C = 1.6
+DETERMINISTIC_SIGMA_PER_LEAD_DAY_C = 0.4
+ENSEMBLE_SIGMA_FLOOR_BASE_C = 1.0
+ENSEMBLE_SIGMA_FLOOR_PER_LEAD_DAY_C = 0.25
+
+
+def forecast_sigma_floor_c(lead_days: int, *, deterministic: bool) -> float:
+    """Minimum predictive standard deviation for one model's daily maximum."""
+    lead = max(0, lead_days)
+    if deterministic:
+        return DETERMINISTIC_SIGMA_BASE_C + DETERMINISTIC_SIGMA_PER_LEAD_DAY_C * lead
+    return ENSEMBLE_SIGMA_FLOOR_BASE_C + ENSEMBLE_SIGMA_FLOOR_PER_LEAD_DAY_C * lead
+
+
 def _ensemble_probability(
     contract: HighTemperatureContract,
     model_members: tuple[tuple[float, ...], ...],
     lead_days: int,
+    *,
+    deterministic: bool = False,
 ) -> EnsembleForecast:
     inflation = 1.05 + 0.15 * max(0, lead_days)
+    sigma_floor = forecast_sigma_floor_c(lead_days, deterministic=deterministic)
     lower_c = (
         float(contract.probability_lower_c)
         if contract.probability_lower_c is not None
@@ -1234,7 +1257,7 @@ def _ensemble_probability(
     for members in model_members:
         model_mean = statistics.mean(members)
         model_std = statistics.stdev(members) if len(members) >= 2 else 0.0
-        sigma = max(model_std * inflation, 0.5)
+        sigma = max(model_std * inflation, sigma_floor)
         distribution = NormalDist(mu=model_mean, sigma=sigma)
         if lower_c is None:
             assert upper_c is not None
@@ -1245,7 +1268,8 @@ def _ensemble_probability(
             probability = distribution.cdf(upper_c) - distribution.cdf(lower_c)
         model_probabilities.append(probability)
         model_means.append(model_mean)
-        model_variances.append(model_std ** 2)
+        # Report the predictive spread actually used for the probability.
+        model_variances.append(sigma ** 2)
     distribution_probability = statistics.mean(model_probabilities)
     directional_probability = min(
         0.999,
@@ -1949,6 +1973,7 @@ def _deterministic_forecast(
         contract,
         ((maximum_c,),),
         lead_days,
+        deterministic=True,
     )
     return replace(
         result,
