@@ -1,8 +1,14 @@
-# Polymarket Trading Bot — V6 Hybrid Paper
+# Polymarket Weather Bot — V7 Paper Worker
 
-Paper-first Polymarket research and trading infrastructure for a small,
-risk-capped account. The April-era execution loop is retained only for offline
-research compatibility; its live path is permanently disabled.
+Paper-first Polymarket weather research and simulated-trading infrastructure
+for a small, risk-capped account. The current entrypoint is the V7 paper worker
+(`run_v3.py paper-run`, code in `src/v3/`). Since the 2026-09 remediation, new
+paper entries are frozen by default; existing positions are still managed. See
+[docs/remediation-status.md](docs/remediation-status.md) for the current state.
+
+The April-era execution loop now lives in `legacy/` (`legacy/run_full_loop.py`
+and its supporting modules). It is retained only for offline research
+compatibility; its live path is permanently disabled.
 
 > Experimental software, not financial advice. No strategy is enabled for live
 > trading in this foundation.
@@ -50,11 +56,24 @@ research compatibility; its live path is permanently disabled.
   positions. The main profile keeps a 5 pUSD realized-loss breaker, a 10%
   entry-cost drawdown breaker, five-position cap, and two-provider entry gate.
   Promotion is a paper-policy decision, not proof of statistical superiority.
-- Legacy `run_full_loop.py --live` exits before constructing a client.
+- Legacy `legacy/run_full_loop.py --live` exits before constructing a client.
 - Repository watchdog is status-only and cannot launch the bot.
 - No Polymarket Hermes/Claude cron is required or configured.
 - Manual positions can be marked observe-only through the ignored local `.env`;
   reconciliation never sells, cancels, merges, or redeems them.
+
+## Repository layout
+
+```text
+src/v3/        Current paper worker, math, risk, ledger, weather research
+run_v3.py      CLI entrypoint (validate-config, paper-run, paper-status, reports)
+scripts/       Status, reporting, reconciliation and research helpers
+config/        Gate registry and other static configuration
+legacy/        April-era loop (run_full_loop.py) and its modules; live disabled
+tests/         Test suite (tests/v3 for current code, tests/legacy for old loop)
+docs/          Remediation status and historical notes
+.github/       CI workflow (compile check + pytest)
+```
 
 ## V3 architecture
 
@@ -212,7 +231,7 @@ commit account-derived events or candidate records.
 
 ```bash
 python -m pytest tests -q
-python -m py_compile src/v3/*.py src/v3/strategies/*.py run_v3.py
+python -m compileall -q src scripts legacy run_v3.py
 ```
 
 V3 tests cover fee curves, depth-aware VWAP, complete-set net edge, correlated

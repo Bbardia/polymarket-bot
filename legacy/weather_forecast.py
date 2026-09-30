@@ -24,7 +24,7 @@ from typing import Optional
 from loguru import logger
 from scipy.stats import norm
 
-from src.config import Config
+from legacy.config import Config
 
 
 # Market title patterns

@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from src.forecast_scanner import ForecastScanner
+from legacy.forecast_scanner import ForecastScanner
 
 
 @dataclass

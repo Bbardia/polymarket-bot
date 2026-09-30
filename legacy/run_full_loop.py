@@ -14,24 +14,24 @@ import argparse
 from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from loguru import logger
-from src.config import Config
-from src.kelly import KellySizer, DynamicKellySizer
-from src.portfolio import PortfolioTracker, Position, ClosedTrade
-from src.whale_tracker import WhaleTracker
-from src.btc_sniper import BTCSniper
-from src.btc_straddle import BTCStraddle
-from src.weather_forecast import WeatherForecast
-from src.forecast_scanner import ForecastScanner
-from src.edge_math import dynamic_min_edge, executable_buy_price
+from legacy.config import Config
+from legacy.kelly import KellySizer, DynamicKellySizer
+from legacy.portfolio import PortfolioTracker, Position, ClosedTrade
+from legacy.whale_tracker import WhaleTracker
+from legacy.btc_sniper import BTCSniper
+from legacy.btc_straddle import BTCStraddle
+from legacy.weather_forecast import WeatherForecast
+from legacy.forecast_scanner import ForecastScanner
+from legacy.edge_math import dynamic_min_edge, executable_buy_price
 
-LOG_DIR = Path(__file__).parent / "logs"
+LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 logger.add(LOG_DIR / "loop_v2_{time}.log", rotation="1 day", retention="7 days", level="DEBUG")
 
-TRADES_FILE = Path(__file__).parent / "data" / "loop_v2_trades.jsonl"
+TRADES_FILE = Path(__file__).resolve().parent.parent / "data" / "loop_v2_trades.jsonl"
 
 LEGACY_LIVE_DISABLED_MESSAGE = (
     "Legacy live trading is permanently disabled: use the V3 foundation."
@@ -51,7 +51,7 @@ def _execute_trade(pm, token_id, price, cost, signal, portfolio=None) -> dict:
     _refuse_legacy_live()
     from py_clob_client.clob_types import OrderArgs, OrderType
     from py_clob_client.order_builder.constants import BUY
-    from src.orderbook_utils import check_orderbook_quality
+    from legacy.orderbook_utils import check_orderbook_quality
 
     # Execution-time BUY_NO cap re-check (signal price may have drifted)
     if hasattr(signal, 'side') and signal.side == "BUY_NO" and 0.25 < price < 0.80:
@@ -508,7 +508,7 @@ def run_forecast_scanner_strategy(
     """
     if not dry_run:
         _refuse_legacy_live()
-    from src.polymarket_client import PolymarketClient
+    from legacy.polymarket_client import PolymarketClient
 
     # Need a PolymarketClient for Gamma API market discovery
     pm_client = PolymarketClient()
@@ -1385,7 +1385,7 @@ def _sync_untracked_positions(portfolio, dry_run: bool = True):
         from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
         from py_clob_client.client import ClobClient
 
-        v1_file = Path(__file__).parent / "data" / "live_trades.jsonl"
+        v1_file = Path(__file__).resolve().parent.parent / "data" / "live_trades.jsonl"
         if not v1_file.exists():
             return
 
@@ -1479,11 +1479,11 @@ def main():
     kelly = DynamicKellySizer(
         inner=base_kelly,
         peak_bankroll=args.budget,
-        history_path=str(Path(__file__).parent / "data" / "kelly_history.json"),
+        history_path=str(Path(__file__).resolve().parent.parent / "data" / "kelly_history.json"),
     )
 
     portfolio = PortfolioTracker(
-        data_dir=str(Path(__file__).parent / "data"),
+        data_dir=str(Path(__file__).resolve().parent.parent / "data"),
         max_positions=args.max_positions,
         daily_loss_limit_pct=0.15,
         max_drawdown_pct=0.25,
@@ -1499,16 +1499,16 @@ def main():
 
     CASH_FLOOR = 0.0
 
-    whale_tracker = WhaleTracker(data_dir=str(Path(__file__).parent / "data"))
-    btc_sniper = BTCSniper(data_dir=str(Path(__file__).parent / "data"))
-    btc_straddle = BTCStraddle(data_dir=str(Path(__file__).parent / "data"))
+    whale_tracker = WhaleTracker(data_dir=str(Path(__file__).resolve().parent.parent / "data"))
+    btc_sniper = BTCSniper(data_dir=str(Path(__file__).resolve().parent.parent / "data"))
+    btc_straddle = BTCStraddle(data_dir=str(Path(__file__).resolve().parent.parent / "data"))
     weather_forecast = WeatherForecast()
     forecast_scanner = ForecastScanner()
 
     pm = None
     if not dry_run:
         try:
-            from src.polymarket_client import PolymarketClient
+            from legacy.polymarket_client import PolymarketClient
             pm = PolymarketClient()
             pm.init_trading_client()
         except Exception as e:
