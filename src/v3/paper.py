@@ -78,6 +78,93 @@ def _decimal_env(name: str, default: str) -> Decimal:
     return value
 
 
+def weather_policy_from_env() -> WeatherPaperPolicy:
+    """V7 weather policy from V3_PAPER_WEATHER_* settings (shared by paper and live)."""
+    return WeatherPaperPolicy(
+        enabled=_env_bool("V3_PAPER_WEATHER_ENABLED", True),
+        horizon_days=int(os.getenv("V3_PAPER_WEATHER_HORIZON_DAYS", "3")),
+        discovery_limit=int(os.getenv("V3_PAPER_WEATHER_DISCOVERY_LIMIT", "1500")),
+        market_limit=int(os.getenv("V3_PAPER_WEATHER_MARKET_LIMIT", "100")),
+        min_liquidity=_decimal_env("V3_PAPER_WEATHER_MIN_LIQUIDITY", "1000"),
+        min_price=_decimal_env("V3_PAPER_WEATHER_MIN_PRICE", "0.02"),
+        max_price=_decimal_env("V3_PAPER_WEATHER_MAX_PRICE", "0.98"),
+        max_order_notional=_decimal_env("V3_PAPER_WEATHER_MAX_ORDER_NOTIONAL", "5"),
+        max_open_positions=int(os.getenv("V3_PAPER_WEATHER_MAX_OPEN_POSITIONS", "15")),
+        base_edge=_decimal_env("V3_PAPER_WEATHER_BASE_EDGE", "0.03"),
+        intraclass_correlation=_decimal_env("V3_PAPER_WEATHER_ICC", "0.05"),
+        prior_strength=_decimal_env("V3_PAPER_WEATHER_PRIOR_STRENGTH", "10"),
+        fractional_kelly=_decimal_env("V3_PAPER_WEATHER_FRACTIONAL_KELLY", "0.05"),
+        kelly_sizing_enabled=_strict_env_bool("V3_PAPER_WEATHER_KELLY_SIZING_ENABLED", False),
+        uncertainty_z=_decimal_env("V3_PAPER_WEATHER_UNCERTAINTY_Z", "1"),
+        observations_enabled=_env_bool(
+            "V3_PAPER_WEATHER_OBSERVATIONS_ENABLED",
+            True,
+        ),
+        require_healthy_forecast=_env_bool(
+            "V3_PAPER_WEATHER_REQUIRE_HEALTHY_FORECAST",
+            False,
+        ),
+        minimum_provider_count=int(
+            os.getenv("V3_PAPER_WEATHER_MIN_PROVIDER_COUNT", "2")
+        ),
+        ladder_enabled=_strict_env_bool(
+            "V3_PAPER_WEATHER_LADDER_ENABLED", False
+        ),
+        ladder_width=int(os.getenv("V3_PAPER_WEATHER_LADDER_WIDTH", "3")),
+        ladder_min_expected_profit=_decimal_env(
+            "V3_PAPER_WEATHER_LADDER_MIN_EXPECTED_PROFIT", "0.02"
+        ),
+        ladder_min_cluster_probability=_decimal_env(
+            "V3_PAPER_WEATHER_LADDER_MIN_CLUSTER_PROBABILITY", "0.60"
+        ),
+        ladder_max_basket_cost=_decimal_env(
+            "V3_PAPER_WEATHER_LADDER_MAX_BASKET_COST", "5"
+        ),
+    )
+
+
+def build_weather_forecast(
+    data_dir: Path, *, max_requests_per_day: int, cache_seconds: float,
+) -> ResilientForecastEnsemble:
+    """The V7 provider ensemble and calibrator, rooted in ``data_dir``."""
+    return ResilientForecastEnsemble(
+        (
+            OpenMeteoEnsemble(
+                quota_path=data_dir / "open_meteo_quota.json",
+                max_requests_per_day=max_requests_per_day,
+                cache_seconds=cache_seconds,
+            ),
+            MetNoLocationForecast(),
+            SevenTimerForecast(),
+            NWSGridForecast(),
+            JMAForecast(),
+        ),
+        calibrator=ProbabilityCalibration(data_dir / CALIBRATION_FILENAME),
+    )
+
+
+def station_metadata_reason(metadata_path: Path | None, city: str) -> str | None:
+    """Fail-closed resolver-station check shared by paper and live entries."""
+    from .paper_weather import CITY_STATIONS, CITY_COORDS, CITY_TIMEZONES
+    if metadata_path is None:
+        return "station metadata unavailable; entries refused"
+    try:
+        metadata = StationMetadata.from_path(metadata_path)
+        station = CITY_STATIONS.get(city)
+        result = verify_station_for_city(city=city, expected_station=station,
+            city_coordinates=CITY_COORDS.get(city),
+            parsed=ResolverIdentity(station, "weather.gov-timeseries", station is not None, "upstream per-market rules verified"),
+            metadata=metadata)
+        record = metadata.get(station) if station else None
+        if not result.verified:
+            return result.reason
+        if record is None or record.timezone != CITY_TIMEZONES.get(city):
+            return "station metadata timezone missing or differs from configured zone"
+        return None
+    except (ValueError, OSError, TypeError) as exc:
+        return f"invalid station metadata: {exc}"
+
+
 @dataclass(frozen=True)
 class PaperSettings:
     data_dir: Path
@@ -231,47 +318,7 @@ class PaperSettings:
             hybrid_runner_target_return=_decimal_env(
                 "V3_PAPER_HYBRID_RUNNER_TARGET_RETURN", "0.50"
             ),
-            weather_policy=WeatherPaperPolicy(
-                enabled=_env_bool("V3_PAPER_WEATHER_ENABLED", True),
-                horizon_days=int(os.getenv("V3_PAPER_WEATHER_HORIZON_DAYS", "3")),
-                discovery_limit=int(os.getenv("V3_PAPER_WEATHER_DISCOVERY_LIMIT", "1500")),
-                market_limit=int(os.getenv("V3_PAPER_WEATHER_MARKET_LIMIT", "100")),
-                min_liquidity=_decimal_env("V3_PAPER_WEATHER_MIN_LIQUIDITY", "1000"),
-                min_price=_decimal_env("V3_PAPER_WEATHER_MIN_PRICE", "0.02"),
-                max_price=_decimal_env("V3_PAPER_WEATHER_MAX_PRICE", "0.98"),
-                max_order_notional=_decimal_env("V3_PAPER_WEATHER_MAX_ORDER_NOTIONAL", "5"),
-                max_open_positions=int(os.getenv("V3_PAPER_WEATHER_MAX_OPEN_POSITIONS", "15")),
-                base_edge=_decimal_env("V3_PAPER_WEATHER_BASE_EDGE", "0.03"),
-                intraclass_correlation=_decimal_env("V3_PAPER_WEATHER_ICC", "0.05"),
-                prior_strength=_decimal_env("V3_PAPER_WEATHER_PRIOR_STRENGTH", "10"),
-                fractional_kelly=_decimal_env("V3_PAPER_WEATHER_FRACTIONAL_KELLY", "0.05"),
-                kelly_sizing_enabled=_strict_env_bool("V3_PAPER_WEATHER_KELLY_SIZING_ENABLED", False),
-                uncertainty_z=_decimal_env("V3_PAPER_WEATHER_UNCERTAINTY_Z", "1"),
-                observations_enabled=_env_bool(
-                    "V3_PAPER_WEATHER_OBSERVATIONS_ENABLED",
-                    True,
-                ),
-                require_healthy_forecast=_env_bool(
-                    "V3_PAPER_WEATHER_REQUIRE_HEALTHY_FORECAST",
-                    False,
-                ),
-                minimum_provider_count=int(
-                    os.getenv("V3_PAPER_WEATHER_MIN_PROVIDER_COUNT", "2")
-                ),
-                ladder_enabled=_strict_env_bool(
-                    "V3_PAPER_WEATHER_LADDER_ENABLED", False
-                ),
-                ladder_width=int(os.getenv("V3_PAPER_WEATHER_LADDER_WIDTH", "3")),
-                ladder_min_expected_profit=_decimal_env(
-                    "V3_PAPER_WEATHER_LADDER_MIN_EXPECTED_PROFIT", "0.02"
-                ),
-                ladder_min_cluster_probability=_decimal_env(
-                    "V3_PAPER_WEATHER_LADDER_MIN_CLUSTER_PROBABILITY", "0.60"
-                ),
-                ladder_max_basket_cost=_decimal_env(
-                    "V3_PAPER_WEATHER_LADDER_MAX_BASKET_COST", "5"
-                ),
-            ),
+            weather_policy=weather_policy_from_env(),
         )
 
     @property
@@ -734,20 +781,10 @@ class PaperWorker:
         self.store.flush_pending_audits(self.state)
         self.forecast = forecast
         if self.forecast is None and settings.weather_policy.enabled:
-            calibrator = ProbabilityCalibration(store.data_dir / CALIBRATION_FILENAME)
-            self.forecast = ResilientForecastEnsemble(
-                (
-                    OpenMeteoEnsemble(
-                        quota_path=store.data_dir / "open_meteo_quota.json",
-                        max_requests_per_day=settings.open_meteo_max_requests_per_day,
-                        cache_seconds=settings.open_meteo_cache_seconds,
-                    ),
-                    MetNoLocationForecast(),
-                    SevenTimerForecast(),
-                    NWSGridForecast(),
-                    JMAForecast(),
-                ),
-                calibrator=calibrator,
+            self.forecast = build_weather_forecast(
+                store.data_dir,
+                max_requests_per_day=settings.open_meteo_max_requests_per_day,
+                cache_seconds=settings.open_meteo_cache_seconds,
             )
         self.observation_provider = observation_provider
         if (
@@ -867,24 +904,7 @@ class PaperWorker:
         )
 
     def _station_metadata_reason(self, city: str) -> str | None:
-        from .paper_weather import CITY_STATIONS, CITY_COORDS, CITY_TIMEZONES
-        if self.settings.station_metadata_path is None:
-            return "station metadata unavailable; entries refused"
-        try:
-            metadata = StationMetadata.from_path(self.settings.station_metadata_path)
-            station = CITY_STATIONS.get(city)
-            result = verify_station_for_city(city=city, expected_station=station,
-                city_coordinates=CITY_COORDS.get(city),
-                parsed=ResolverIdentity(station, "weather.gov-timeseries", station is not None, "upstream per-market rules verified"),
-                metadata=metadata)
-            record = metadata.get(station) if station else None
-            if not result.verified:
-                return result.reason
-            if record is None or record.timezone != CITY_TIMEZONES.get(city):
-                return "station metadata timezone missing or differs from configured zone"
-            return None
-        except (ValueError, OSError, TypeError) as exc:
-            return f"invalid station metadata: {exc}"
+        return station_metadata_reason(self.settings.station_metadata_path, city)
 
     async def _entry_books_reason(self, token_ids: list[str]) -> str | None:
         """Recheck public source timestamps and executable top levels at fill time."""

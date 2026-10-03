@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 from src.v3.api import UnifiedPolymarketAPI
 from src.v3.config import V3Settings
+from src.v3.live_shadow import LiveShadowSettings, run_live_shadow
 from src.v3.paper import PaperSettings, paper_status, run_paper
 from src.v3.simulation import (
     evaluate_shadow_candidates,
@@ -147,6 +148,36 @@ def paper_run(*, cycles: int, interval: float | None) -> int:
     return 0
 
 
+def live_shadow(*, env_file: Path, cycles: int, interval: float | None) -> int:
+    """Read-only shadow of live V7 entries; never builds the order client."""
+    load_dotenv(env_file, override=False)
+    settings = V3Settings.from_env()
+    if settings.live_enabled or not settings.paper_trading:
+        raise RuntimeError(
+            "live-shadow refuses a live-enabled profile: keep ENABLE_V3_LIVE_TRADING=false "
+            "and PAPER_TRADING=true"
+        )
+    shadow = LiveShadowSettings.from_env(ROOT)
+    if interval is not None:
+        shadow = replace(shadow, scan_interval_seconds=interval)
+    print("Account reads: " + (
+        "ENABLED (read-only)" if not settings.account_client_errors()
+        else "disabled (" + "; ".join(settings.account_client_errors()) + ")"
+    ), flush=True)
+    asyncio.run(run_live_shadow(settings, shadow, cycles=cycles))
+    return 0
+
+
+def live_shadow_status() -> int:
+    load_dotenv(ROOT / ".env.live", override=False)
+    status_path = LiveShadowSettings.from_env(ROOT).data_dir / "status.json"
+    if not status_path.is_file():
+        print(json.dumps({"mode": "LIVE_SHADOW", "state": "not_started"}))
+        return 0
+    print(status_path.read_text(encoding="utf-8"))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Operate the paper-first Polymarket V3 foundation.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -178,6 +209,14 @@ def main() -> int:
         "paper-status",
         help="Show local paper-worker health without network or account access.",
     )
+    live_shadow_parser = subparsers.add_parser(
+        "live-shadow",
+        help="Read-only live shadow of V7 entries; logs intents, never submits.",
+    )
+    live_shadow_parser.add_argument("--env-file", type=Path, default=ROOT / ".env.live")
+    live_shadow_parser.add_argument("--cycles", type=int, default=0)
+    live_shadow_parser.add_argument("--interval", type=float)
+    subparsers.add_parser("live-shadow-status", help="Show the last live-shadow status.")
     args = parser.parse_args()
     try:
         if args.command == "validate-config":
@@ -190,6 +229,10 @@ def main() -> int:
             return replay_report(args.path)
         if args.command == "paper-status":
             return paper_status_report()
+        if args.command == "live-shadow":
+            return live_shadow(env_file=args.env_file, cycles=args.cycles, interval=args.interval)
+        if args.command == "live-shadow-status":
+            return live_shadow_status()
         return paper_run(cycles=args.cycles, interval=args.interval)
     except (OSError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))

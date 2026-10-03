@@ -1,3 +1,25 @@
+# Live-readiness status (2026-10-03, afternoon update)
+
+## Decision: still NO-GO for real orders; read-only live shadow added
+
+Market and venue facts checked online on 2026-10-03:
+- Polymarket's geoblock endpoint reports this host (CH) as not blocked, and Switzerland is not on Polymarket's restricted list. Switzerland's Gespa has had polymarket.com on its blocked-domain list since November 2024, so the legal decision stays with the account owner.
+- Current weather markets are protocol `v1`, `orderMinSize` 5, with fee schedule `rate 0.05, exponent 1, takerOnly true, rebateRate 0.25`. Post-only maker entries therefore pay no fee, which is the only schedule the V7 bridge accepts.
+- `polymarket-client` 0.12.0 is current; 0.6.0 is pinned here. 0.9.0 added trading for Poly V2 market identifiers and 0.10.0 moved data reads to Data API v2 (breaking). Weather markets are still v1, so 0.6.0 can trade them today, but the pin must be upgraded before any v2 weather market appears.
+
+New in this pass:
+- `run_v3.py live-shadow` (`src/v3/live_shadow.py`, profile template `config/templates/env.live.template`): runs the unchanged V7 weather evaluation and selection, the resolver-station gate, a fresh verified market context, the unchanged `propose_v7_weather_order` bridge, and the real `RiskEngine` with the user limits. It logs every would-be order to `shadow_intents.jsonl`. With `ENABLE_V3_ACCOUNT_READS=true` it also reads the account snapshot and trade history and reports whether the strict reconciliation and trade-history gates would block. It refuses to start with live trading enabled and never constructs the order client.
+- Shared helpers `weather_policy_from_env`, `station_metadata_reason` and `build_weather_forecast` in `paper.py`, so paper and shadow use identical policy code.
+
+Blocked in this session by the auto-mode safety classifier (not applied; needs explicit user permission):
+- Limiting startup trade-history recovery to trades after an account baseline. Without it, any pre-existing manual trade on the account latches the live service closed.
+- Treating resolved (redeemable) positions as zero open risk. Without it, lost positions count against exposure and position caps until redeemed.
+- Treating managed post-only maker fills with no reported fee rate as fee-free. Without it, such a fill latches reconciliation.
+
+V7 signal frequency: the V7 main paper ledger shows only a few real directional candidates per day (20 rows on 2026-10-01, 18 already traded), so the shadow must run for days to measure how often the strict bridge (unchanged book hash between signal and fresh context) actually proposes an order.
+
+---
+
 # Live-readiness status (2026-10-03)
 
 ## Decision: NO-GO
