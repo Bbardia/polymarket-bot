@@ -20,17 +20,35 @@ class RiskLimits:
     max_open_orders: int
     max_positions: int
     daily_loss_limit: Decimal
-    max_drawdown_fraction: Decimal
     max_quote_age_seconds: int
     max_order_ttl_seconds: int
+    max_drawdown_amount: Decimal = ZERO
+    max_drawdown_fraction: Decimal | None = None
 
     def __post_init__(self) -> None:
+        numeric = (
+            self.max_capital, self.reserve_fraction, self.max_order_notional,
+            self.max_event_exposure, self.daily_loss_limit, self.max_drawdown_amount,
+        )
+        if any(not value.is_finite() for value in numeric):
+            raise ValueError("risk limits must be finite")
         if self.max_capital <= ZERO or self.max_order_notional <= ZERO:
             raise ValueError("capital and order limits must be positive")
+        if self.max_event_exposure <= ZERO or self.daily_loss_limit <= ZERO:
+            raise ValueError("event exposure and daily loss limits must be positive")
+        if self.max_drawdown_amount <= ZERO:
+            raise ValueError("maximum drawdown amount must be positive")
+        if self.max_drawdown_fraction is not None and (
+            not self.max_drawdown_fraction.is_finite()
+            or not (ZERO < self.max_drawdown_fraction < ONE)
+        ):
+            raise ValueError("max drawdown fraction must be in (0, 1)")
+        if min(self.max_open_orders, self.max_positions, self.max_quote_age_seconds) < 0:
+            raise ValueError("count and quote-age limits cannot be negative")
+        if self.max_order_ttl_seconds <= 0:
+            raise ValueError("maximum order TTL must be positive")
         if not (ZERO <= self.reserve_fraction < ONE):
             raise ValueError("reserve fraction must be in [0, 1)")
-        if not (ZERO < self.max_drawdown_fraction < ONE):
-            raise ValueError("max drawdown fraction must be in (0, 1)")
 
 
 @dataclass(frozen=True)
@@ -61,8 +79,8 @@ class OrderIntent:
     quote_age_seconds: int
     tick_size: Decimal = Decimal("0.01")
     min_order_size: Decimal = Decimal("5")
-    market_accepting_orders: bool = True
-    rules_verified: bool = True
+    market_accepting_orders: bool = False
+    rules_verified: bool = False
     disputed: bool = False
 
     @property
@@ -84,6 +102,28 @@ class RiskEngine:
         self.limits = limits
 
     def evaluate(self, intent: OrderIntent, state: AccountRiskState) -> RiskDecision:
+        raw_values = (
+            state.equity, state.cash, state.total_exposure, state.daily_pnl, state.peak_equity,
+            intent.price, intent.shares, intent.estimated_fee, intent.tick_size, intent.min_order_size,
+        )
+        if (
+            any(not isinstance(value, Decimal) for value in raw_values)
+            or not isinstance(state.event_exposure, dict)
+            or any(not isinstance(value, Decimal) for value in state.event_exposure.values())
+            or any(type(value) is not int for value in (
+                state.open_orders, state.open_positions,
+                state.unknown_remote_positions, state.unknown_remote_orders,
+            ))
+        ):
+            return RiskDecision(False, "risk inputs have invalid types", ZERO, ZERO, ZERO)
+        state_values = (
+            state.equity, state.cash, state.total_exposure, state.daily_pnl, state.peak_equity,
+        )
+        intent_values = (
+            intent.price, intent.shares, intent.estimated_fee, intent.tick_size, intent.min_order_size,
+        )
+        if any(not value.is_finite() for value in (*state_values, *intent_values)):
+            return RiskDecision(False, "risk inputs must be finite", ZERO, ZERO, ZERO)
         capital_base = min(max(state.equity, ZERO), self.limits.max_capital)
         deployable = capital_base * (ONE - self.limits.reserve_fraction)
         notional = intent.all_in_notional
@@ -91,6 +131,16 @@ class RiskEngine:
         def reject(reason: str) -> RiskDecision:
             return RiskDecision(False, reason, capital_base, deployable, notional)
 
+        if (
+            state.equity < ZERO or state.cash < ZERO or state.total_exposure < ZERO
+            or state.peak_equity < ZERO or intent.price <= ZERO or intent.shares <= ZERO
+            or intent.estimated_fee < ZERO or intent.tick_size <= ZERO
+            or intent.min_order_size <= ZERO
+            or any(not value.is_finite() or value < ZERO for value in state.event_exposure.values())
+            or min(state.open_orders, state.open_positions, state.unknown_remote_positions,
+                   state.unknown_remote_orders) < 0
+        ):
+            return reject("risk inputs are outside valid ranges")
         if not state.reconciled:
             return reject("account state is not reconciled")
         if state.unknown_remote_positions:
@@ -122,8 +172,12 @@ class RiskEngine:
         if state.daily_pnl <= -self.limits.daily_loss_limit:
             return reject("daily loss limit reached")
         if state.peak_equity > ZERO:
-            drawdown = (state.peak_equity - state.equity) / state.peak_equity
-            if drawdown >= self.limits.max_drawdown_fraction:
+            drawdown_amount = state.peak_equity - state.equity
+            if drawdown_amount >= self.limits.max_drawdown_amount:
+                return reject("maximum drawdown reached")
+            if self.limits.max_drawdown_fraction is not None and (
+                drawdown_amount / state.peak_equity >= self.limits.max_drawdown_fraction
+            ):
                 return reject("maximum drawdown reached")
         if notional > self.limits.max_order_notional:
             return reject("order exceeds max order notional")

@@ -39,11 +39,20 @@ class LedgerEvent:
 
 class EventLedger:
     def __init__(self, path: str | Path) -> None:
+        self._in_memory = str(path) == ":memory:"
+        self._memory_connection: sqlite3.Connection | None = None
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self._in_memory:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
+        if self._in_memory:
+            if self._memory_connection is None:
+                connection = sqlite3.connect(":memory:")
+                connection.execute("PRAGMA synchronous=FULL")
+                self._memory_connection = connection
+            return self._memory_connection
         connection = sqlite3.connect(self.path)
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=FULL")

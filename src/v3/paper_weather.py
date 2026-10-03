@@ -773,6 +773,11 @@ class WeatherEvaluation:
     sizing_budget: Decimal | None = None
     venue_minimum_shares: Decimal | None = None
     fee_rate: Decimal | None = None
+    fee_exponent: Decimal | None = None
+    taker_only: bool | None = None
+    decision_timestamp: datetime | None = None
+    book_timestamp: datetime | None = None
+    book_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2340,6 +2345,7 @@ def _side_evaluation(
     observation_error: str | None,
     observation_status: str,
     trade_block_reason: str | None,
+    decision_timestamp: datetime,
 ) -> WeatherEvaluation | None:
     if not context.accepting_orders or context.fee_rate is None:
         return None
@@ -2466,6 +2472,11 @@ def _side_evaluation(
         sizing_budget=sizing_budget,
         venue_minimum_shares=venue_minimum,
         fee_rate=context.fee_rate,
+        fee_exponent=context.fee_exponent,
+        taker_only=context.taker_only,
+        decision_timestamp=decision_timestamp,
+        book_timestamp=context.book_timestamp,
+        book_hash=context.book_hash,
         same_day_contract=same_day_contract,
         same_day_observation_available=observation.same_day_observation_available,
         current_high_display=observation.current_high_display,
@@ -2842,20 +2853,24 @@ async def evaluate_weather_universe(
             by_token = {str(book.token_id): book for book in books}
             if yes_token not in by_token or no_token not in by_token:
                 raise ValueError("weather book response omitted an outcome token")
-            context = MarketContext.from_sdk(market, by_token[yes_token])
-            if not context.negative_risk:
+            yes_context = MarketContext.from_sdk(market, by_token[yes_token])
+            no_context = MarketContext.from_sdk(market, by_token[no_token])
+            if not yes_context.negative_risk or not no_context.negative_risk:
                 continue
             if (
-                context.accepting_orders
-                and context.rules_verified
-                and context.fee_rate is not None
+                yes_context.accepting_orders
+                and no_context.accepting_orders
+                and yes_context.rules_verified
+                and no_context.rules_verified
+                and yes_context.fee_rate is not None
+                and no_context.fee_rate is not None
             ):
                 components[str(market.id)] = _SurfaceComponent(
                     market=market,
                     contract=contract,
                     forecast=point_forecast,
                     yes_book=by_token[yes_token],
-                    context=context,
+                    context=yes_context,
                 )
             options = tuple(filter(None, (
                 _side_evaluation(
@@ -2865,13 +2880,14 @@ async def evaluate_weather_universe(
                     yes_probability=observation.probability,
                     side="YES",
                     book=by_token[yes_token],
-                    context=context,
+                    context=yes_context,
                     policy=policy,
                     same_day_contract=same_day_contract,
                     observation=observation,
                     observation_error=observation_error,
                     observation_status=observation_status,
                     trade_block_reason=trade_block_reason,
+                    decision_timestamp=now,
                 ),
                 _side_evaluation(
                     market=market,
@@ -2880,13 +2896,14 @@ async def evaluate_weather_universe(
                     yes_probability=observation.probability,
                     side="NO",
                     book=by_token[no_token],
-                    context=context,
+                    context=no_context,
                     policy=policy,
                     same_day_contract=same_day_contract,
                     observation=observation,
                     observation_error=observation_error,
                     observation_status=observation_status,
                     trade_block_reason=trade_block_reason,
+                    decision_timestamp=now,
                 ),
             )))
             if options:

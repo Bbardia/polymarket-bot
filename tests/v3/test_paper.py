@@ -837,7 +837,7 @@ def test_no_weather_position_loss_settles_with_correct_brier_and_no_duplicate(tm
 def test_paper_early_exit_uses_full_bid_depth_fees_and_persists_audit(tmp_path):
     opened = market()
     opened.trading.fees_enabled = True
-    opened.trading.fee_schedule = SimpleNamespace(rate=D("0.05"))
+    opened.trading.fee_schedule = SimpleNamespace(rate=D("0.05"), exponent=1, taker_only=True)
     exit_book = book("yes-token", ask="0.50", bid="0.40")
     exit_book.bids = (
         SimpleNamespace(price=D("0.40"), size=D("3")),
@@ -888,7 +888,7 @@ def test_paper_early_exit_uses_full_bid_depth_fees_and_persists_audit(tmp_path):
 def test_exit_threshold_uses_fees_from_best_bids(tmp_path, hybrid, runner):
     opened = market()
     opened.trading.fees_enabled = True
-    opened.trading.fee_schedule = SimpleNamespace(rate=D("0.05"))
+    opened.trading.fee_schedule = SimpleNamespace(rate=D("0.05"), exponent=1, taker_only=True)
     exit_book = book("yes-token", ask="0.50", bid="0.40")
     exit_book.bids = (
         SimpleNamespace(price=D("0.01"), size=D("100")),
@@ -961,7 +961,7 @@ def test_paper_early_exit_refuses_shallow_bid_books_without_mutation(tmp_path):
 def test_paper_hybrid_exit_keeps_runner_then_exits_at_higher_target(tmp_path):
     opened = market()
     opened.trading.fees_enabled = True
-    opened.trading.fee_schedule = SimpleNamespace(rate=D("0.05"))
+    opened.trading.fee_schedule = SimpleNamespace(rate=D("0.05"), exponent=1, taker_only=True)
     exit_book = book("yes-token", ask="0.50", bid="0.40")
     client = FakePublicClient([opened], [exit_book])
     store = PaperStore(tmp_path)
@@ -1389,6 +1389,9 @@ def test_worker_uses_injected_observations_and_reports_availability_and_errors(t
     evaluation = next(row for row in weather_rows if row.get("market_id") == "observed")
     assert evaluation["tradeable"] is False
     assert evaluation["observation_error"] == "ConnectionError: NOAA unavailable"
+    assert evaluation["decision_timestamp"] == "2026-08-25T01:00:00+00:00"
+    assert datetime.fromisoformat(evaluation["book_timestamp"]).tzinfo is not None
+    assert evaluation["book_hash"] in {"hash-yes-observed", "hash-no-observed"}
 
 
 def test_forecast_outage_is_unhealthy_and_distinct_from_zero_candidates(tmp_path):

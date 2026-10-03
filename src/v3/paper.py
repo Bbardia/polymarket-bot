@@ -1179,6 +1179,15 @@ class PaperWorker:
         forecast = evaluation.forecast
         return {
             "scanned_at": scanned_at,
+            "decision_timestamp": (
+                None if evaluation.decision_timestamp is None
+                else evaluation.decision_timestamp.isoformat()
+            ),
+            "book_timestamp": (
+                None if evaluation.book_timestamp is None
+                else evaluation.book_timestamp.isoformat()
+            ),
+            "book_hash": evaluation.book_hash,
             "forecast_model_version": FORECAST_MODEL_VERSION,
             "strategy": evaluation.strategy,
             "event_key": evaluation.event_key,
@@ -1236,6 +1245,8 @@ class PaperWorker:
             "sizing_budget": None if evaluation.sizing_budget is None else str(evaluation.sizing_budget),
             "venue_minimum_shares": None if evaluation.venue_minimum_shares is None else str(evaluation.venue_minimum_shares),
             "fee_rate": None if evaluation.fee_rate is None else str(evaluation.fee_rate),
+            "fee_exponent": None if evaluation.fee_exponent is None else str(evaluation.fee_exponent),
+            "taker_only": evaluation.taker_only,
             "fee_source": "gamma_market_schedule_or_disabled",
             "same_day_contract": evaluation.same_day_contract,
             "same_day_observation_available": (

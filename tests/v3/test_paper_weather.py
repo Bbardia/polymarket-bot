@@ -352,7 +352,7 @@ def test_weather_universe_coalesces_global_forecast_outage_and_counts_skipped_ma
 def test_weather_multi_level_fee_matches_depth_summed_all_in_cost_and_decision():
     item = weather_market()
     item.trading.fees_enabled = True
-    item.trading.fee_schedule = SimpleNamespace(rate=D("0.05"))
+    item.trading.fee_schedule = SimpleNamespace(rate=D("0.05"), exponent=1, taker_only=True)
     yes_book = book("yes-weather-1", bid="0.09", ask="0.10")
     yes_book.asks = (
         SimpleNamespace(price=D("0.10"), size=D("2")),

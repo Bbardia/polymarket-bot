@@ -49,5 +49,31 @@ def test_full_confirmed_fill_reaches_filled_state():
 def test_fill_cannot_exceed_requested_size():
     order = OrderAggregate.new(client_order_id="client-1", token_id="token", side="BUY", requested_size=D("5"))
     order.accept(order_id="exchange-1", status="matched")
+    before = (order.state, order.confirmed_size, order.confirmed_notional, order.confirmed_fees, dict(order.trades))
     with pytest.raises(ValueError, match="exceeds requested size"):
         order.record_trade("trade-1", size=D("6"), price=D("0.40"), fee=D("0"), status=TradeStatus.CONFIRMED)
+    assert (order.state, order.confirmed_size, order.confirmed_notional, order.confirmed_fees, order.trades) == before
+
+
+def test_late_confirmation_after_cancel_raises_without_mutating_aggregate():
+    order = OrderAggregate.new(client_order_id="client-1", token_id="token", side="BUY", requested_size=D("10"))
+    order.record_trade("trade-1", size=D("2"), price=D("0.40"), fee=D("0.02"), status=TradeStatus.CONFIRMED)
+    order.cancel()
+    before = (order.state, order.confirmed_size, order.confirmed_notional, order.confirmed_fees, dict(order.trades))
+
+    with pytest.raises(ValueError, match="confirmed trade after cancellation requires reconciliation"):
+        order.record_trade("trade-2", size=D("1"), price=D("0.50"), fee=D("0.01"), status=TradeStatus.CONFIRMED)
+
+    assert (order.state, order.confirmed_size, order.confirmed_notional, order.confirmed_fees, order.trades) == before
+
+
+def test_matched_trade_confirmation_after_cancel_raises_without_mutation():
+    order = OrderAggregate.new(client_order_id="client-1", token_id="token", side="BUY", requested_size=D("10"))
+    order.record_trade("trade-2", size=D("1"), price=D("0.50"), fee=D("0"), status=TradeStatus.MATCHED)
+    order.cancel()
+    before = (order.state, order.confirmed_size, order.confirmed_notional, order.confirmed_fees, order.trades["trade-2"].status)
+
+    with pytest.raises(ValueError, match="confirmed trade after cancellation requires reconciliation"):
+        order.record_trade("trade-2", size=D("1"), price=D("0.50"), fee=D("0.01"), status=TradeStatus.CONFIRMED)
+
+    assert (order.state, order.confirmed_size, order.confirmed_notional, order.confirmed_fees, order.trades["trade-2"].status) == before

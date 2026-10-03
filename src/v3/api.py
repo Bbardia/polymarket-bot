@@ -7,17 +7,49 @@ full V3 live gate. This module exposes no automatic account mutation.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable
-from decimal import Decimal
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import polymarket
 from polymarket import AsyncPublicClient, AsyncSecureClient, BuilderApiKey
 
 from .config import V3Settings
-from .reconciliation import RemoteOrder, RemotePosition, RemoteSnapshot
+from .reconciliation import (
+    TRADE_STATUSES, TRADE_TRADER_SIDES, RemoteOrder, RemotePosition,
+    RemoteSnapshot, RemoteTrade, RemoteTradeMaker,
+)
 
 PUSD_BASE_UNITS = Decimal("1000000")
+ACTIVITY_PAGE_SIZE_CAP = 500
+
+
+
+@dataclass(frozen=True)
+class AccountCashFlow:
+    event_id: str
+    event_type: str
+    timestamp: datetime
+    transaction_hash: str
+    amount: Decimal
+
+    def __post_init__(self) -> None:
+        if self.event_type not in ("DEPOSIT", "WITHDRAWAL"):
+            raise ValueError("event_type must be DEPOSIT or WITHDRAWAL")
+        if not isinstance(self.amount, Decimal) or not self.amount.is_finite() or self.amount <= 0:
+            raise ValueError("amount must be a finite positive Decimal")
+
+    @property
+    def signed_amount(self) -> Decimal:
+        if self.event_type == "DEPOSIT":
+            return self.amount
+        if self.event_type == "WITHDRAWAL":
+            return -self.amount
+        raise ValueError("event_type must be DEPOSIT or WITHDRAWAL")
+
 
 SecureClientFactory = Callable[..., Awaitable[Any]]
 
@@ -79,41 +111,424 @@ class UnifiedPolymarketAPI:
         self._secure_client = await self._secure_client_factory(**kwargs)
         return self._secure_client
 
-    async def fetch_remote_snapshot(self, *, max_items: int = 2_000) -> RemoteSnapshot:
+    async def fetch_remote_snapshot(
+        self, *, max_items: int = 2_000, page_limit: int = 100,
+    ) -> RemoteSnapshot:
         """Read pUSD, positions, and open orders; never mutates the account."""
+        if type(max_items) is not int or max_items <= 0:
+            raise ValueError("max_items must be a positive integer")
+        if type(page_limit) is not int or page_limit <= 0:
+            raise ValueError("page_limit must be a positive integer")
         client = self._authenticated_client()
         balance = await client.get_balance_allowance(asset_type="COLLATERAL")
 
         positions: list[RemotePosition] = []
+        position_tokens: set[str] = set()
+        position_pages = position_rows = 0
         async for page in client.list_positions(size_threshold=0):
-            for position in page.items:
+            position_pages += 1
+            if position_pages > page_limit:
+                raise RuntimeError("position reconciliation page limit exceeded")
+            items = getattr(page, "items", None)
+            if items is None or isinstance(items, (str, bytes)):
+                raise RuntimeError("position reconciliation page has malformed items")
+            try:
+                iterator = iter(items)
+            except TypeError as exc:
+                raise RuntimeError("position reconciliation page has malformed items") from exc
+            for position in iterator:
+                position_rows += 1
+                if position_rows > max_items:
+                    raise RuntimeError("position reconciliation item limit exceeded")
                 size = Decimal(str(position.size or 0))
-                if size > 0 and position.token_id:
+                if not size.is_finite() or size < 0:
+                    raise RuntimeError("position size is invalid")
+                token_id = str(getattr(position, "token_id", "") or "")
+                if token_id:
+                    if token_id in position_tokens:
+                        raise RuntimeError("duplicate position identity in account snapshot")
+                    position_tokens.add(token_id)
+                if size > 0:
+                    condition_id = str(position.condition_id or "")
+                    if not condition_id or not token_id:
+                        raise RuntimeError("position is missing condition/token identity")
+                    if position.current_value is None:
+                        raise RuntimeError("position is missing current value")
+                    if position.initial_value is None:
+                        raise RuntimeError("position is missing initial value")
+                    current_value = Decimal(str(position.current_value))
+                    initial_value = Decimal(str(position.initial_value))
+                    if (
+                        not current_value.is_finite() or current_value < 0
+                        or not initial_value.is_finite() or initial_value < 0
+                    ):
+                        raise RuntimeError("position value is invalid")
                     positions.append(RemotePosition(
-                        condition_id=str(position.condition_id),
-                        token_id=str(position.token_id),
+                        condition_id=condition_id,
+                        token_id=token_id,
                         size=size,
-                        current_value=Decimal(str(position.current_value or 0)),
+                        current_value=current_value,
+                        initial_value=initial_value,
                     ))
-                if len(positions) > max_items:
-                    raise RuntimeError("position reconciliation limit exceeded")
 
         orders: list[RemoteOrder] = []
+        order_ids: set[str] = set()
+        order_pages = order_rows = 0
         async for page in client.list_open_orders():
-            for order in page.items:
+            order_pages += 1
+            if order_pages > page_limit:
+                raise RuntimeError("open-order reconciliation page limit exceeded")
+            items = getattr(page, "items", None)
+            if items is None or isinstance(items, (str, bytes)):
+                raise RuntimeError("open-order reconciliation page has malformed items")
+            try:
+                iterator = iter(items)
+            except TypeError as exc:
+                raise RuntimeError("open-order reconciliation page has malformed items") from exc
+            for order in iterator:
+                order_rows += 1
+                if order_rows > max_items:
+                    raise RuntimeError("open-order reconciliation item limit exceeded")
+                order_id = str(order.id or "")
+                condition_id = str(order.condition_id or "")
+                token_id = str(order.token_id or "")
+                if not order_id or not condition_id or not token_id:
+                    raise RuntimeError("open order is missing identity")
+                price = Decimal(str(order.price))
+                original_size = Decimal(str(order.original_size))
+                size_matched = Decimal(str(order.size_matched))
+                if (
+                    not price.is_finite()
+                    or not original_size.is_finite()
+                    or not size_matched.is_finite()
+                    or price <= 0
+                    or original_size < 0
+                    or size_matched < 0
+                    or size_matched > original_size
+                ):
+                    raise RuntimeError("open order has invalid price or size")
+                if order_id in order_ids:
+                    raise RuntimeError("duplicate open-order identity in account snapshot")
+                order_ids.add(order_id)
                 orders.append(RemoteOrder(
-                    order_id=str(order.id),
-                    condition_id=str(order.condition_id),
-                    token_id=str(order.token_id),
+                    order_id=order_id,
+                    condition_id=condition_id,
+                    token_id=token_id,
+                    remaining_notional=(original_size - size_matched) * price,
                 ))
-                if len(orders) > max_items:
-                    raise RuntimeError("open-order reconciliation limit exceeded")
 
+        cash = Decimal(balance.balance) / PUSD_BASE_UNITS
+        if not cash.is_finite() or cash < 0:
+            raise RuntimeError("collateral balance is invalid")
         return RemoteSnapshot(
-            cash=Decimal(balance.balance) / PUSD_BASE_UNITS,
+            cash=cash,
             positions=tuple(positions),
             open_orders=tuple(orders),
         )
+
+    async def fetch_account_trades(self, *, max_items: int, page_limit: int) -> tuple[RemoteTrade, ...]:
+        """Fetch bounded authenticated trade-history rows; never applies fills to local state."""
+        if type(max_items) is not int or max_items <= 0:
+            raise ValueError("max_items must be a positive integer")
+        if type(page_limit) is not int or page_limit <= 0:
+            raise ValueError("page_limit must be a positive integer")
+        client = self._authenticated_client()
+        records: dict[str, RemoteTrade] = {}
+        raw_rows = pages = maker_rows = 0
+
+        def timestamp(value: Any, *, required: bool) -> datetime | None:
+            if value is None and not required:
+                return None
+            if isinstance(value, datetime):
+                result = value
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                result = datetime.fromtimestamp(value, tz=timezone.utc)
+            else:
+                raise ValueError("timestamp is missing or malformed")
+            if result.tzinfo is None or result.utcoffset() is None:
+                raise ValueError("timestamp is timezone-naive")
+            return result.astimezone(timezone.utc)
+
+        def decimal(value: Any, name: str, *, optional: bool = False) -> Decimal | None:
+            if value is None and optional:
+                return None
+            result = Decimal(str(value))
+            if not result.is_finite() or (result < 0 if "fee" in name else result <= 0):
+                raise ValueError(f"{name} is invalid")
+            return result
+
+        try:
+            async for page in client.list_account_trades():
+                pages += 1
+                if pages > page_limit:
+                    raise RuntimeError("account trade page limit exceeded")
+                items = getattr(page, "items", None)
+                if items is None or isinstance(items, (str, bytes)):
+                    raise ValueError("page items are malformed")
+                try:
+                    iterator = iter(items)
+                except TypeError as exc:
+                    raise ValueError("page items are malformed") from exc
+                for row in iterator:
+                    if raw_rows >= max_items:
+                        raise RuntimeError("account trade item limit exceeded")
+                    raw_rows += 1
+                    trade_id = getattr(row, "id")
+                    condition = getattr(row, "condition_id")
+                    token = getattr(row, "token_id")
+                    taker_order_id = getattr(row, "taker_order_id")
+                    side, trader_side, status = getattr(row, "side"), getattr(row, "trader_side"), getattr(row, "status")
+                    if not all(isinstance(x, str) and x.strip() for x in (trade_id, condition, token, taker_order_id, side, trader_side, status)):
+                        raise ValueError("identity or status missing")
+                    if status not in TRADE_STATUSES:
+                        raise ValueError("unknown trade status")
+                    if trader_side not in TRADE_TRADER_SIDES:
+                        raise ValueError("unknown trader side")
+                    price, size = decimal(getattr(row, "price"), "price"), decimal(getattr(row, "size"), "size")
+                    fee = decimal(getattr(row, "fee_rate_bps"), "fee_rate_bps", optional=True)
+                    makers = []
+                    raw_makers = getattr(row, "maker_orders")
+                    if raw_makers is None or isinstance(raw_makers, (str, bytes)):
+                        raise ValueError("maker_orders malformed")
+                    for maker in raw_makers:
+                        if maker_rows >= max_items:
+                            raise RuntimeError("account trade maker order limit exceeded")
+                        maker_rows += 1
+                        makers.append(RemoteTradeMaker(
+                            order_id=getattr(maker, "order_id"), token_id=getattr(maker, "token_id"),
+                            side=getattr(maker, "side"), price=decimal(getattr(maker, "price"), "maker price"),
+                            matched_amount=decimal(getattr(maker, "matched_amount"), "maker matched amount"),
+                            fee_rate_bps=decimal(getattr(maker, "fee_rate_bps", None), "maker fee_rate_bps", optional=True),
+                        ))
+                    tx_hash = getattr(row, "transaction_hash", None)
+                    if tx_hash is not None and (not isinstance(tx_hash, str) or not re.fullmatch(r"0x[0-9a-fA-F]{64}", tx_hash)):
+                        raise ValueError("transaction hash is invalid")
+                    current = RemoteTrade(
+                        trade_id=trade_id, condition_id=condition, token_id=token, taker_order_id=taker_order_id, side=side,
+                        trader_side=trader_side, price=price, size=size, status=status,
+                        matched_at=timestamp(getattr(row, "matched_at"), required=True),
+                        updated_at=timestamp(getattr(row, "updated_at", None), required=False),
+                        fee_rate_bps=fee, transaction_hash=tx_hash.lower() if tx_hash else None,
+                        maker_orders=tuple(makers),
+                    )
+                    previous = records.get(trade_id)
+                    if previous is not None and previous != current:
+                        raise RuntimeError("conflicting duplicate account trade ID")
+                    records[trade_id] = current
+        except RuntimeError:
+            raise
+        except (AttributeError, TypeError, ValueError, InvalidOperation, OverflowError, OSError) as exc:
+            raise RuntimeError(f"invalid account trade: {exc}") from exc
+        return tuple(sorted(records.values(), key=lambda trade: (trade.matched_at, trade.trade_id)))
+
+    async def fetch_account_cash_flows(
+        self, *, max_items: int = 10_000, page_size: int = ACTIVITY_PAGE_SIZE_CAP
+    ) -> tuple[AccountCashFlow, ...]:
+        """Read bounded public wallet deposit/withdrawal history; not an authoritative risk source."""
+        if type(max_items) is not int or max_items <= 0:
+            raise ValueError("max_items must be positive")
+        if type(page_size) is not int or page_size <= 0 or page_size > ACTIVITY_PAGE_SIZE_CAP:
+            raise ValueError("page_size must be between 1 and 500")
+        wallet = str(self.settings.wallet_address or "").strip()
+        if not wallet:
+            raise RuntimeError("configured wallet is required for cash-flow activity")
+
+        records: dict[str, AccountCashFlow] = {}
+        raw_rows = 0
+        effective_page_size = min(page_size, max_items)
+        page_limit = (max_items + effective_page_size - 1) // effective_page_size + 1
+        pages_consumed = 0
+        async for page in self.public_client.list_activity(
+            user=wallet, activity_types=["DEPOSIT", "WITHDRAWAL"], start=1, page_size=effective_page_size,
+        ):
+            pages_consumed += 1
+            if pages_consumed > page_limit:
+                raise RuntimeError("cash-flow activity page limit exceeded")
+            items = getattr(page, "items", None)
+            if items is None or isinstance(items, (str, bytes)):
+                raise RuntimeError("cash-flow activity page has malformed items")
+            try:
+                iterator = iter(items)
+            except TypeError as exc:
+                raise RuntimeError("cash-flow activity page has malformed items") from exc
+            for row in iterator:
+                if raw_rows >= max_items:
+                    raise RuntimeError("cash-flow activity item limit exceeded")
+                raw_rows += 1
+                try:
+                    kind = getattr(row, "type")
+                    row_wallet = getattr(row, "wallet")
+                    tx_hash = getattr(row, "transaction_hash")
+                    raw_time = getattr(row, "timestamp")
+                    raw_amount = getattr(row, "amount")
+                    if kind not in ("DEPOSIT", "WITHDRAWAL"):
+                        raise ValueError("unexpected activity type")
+                    if not isinstance(row_wallet, str) or row_wallet.lower() != wallet.lower():
+                        raise ValueError("activity wallet mismatch")
+                    if not isinstance(tx_hash, str) or not re.fullmatch(r"0x[0-9a-fA-F]{64}", tx_hash):
+                        raise ValueError("transaction hash must be 0x-prefixed 32-byte hex")
+                    if isinstance(raw_time, datetime):
+                        timestamp = raw_time
+                    elif isinstance(raw_time, (int, float)) and not isinstance(raw_time, bool):
+                        timestamp = datetime.fromtimestamp(raw_time, tz=timezone.utc)
+                    else:
+                        raise ValueError("timestamp is missing or malformed")
+                    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+                        raise ValueError("timestamp is timezone-naive")
+                    timestamp = timestamp.astimezone(timezone.utc)
+                    amount = Decimal(str(raw_amount))
+                    if not amount.is_finite() or amount <= 0:
+                        raise ValueError("amount must be finite and positive")
+                    normalized_hash = tx_hash.strip().lower()
+                    stable_id = f"{normalized_hash}:{kind}"
+                    event = AccountCashFlow(stable_id, kind, timestamp, normalized_hash, amount)
+                except (AttributeError, TypeError, ValueError, InvalidOperation, OverflowError, OSError) as exc:
+                    raise RuntimeError(f"invalid cash-flow activity row: {exc}") from exc
+                previous = records.get(event.event_id)
+                if previous is not None:
+                    if previous != event:
+                        raise RuntimeError("conflicting duplicate cash-flow activity event")
+                    continue
+                records[event.event_id] = event
+        return tuple(sorted(records.values(), key=lambda event: (event.timestamp, event.event_id)))
+
+    async def fetch_account_cash_flows_window(
+        self, *, start: int, end: int, max_items: int = 20_000,
+        page_size: int = ACTIVITY_PAGE_SIZE_CAP, page_limit: int = 10_000,
+        window_limit: int = 1_024,
+    ) -> tuple[AccountCashFlow, ...]:
+        """Fetch a bounded explicit epoch window; this is not proof of complete history."""
+        for name, value in (("start", start), ("end", end), ("max_items", max_items),
+                            ("page_size", page_size), ("page_limit", page_limit),
+                            ("window_limit", window_limit)):
+            if type(value) is not int:
+                raise ValueError(f"{name} must be an integer")
+        if start < 0 or end < start:
+            raise ValueError("start and end must define a nonnegative inclusive window")
+        if max_items <= 0 or page_limit <= 0 or window_limit <= 0:
+            raise ValueError("item, page, and window limits must be positive")
+        if not 0 < page_size <= ACTIVITY_PAGE_SIZE_CAP:
+            raise ValueError("page_size must be between 1 and 500")
+        wallet = str(self.settings.wallet_address or "").strip()
+        if not wallet:
+            raise RuntimeError("configured wallet is required for cash-flow activity")
+
+        records: dict[str, AccountCashFlow] = {}
+        raw_rows = pages_consumed = windows_consumed = 0
+        pending = [(start, end)]
+        try:
+            while pending:
+                lo, hi = pending.pop()
+                windows_consumed += 1
+                if windows_consumed > window_limit:
+                    raise RuntimeError("cash-flow activity window limit exceeded")
+                current_rows = 0
+                current_pages = 0
+                overflow = False
+                previous_timestamp: datetime | None = None
+                async for page in self.public_client.list_activity(
+                    user=wallet, activity_types=["DEPOSIT", "WITHDRAWAL"],
+                    start=lo, end=hi, sort_direction="ASC", page_size=page_size,
+                ):
+                    current_pages += 1
+                    pages_consumed += 1
+                    if pages_consumed > page_limit:
+                        raise RuntimeError("cash-flow activity page limit exceeded")
+                    items = getattr(page, "items", None)
+                    if items is None or isinstance(items, (str, bytes)):
+                        raise RuntimeError("cash-flow activity page has malformed items")
+                    try:
+                        rows = list(iter(items))
+                    except TypeError as exc:
+                        raise RuntimeError("cash-flow activity page has malformed items") from exc
+                    if len(rows) > page_size:
+                        raise RuntimeError("cash-flow activity page exceeds requested page size")
+                    for row in rows:
+                        if raw_rows >= max_items:
+                            raise RuntimeError("cash-flow activity item limit exceeded")
+                        raw_rows += 1
+                        current_rows += 1
+                        try:
+                            kind, row_wallet = getattr(row, "type"), getattr(row, "wallet")
+                            tx_hash, raw_time, raw_amount = getattr(row, "transaction_hash"), getattr(row, "timestamp"), getattr(row, "amount")
+                            if kind not in ("DEPOSIT", "WITHDRAWAL"):
+                                raise ValueError("unexpected activity type")
+                            if not isinstance(row_wallet, str) or row_wallet.lower() != wallet.lower():
+                                raise ValueError("activity wallet mismatch")
+                            if not isinstance(tx_hash, str) or not re.fullmatch(r"0x[0-9a-fA-F]{64}", tx_hash):
+                                raise ValueError("invalid transaction hash")
+                            if isinstance(raw_time, datetime):
+                                timestamp = raw_time
+                            elif isinstance(raw_time, int) and not isinstance(raw_time, bool):
+                                timestamp = datetime.fromtimestamp(raw_time, tz=timezone.utc)
+                            else:
+                                raise ValueError("timestamp must be an integer epoch or datetime")
+                            if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+                                raise ValueError("timestamp is timezone-naive")
+                            timestamp = timestamp.astimezone(timezone.utc)
+                            epoch = int(timestamp.timestamp())
+                            if not lo <= epoch <= hi:
+                                raise ValueError("activity timestamp outside requested window")
+                            if previous_timestamp is not None and timestamp < previous_timestamp:
+                                raise ValueError("activity timestamps are not ascending")
+                            previous_timestamp = timestamp
+                            amount = Decimal(str(raw_amount))
+                            if not amount.is_finite() or amount <= 0:
+                                raise ValueError("amount must be finite and positive")
+                            normalized_hash = tx_hash.lower()
+                            event = AccountCashFlow(f"{normalized_hash}:{kind}", kind, timestamp, normalized_hash, amount)
+                        except (AttributeError, TypeError, ValueError, InvalidOperation, OverflowError, OSError) as exc:
+                            raise RuntimeError(f"invalid cash-flow activity row: {exc}") from exc
+                        previous = records.get(event.event_id)
+                        if previous is not None and previous != event:
+                            raise RuntimeError("conflicting duplicate cash-flow activity event")
+                        records[event.event_id] = event
+                    if current_pages * page_size >= 5_000 and len(rows) == page_size:
+                        overflow = True
+                        break
+                if overflow:
+                    if lo == hi:
+                        raise RuntimeError("single-second cash-flow window exceeds 5000 offset cap")
+                    mid = (lo + hi) // 2
+                    pending.append((mid + 1, hi))
+                    pending.append((lo, mid))
+        except RuntimeError:
+            raise
+        except (AttributeError, TypeError, ValueError, InvalidOperation, OverflowError, OSError) as exc:
+            raise RuntimeError(f"cash-flow activity retrieval failed: {exc}") from exc
+        return tuple(sorted(records.values(), key=lambda event: (event.timestamp, event.event_id)))
+
+    async def get_verified_market_context(self, condition_id: str, token_id: str):
+        """Resolve a condition and token to fresh public market/book constraints."""
+        from .market_context import MarketContext
+
+        if not condition_id or not token_id:
+            raise ValueError("condition_id and token_id are required")
+        matches = []
+        async for page in self.public_client.list_markets(
+            condition_ids=[condition_id], page_size=5,
+        ):
+            for market in page.items:
+                if str(getattr(market, "condition_id", "") or "") == condition_id:
+                    matches.append(market)
+                    if len(matches) > 1:
+                        raise RuntimeError("condition resolved to multiple market records")
+        if len(matches) != 1:
+            raise RuntimeError("condition did not resolve to exactly one market")
+
+        book = await self.public_client.get_order_book(token_id=token_id)
+        if str(getattr(book, "token_id", "") or "") != token_id:
+            raise RuntimeError("order book token does not match requested token")
+        context = MarketContext.from_sdk(matches[0], book)
+        if not context.condition_matches:
+            raise RuntimeError("market and order book condition IDs do not match")
+        if not context.token_matches:
+            raise RuntimeError("requested token is not one of the market's outcome tokens")
+        if context.book_timestamp is None or context.book_timestamp.tzinfo is None:
+            raise RuntimeError("order book timestamp is missing or timezone-naive")
+        if not context.book_hash:
+            raise RuntimeError("order book hash is missing")
+        return context
 
     async def get_order_book(self, token_id: str):
         """Read-only typed Decimal order book from CLOB V2."""

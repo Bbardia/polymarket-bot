@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+from types import SimpleNamespace
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -15,7 +16,8 @@ from typing import Any, Protocol, cast
 
 from .ledger import EventLedger, LedgerEvent
 from .math import taker_fee
-from .orders import OrderAggregate, OrderState, TradeStatus
+from .orders import OrderAggregate, OrderReconciliationRequired, OrderState, TradeStatus
+from .reconciliation import RemoteTrade
 
 
 class StreamState(str, Enum):
@@ -158,18 +160,158 @@ class StreamEventProcessor:
         self.reconciliation_reasons: list[str] = []
         self._applied_event_ids: set[str] = set()
         self._replay_ledger()
+        self._reconcile_pending_submissions()
+
+    @property
+    def active_order_ids(self) -> frozenset[str]:
+        """Exchange IDs for durable orders that have not reached a terminal state."""
+        terminal = {OrderState.CANCELED, OrderState.FILLED, OrderState.FAILED}
+        return frozenset(
+            order_id for order_id, order in self.orders.items()
+            if order.state not in terminal
+        )
+
+    def _reconcile_pending_submissions(self) -> None:
+        pending: dict[str, str] = {}
+        latched = any(
+            event.event_type == "order.submission_reconciliation_latched"
+            for event in self.ledger.events()
+        )
+        for event in self.ledger.events():
+            if event.event_type not in {
+                "order.submission.started", "order.submission.attempted",
+                "order.accepted", "order.rejected",
+            }:
+                continue
+            client_id = event.payload.get("client_order_id")
+            valid_id = isinstance(client_id, str) and bool(client_id)
+            if event.event_type in {"order.submission.started", "order.submission.attempted"}:
+                identity = f"client:{client_id}" if valid_id else f"event:{event.event_id}"
+                pending[identity] = client_id if valid_id else event.event_id  # type: ignore[assignment]
+            elif valid_id and not latched and self._valid_submission_terminal(event):
+                pending.pop(f"client:{client_id}", None)
+        if not pending:
+            return
+        identities = sorted(pending)
+        client_ids = sorted(value for key, value in pending.items() if key.startswith("client:"))
+        event_ids = sorted(value for key, value in pending.items() if key.startswith("event:"))
+        labels = client_ids + [f"malformed event {event_id}" for event_id in event_ids]
+        reason = "unresolved order submission requires reconciliation: " + ", ".join(labels)
+        latch_id = "submission-reconciliation:" + hashlib.sha256(
+            ",".join(identities).encode()
+        ).hexdigest()
+        self.ledger.append(LedgerEvent.create(
+            "order.submission_reconciliation_latched",
+            {"client_order_ids": client_ids, "event_ids": event_ids, "reason": reason}, event_id=latch_id,
+        ))
+        self._record_result(ProcessResult(
+            False, requires_reconciliation=True, reason=reason, event_id=latch_id,
+        ))
+
+    @staticmethod
+    def _valid_submission_terminal(event: LedgerEvent) -> bool:
+        payload = event.payload
+        client_id = payload.get("client_order_id")
+        if not isinstance(client_id, str) or not client_id:
+            return False
+        if event.event_type == "order.rejected":
+            return all(
+                isinstance(payload.get(key), str) and bool(payload[key])
+                for key in ("code", "message")
+            )
+        if event.event_type != "order.accepted":
+            return False
+        order_id = payload.get("order_id")
+        token_id = payload.get("token_id")
+        side = payload.get("side")
+        status = payload.get("status")
+        requested_size = payload.get("requested_size")
+        if not all(isinstance(value, str) and value for value in (order_id, token_id, side, status)):
+            return False
+        if not isinstance(requested_size, (str, int, float, Decimal)) or isinstance(requested_size, bool):
+            return False
+        try:
+            parsed_size = Decimal(str(requested_size))
+            if not parsed_size.is_finite() or parsed_size <= 0:
+                return False
+            aggregate = OrderAggregate.new(
+                client_order_id=client_id, token_id=cast(str, token_id), side=cast(str, side),
+                requested_size=parsed_size,
+            )
+            aggregate.accept(order_id=cast(str, order_id), status=cast(str, status))
+        except (ArithmeticError, TypeError, ValueError):
+            return False
+        return True
 
     def _replay_ledger(self) -> None:
         for event in self.ledger.events():
-            normalized = NormalizedStreamEvent(
-                event_id=event.event_id,
-                event_type=event.event_type,
-                occurred_at=event.occurred_at or None,
-                payload=event.payload,
-            )
-            result = self._apply(normalized)
+            if event.event_type == "order.accepted":
+                result = self._adopt_accepted_order(event)
+            elif event.event_type == "order.submission_reconciliation_latched":
+                result = ProcessResult(
+                    False, requires_reconciliation=True,
+                    reason=str(event.payload.get("reason", "persisted submission reconciliation latch")),
+                    event_id=event.event_id,
+                )
+            elif event.event_type == "stream.reconciliation_required":
+                result = ProcessResult(
+                    False, requires_reconciliation=True,
+                    reason=str(event.payload.get("reason", "persisted stream gap")),
+                    event_id=event.event_id,
+                )
+            else:
+                normalized = NormalizedStreamEvent(
+                    event_id=event.event_id,
+                    event_type=event.event_type,
+                    occurred_at=event.occurred_at or None,
+                    payload=event.payload,
+                )
+                result = self._apply(normalized)
             self._record_result(result)
             self._applied_event_ids.add(event.event_id)
+
+    def _adopt_accepted_order(self, event: LedgerEvent) -> ProcessResult:
+        if not self._valid_submission_terminal(event):
+            return ProcessResult(
+                False, requires_reconciliation=True,
+                reason="persisted accepted order is malformed; reconciliation required",
+                event_id=event.event_id,
+            )
+        payload = event.payload
+        order_id = str(payload.get("order_id", ""))
+        try:
+            if not order_id:
+                raise ValueError("accepted order has no exchange ID")
+            order = OrderAggregate.new(
+                client_order_id=str(payload["client_order_id"]),
+                token_id=str(payload["token_id"]),
+                side=str(payload["side"]),
+                requested_size=Decimal(str(payload["requested_size"])),
+            )
+            order.accept(order_id=order_id, status=str(payload["status"]).lower())
+        except (ArithmeticError, KeyError, TypeError, ValueError):
+            return ProcessResult(
+                False, requires_reconciliation=True,
+                reason="persisted accepted order is malformed; reconciliation required",
+                event_id=event.event_id,
+            )
+        existing = self.orders.get(order_id)
+        if existing is not None:
+            if (
+                existing.client_order_id != order.client_order_id
+                or existing.token_id != order.token_id
+                or existing.side != order.side
+                or existing.requested_size != order.requested_size
+            ):
+                return ProcessResult(
+                    False, requires_reconciliation=True,
+                    reason="persisted accepted order conflicts with existing order",
+                    event_id=event.event_id,
+                )
+        else:
+            self.orders[order_id] = order
+        self.managed_order_ids = self.managed_order_ids | {order_id}
+        return ProcessResult(True, reason="persisted accepted order restored", event_id=event.event_id)
 
     def _record_result(self, result: ProcessResult) -> ProcessResult:
         if result.requires_reconciliation:
@@ -179,11 +321,15 @@ class StreamEventProcessor:
         return result
 
     def require_reconciliation(self, reason: str) -> None:
-        """Set a sticky fail-closed blocker after a stream gap or ambiguity."""
+        """Persist a sticky fail-closed blocker after a stream gap or ambiguity."""
+        event = LedgerEvent.create("stream.reconciliation_required", {"reason": reason})
+        self.ledger.append(event)
+        self._applied_event_ids.add(event.event_id)
         self._record_result(ProcessResult(
             accepted=False,
             requires_reconciliation=True,
             reason=reason,
+            event_id=event.event_id,
         ))
 
     def process(self, event: Any) -> ProcessResult:
@@ -206,6 +352,73 @@ class StreamEventProcessor:
         result = self._apply(normalized)
         self._applied_event_ids.add(normalized.event_id)
         return self._record_result(result)
+
+    def import_remote_trade(self, trade: RemoteTrade) -> ProcessResult:
+        """Replay one validated history row through the normal user-trade path.
+
+        This imports only associations attributable to managed orders; it is not
+        a complete remote account reconciliation.
+        """
+        if not isinstance(trade, RemoteTrade):
+            self.require_reconciliation("malformed remote trade row requires reconciliation")
+            return ProcessResult(False, requires_reconciliation=True,
+                                 reason="malformed remote trade row requires reconciliation")
+        maker_rows = [{
+            "order_id": maker.order_id,
+            "asset_id": maker.token_id,
+            "side": maker.side,
+            "matched_amount": maker.matched_amount,
+            "price": maker.price,
+            "fee_rate_bps": maker.fee_rate_bps,
+        } for maker in trade.maker_orders]
+        if trade.trader_side == "TAKER":
+            if trade.taker_order_id not in self.managed_order_ids:
+                reason = "remote trade references unknown taker order"
+                self.require_reconciliation(reason)
+                return ProcessResult(False, requires_reconciliation=True, reason=reason)
+            managed_order = self.orders.get(trade.taker_order_id)
+            if managed_order is None or managed_order.side != trade.side:
+                reason = "remote trade side conflicts with managed taker order"
+                self.require_reconciliation(reason)
+                return ProcessResult(False, requires_reconciliation=True, reason=reason)
+        elif not any(row["order_id"] in self.managed_order_ids for row in maker_rows):
+            reason = "remote trade has no managed maker association"
+            self.require_reconciliation(reason)
+            return ProcessResult(False, requires_reconciliation=True, reason=reason)
+        elif any(
+            row["order_id"] in self.managed_order_ids
+            and (self.orders.get(row["order_id"]) is None
+                 or self.orders[row["order_id"]].side != row["side"])
+            for row in maker_rows
+        ):
+            reason = "remote maker side conflicts with managed maker order"
+            self.require_reconciliation(reason)
+            return ProcessResult(False, requires_reconciliation=True, reason=reason)
+        if trade.trader_side == "TAKER" and trade.fee_rate_bps is None:
+            reason = "remote trade fee rate is unknown"
+            self.require_reconciliation(reason)
+            return ProcessResult(False, requires_reconciliation=True, reason=reason)
+        if trade.trader_side == "MAKER" and any(
+            maker.order_id in self.managed_order_ids and maker.fee_rate_bps is None
+            for maker in trade.maker_orders
+        ):
+            reason = "remote maker trade fee rate is unknown"
+            self.require_reconciliation(reason)
+            return ProcessResult(False, requires_reconciliation=True, reason=reason)
+        payload = {
+            "id": trade.trade_id,
+            "taker_order_id": trade.taker_order_id,
+            "asset_id": trade.token_id,
+            "side": trade.side,
+            "size": trade.size,
+            "price": trade.price,
+            "status": trade.status,
+            "fee_rate_bps": trade.fee_rate_bps,
+            "timestamp": trade.matched_at,
+            "last_update": trade.updated_at,
+            "maker_orders": maker_rows,
+        }
+        return self.process(SimpleNamespace(topic="user", type="trade", payload=payload))
 
     def _apply(self, event: NormalizedStreamEvent) -> ProcessResult:
         if event.event_type == "user.order":
@@ -322,10 +535,12 @@ class StreamEventProcessor:
         try:
             status = TradeStatus(str(_value(payload, "status")))
             targets: list[tuple[OrderAggregate, Mapping[str, Any], str]] = []
+            target_order_ids: set[str] = set()
 
             taker_order_id = str(_value(payload, "taker_order_id", default=""))
             taker_order = self.orders.get(taker_order_id)
             if taker_order is not None:
+                target_order_ids.add(taker_order_id)
                 targets.append((taker_order, payload, "size"))
 
             maker_orders = _value(payload, "maker_orders", default=[]) or []
@@ -338,7 +553,12 @@ class StreamEventProcessor:
                     _value(maker_payload, "order_id", "id", default="")
                 )
                 maker_order = self.orders.get(maker_order_id)
-                if maker_order is not None and maker_order is not taker_order:
+                if maker_order is not None and maker_order_id in target_order_ids:
+                    raise OrderReconciliationRequired(
+                        "trade event repeats a managed order target"
+                    )
+                if maker_order is not None:
+                    target_order_ids.add(maker_order_id)
                     targets.append((maker_order, maker_payload, "matched_amount"))
 
             if not targets:
@@ -371,6 +591,10 @@ class StreamEventProcessor:
                     price=price,
                     fee_rate=fee_rate_bps / Decimal("10000"),
                 )
+                trade_id = str(_value(payload, "id"))
+                order.validate_trade(
+                    trade_id, size=size, price=price, fee=fee, status=status,
+                )
                 parsed_targets.append((order, size, price, fee))
 
             trade_id = str(_value(payload, "id"))
@@ -382,7 +606,21 @@ class StreamEventProcessor:
                     fee=fee,
                     status=status,
                 )
-        except (ArithmeticError, TypeError, ValueError):
+        except OrderReconciliationRequired as exc:
+            return ProcessResult(
+                True,
+                requires_reconciliation=True,
+                reason=str(exc),
+                event_id=event.event_id,
+            )
+        except ValueError:
+            return ProcessResult(
+                True,
+                requires_reconciliation=True,
+                reason="malformed trade event requires reconciliation",
+                event_id=event.event_id,
+            )
+        except (ArithmeticError, TypeError):
             return ProcessResult(
                 True,
                 requires_reconciliation=True,

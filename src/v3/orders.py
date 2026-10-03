@@ -9,6 +9,10 @@ from enum import Enum
 ZERO = Decimal("0")
 
 
+class OrderReconciliationRequired(ValueError):
+    """A valid-looking lifecycle event conflicts with order state."""
+
+
 class OrderState(str, Enum):
     CREATED = "CREATED"
     LIVE = "LIVE"
@@ -95,17 +99,11 @@ class OrderAggregate:
         fee: Decimal,
         status: TradeStatus,
     ) -> None:
-        if size <= ZERO or price <= ZERO or fee < ZERO:
-            raise ValueError("invalid trade values")
+        self.validate_trade(trade_id, size=size, price=price, fee=fee, status=status)
         existing = self.trades.get(trade_id)
         if existing:
-            if (existing.size, existing.price) != (size, price):
-                raise ValueError("trade payload changed for an existing trade id")
-            if existing.accounted and existing.fee != fee:
-                raise ValueError("fee changed after confirmed trade accounting")
             if not existing.accounted:
-                # The SDK can omit fee_rate_bps on early lifecycle events and
-                # include it when the same trade reaches CONFIRMED.
+                # Early lifecycle events may omit fee_rate_bps.
                 existing.fee = fee
                 existing.status = status
             elif status is TradeStatus.CONFIRMED:
@@ -115,19 +113,40 @@ class OrderAggregate:
             record = TradeRecord(trade_id, size, price, fee, status)
             self.trades[trade_id] = record
 
-        if status is TradeStatus.FAILED:
-            return
-        if status is not TradeStatus.CONFIRMED or record.accounted:
-            return
-        if self.confirmed_size + size > self.requested_size:
-            raise ValueError("confirmed fill exceeds requested size")
+        if status is TradeStatus.CONFIRMED and not record.accounted:
+            self.confirmed_size += size
+            self.confirmed_notional += size * price
+            self.confirmed_fees += fee
+            record.accounted = True
+            self.state = (
+                OrderState.FILLED
+                if self.confirmed_size == self.requested_size
+                else OrderState.PARTIALLY_FILLED
+            )
 
-        self.confirmed_size += size
-        self.confirmed_notional += size * price
-        self.confirmed_fees += fee
-        record.accounted = True
-        self.state = (
-            OrderState.FILLED
-            if self.confirmed_size == self.requested_size
-            else OrderState.PARTIALLY_FILLED
-        )
+    def validate_trade(
+        self,
+        trade_id: str,
+        *,
+        size: Decimal,
+        price: Decimal,
+        fee: Decimal,
+        status: TradeStatus,
+    ) -> None:
+        """Validate trade economics and lifecycle without changing aggregate state."""
+        if size <= ZERO or price <= ZERO or fee < ZERO:
+            raise ValueError("invalid trade values")
+        if self.state is OrderState.CANCELED and status is TradeStatus.CONFIRMED:
+            raise OrderReconciliationRequired("confirmed trade after cancellation requires reconciliation")
+        existing = self.trades.get(trade_id)
+        if existing:
+            if (existing.size, existing.price) != (size, price):
+                raise ValueError("trade payload changed for an existing trade id")
+            if existing.accounted and existing.fee != fee:
+                raise ValueError("fee changed after confirmed trade accounting")
+        if (
+            status is TradeStatus.CONFIRMED
+            and not (existing and existing.accounted)
+            and self.confirmed_size + size > self.requested_size
+        ):
+            raise ValueError("confirmed fill exceeds requested size")

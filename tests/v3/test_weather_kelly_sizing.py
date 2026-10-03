@@ -105,7 +105,7 @@ def test_worker_sizing_audit_cash_recheck_and_restart(tmp_path):
     second.resolution.source = 'https://www.weather.gov/wrh/timeseries?site=rjtt'
     for item in (first, second):
         item.trading.fees_enabled = True
-        item.trading.fee_schedule = SimpleNamespace(rate=D('.05'))
+        item.trading.fee_schedule = SimpleNamespace(rate=D('.05'), exponent=1, taker_only=True)
         item.trading.base_fee = 1000  # Legacy metadata must not become rate=.1.
     worker, store = event_worker(tmp_path, [first, second], {(D('31'), D('31')): D('.8')})
     worker.settings = replace(worker.settings, weather_policy=replace(
