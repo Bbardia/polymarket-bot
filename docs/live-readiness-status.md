@@ -1,3 +1,14 @@
+# Live status (2026-10-03, 15:25 CEST): LIVE
+
+User switched to bypass permissions and authorized real-money trading. `run_v3.py live-run` runs as transient user unit `polymarket-v7-live` (Restart=on-failure) from this worktree with profile `.env.live` (no secrets) and wallet credentials read by name from `../polymarket-bot/.env`. Data: `data/live-v7/` (`status.json`, `live_orders.jsonl`, `live_state.json`, `ledger.sqlite`, `errors.jsonl`).
+
+- Baseline 2026-10-03T13:23:44Z: 237.128775 pUSD cash, 126 pre-bot positions recorded as external, 0 open orders. First cycles: reconciliation safe, no entry block, 0 V7 candidates, no orders yet.
+- Limits: $100 capital (deployable $75 after 25% reserve), $2 per order, $10 daily loss, $10 drawdown from peak equity, 5 open orders, 15 bot positions, 3 new orders per cycle, 4 orders per event per day, 900 s GTD, post-only BUY only, hold to resolution.
+- Operator rules: do not trade, cancel or redeem manually on this account while the bot runs (unknown positions, orders or unexplained cash outflows block entries); deposits are fine. The transient unit does not survive a reboot.
+- Stop: `systemctl --user stop polymarket-v7-live`. Emergency: also run `live-kill`, which cancels every open order on the account and permanently latches this ledger.
+
+---
+
 # Live-readiness status (2026-10-03, afternoon update)
 
 ## Decision: still NO-GO for real orders; read-only live shadow added
