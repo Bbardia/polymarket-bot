@@ -54,7 +54,7 @@ remain enabled only in the explicit V7 profile. No live-capable path was
 activated, no authenticated endpoint was used, and no historical ledger was
 reset or rewritten. V8 services are retired; their ledgers and uncommitted diff
 are preserved in the external archive recorded at
-`/home/rasbardi/polymarket-v8-archive-20260915`.
+`/home/rasbardi/polymarket-archive/campaigns/polymarket-v8-archive-20260915.tar.zst`.
 
 ## External research addition — PendulumFlow archive
 
