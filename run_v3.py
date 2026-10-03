@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 from src.v3.api import UnifiedPolymarketAPI
 from src.v3.config import V3Settings
+from src.v3.live_runner import LiveRunnerSettings, kill_live, run_live
 from src.v3.live_shadow import LiveShadowSettings, run_live_shadow
 from src.v3.paper import PaperSettings, paper_status, run_paper
 from src.v3.simulation import (
@@ -178,6 +179,54 @@ def live_shadow_status() -> int:
     return 0
 
 
+LIVE_CREDENTIAL_NAMES = ("POLY_PRIVATE_KEY", "POLY_FUNDER_ADDRESS")
+
+
+def load_live_environment(profile: Path, secrets: Path) -> None:
+    """Load the non-secret live profile, then only the wallet credentials."""
+    if not profile.is_file():
+        raise RuntimeError(f"live profile not found: {profile}")
+    load_dotenv(profile, override=False)
+    if secrets.is_file():
+        from dotenv import dotenv_values
+        values = dotenv_values(secrets)
+        for name in LIVE_CREDENTIAL_NAMES:
+            value = values.get(name)
+            if value and name not in os.environ:
+                os.environ[name] = value
+
+
+def live_run(*, env_file: Path, secrets_file: Path, cycles: int, interval: float | None) -> int:
+    """Real-money V7 weather runner; refuses unless every live gate is satisfied."""
+    load_live_environment(env_file, secrets_file)
+    settings = V3Settings.from_env()
+    runner_settings = LiveRunnerSettings.from_env(ROOT)
+    if interval is not None:
+        runner_settings = replace(
+            runner_settings, shadow=replace(runner_settings.shadow, scan_interval_seconds=interval),
+        )
+    asyncio.run(run_live(settings, runner_settings, cycles=cycles))
+    return 0
+
+
+def live_kill(*, env_file: Path, secrets_file: Path) -> int:
+    load_live_environment(env_file, secrets_file)
+    result = asyncio.run(kill_live(V3Settings.from_env(), LiveRunnerSettings.from_env(ROOT)))
+    print(json.dumps({key: str(value) for key, value in result.items()}, indent=2))
+    return 0
+
+
+def live_status(*, env_file: Path) -> int:
+    if env_file.is_file():
+        load_dotenv(env_file, override=False)
+    status_path = LiveRunnerSettings.from_env(ROOT).shadow.data_dir / "status.json"
+    if not status_path.is_file():
+        print(json.dumps({"mode": "LIVE", "state": "not_started"}))
+        return 0
+    print(status_path.read_text(encoding="utf-8"))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Operate the paper-first Polymarket V3 foundation.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -217,6 +266,18 @@ def main() -> int:
     live_shadow_parser.add_argument("--cycles", type=int, default=0)
     live_shadow_parser.add_argument("--interval", type=float)
     subparsers.add_parser("live-shadow-status", help="Show the last live-shadow status.")
+    for name, help_text in (
+        ("live-run", "REAL MONEY: run the gated V7 weather maker runner."),
+        ("live-kill", "REAL MONEY: latch the kill switch and cancel all open account orders."),
+        ("live-status", "Show the last live-runner status without network access."),
+    ):
+        live_parser = subparsers.add_parser(name, help=help_text)
+        live_parser.add_argument("--env-file", type=Path, default=ROOT / ".env.live")
+        if name != "live-status":
+            live_parser.add_argument("--secrets-file", type=Path, default=ROOT / ".env")
+        if name == "live-run":
+            live_parser.add_argument("--cycles", type=int, default=0)
+            live_parser.add_argument("--interval", type=float)
     args = parser.parse_args()
     try:
         if args.command == "validate-config":
@@ -233,6 +294,13 @@ def main() -> int:
             return live_shadow(env_file=args.env_file, cycles=args.cycles, interval=args.interval)
         if args.command == "live-shadow-status":
             return live_shadow_status()
+        if args.command == "live-run":
+            return live_run(env_file=args.env_file, secrets_file=args.secrets_file,
+                            cycles=args.cycles, interval=args.interval)
+        if args.command == "live-kill":
+            return live_kill(env_file=args.env_file, secrets_file=args.secrets_file)
+        if args.command == "live-status":
+            return live_status(env_file=args.env_file)
         return paper_run(cycles=args.cycles, interval=args.interval)
     except (OSError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))
