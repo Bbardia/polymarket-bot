@@ -58,6 +58,8 @@ class LiveOrderService:
         self._submit_lock = asyncio.Lock()
         # Only the asynchronous factory can unlock real service operations.
         self._factory_authorized = False
+        # Account baseline (Unix seconds); trades before it predate the bot.
+        self._trade_history_after: int | None = None
 
     @classmethod
     async def create(
@@ -68,6 +70,7 @@ class LiveOrderService:
         risk_engine: RiskEngine,
         ledger: EventLedger,
         reconciler: Reconciler | None = None,
+        trade_history_after: int | None = None,
     ) -> "LiveOrderService":
         errors = settings.live_client_errors()
         if errors:
@@ -91,6 +94,7 @@ class LiveOrderService:
         client = await api.initialize_secure_client()
         executor = V3OrderExecutor(SDKExecutionAdapter(client), risk_engine, ledger, settings=settings)
         service = cls(api, executor, risk_engine, ledger, reconciler or Reconciler())
+        service._trade_history_after = trade_history_after
         await service.recover_trade_history(
             max_items=TRADE_HISTORY_MAX_ITEMS,
             page_limit=TRADE_HISTORY_PAGE_LIMIT,
@@ -129,7 +133,9 @@ class LiveOrderService:
 
         position_value = ZERO
         position_exposure = ZERO
+        open_positions = 0
         event_exposure: dict[str, Decimal] = {}
+        external = getattr(self._reconciler, "external_condition_ids", frozenset()) if self else frozenset()
         for position in remote.positions:
             initial_value = position.initial_value
             if (
@@ -139,8 +145,16 @@ class LiveOrderService:
                 or initial_value is None or not initial_value.is_finite() or initial_value < ZERO
             ):
                 raise ValueError("remote position is incomplete or invalid")
-            exposure_basis = max(initial_value, position.current_value)
             position_value += position.current_value
+            if position.condition_id in external:
+                # Pre-bot/manual holdings count toward equity, not bot exposure.
+                continue
+            if position.redeemable:
+                # Resolved: remaining risk is only the unredeemed payout value.
+                exposure_basis = position.current_value
+            else:
+                exposure_basis = max(initial_value, position.current_value)
+                open_positions += 1
             position_exposure += exposure_basis
             event_exposure[position.condition_id] = (
                 event_exposure.get(position.condition_id, ZERO) + exposure_basis
@@ -168,7 +182,7 @@ class LiveOrderService:
             total_exposure=position_exposure + pending_order_notional,
             event_exposure=event_exposure,
             open_orders=len(remote.open_orders),
-            open_positions=len(remote.positions),
+            open_positions=open_positions,
             daily_pnl=daily_pnl,
             peak_equity=peak_equity,
             reconciled=True,
@@ -313,15 +327,24 @@ class LiveOrderService:
         self, *, max_items: int, page_limit: int,
         timeout_seconds: float = TRADE_HISTORY_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
-        """Replay a bounded account trade read; this never clears a reconciliation latch."""
+        """Replay a bounded account trade read; this never clears a reconciliation latch.
+
+        Only trades at or after the factory's account baseline are replayed;
+        any later trade not attributable to a managed order still latches.
+        """
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be a finite positive number")
         processor = StreamEventProcessor(self._ledger)
         try:
-            trades = await asyncio.wait_for(
-                self._api.fetch_account_trades(max_items=max_items, page_limit=page_limit),
-                timeout=timeout_seconds,
+            fetch = (
+                self._api.fetch_account_trades(max_items=max_items, page_limit=page_limit)
+                if self._trade_history_after is None
+                else self._api.fetch_account_trades(
+                    max_items=max_items, page_limit=page_limit,
+                    after=self._trade_history_after,
+                )
             )
+            trades = await asyncio.wait_for(fetch, timeout=timeout_seconds)
         except asyncio.CancelledError:
             processor.require_reconciliation(
                 "trade history read cancelled: CancelledError"

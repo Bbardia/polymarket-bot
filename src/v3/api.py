@@ -169,6 +169,7 @@ class UnifiedPolymarketAPI:
                         size=size,
                         current_value=current_value,
                         initial_value=initial_value,
+                        redeemable=getattr(position, "redeemable", None) is True,
                     ))
 
         orders: list[RemoteOrder] = []
@@ -226,8 +227,16 @@ class UnifiedPolymarketAPI:
             open_orders=tuple(orders),
         )
 
-    async def fetch_account_trades(self, *, max_items: int, page_limit: int) -> tuple[RemoteTrade, ...]:
-        """Fetch bounded authenticated trade-history rows; never applies fills to local state."""
+    async def fetch_account_trades(
+        self, *, max_items: int, page_limit: int, after: int | None = None,
+    ) -> tuple[RemoteTrade, ...]:
+        """Fetch bounded authenticated trade-history rows; never applies fills to local state.
+
+        ``after`` (Unix seconds) limits the read to trades matched at or after a
+        recorded account baseline, so pre-bot manual history is not replayed.
+        """
+        if after is not None and (type(after) is not int or after < 0):
+            raise ValueError("after must be a nonnegative integer epoch")
         if type(max_items) is not int or max_items <= 0:
             raise ValueError("max_items must be a positive integer")
         if type(page_limit) is not int or page_limit <= 0:
@@ -258,7 +267,11 @@ class UnifiedPolymarketAPI:
             return result
 
         try:
-            async for page in client.list_account_trades():
+            trade_pages = (
+                client.list_account_trades() if after is None
+                else client.list_account_trades(after=str(after))
+            )
+            async for page in trade_pages:
                 pages += 1
                 if pages > page_limit:
                     raise RuntimeError("account trade page limit exceeded")
@@ -311,6 +324,8 @@ class UnifiedPolymarketAPI:
                         fee_rate_bps=fee, transaction_hash=tx_hash.lower() if tx_hash else None,
                         maker_orders=tuple(makers),
                     )
+                    if after is not None and current.matched_at.timestamp() < after:
+                        continue
                     previous = records.get(trade_id)
                     if previous is not None and previous != current:
                         raise RuntimeError("conflicting duplicate account trade ID")

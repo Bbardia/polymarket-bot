@@ -268,9 +268,10 @@ class LiveShadowRunner:
             trade_history_error=history_error,
         )
 
-    async def _shadow_intent(
-        self, evaluation: WeatherEvaluation, account: AccountView | None, now: datetime,
-    ) -> dict[str, Any]:
+    async def _build_intent(
+        self, evaluation: WeatherEvaluation, now: datetime,
+    ) -> tuple[dict[str, Any], OrderIntent | None]:
+        """Station gate, fresh verified context and the unchanged V7 bridge."""
         record: dict[str, Any] = {
             "at": now.isoformat(),
             "event_key": evaluation.event_key,
@@ -289,13 +290,13 @@ class LiveShadowRunner:
         reason = station_metadata_reason(self.station_metadata_path, evaluation.city)
         if reason is not None:
             record.update(stage="station", outcome="blocked", reason=reason)
-            return record
+            return record, None
         shadow = evaluation.maker_shadow
         if shadow is None or evaluation.book_timestamp is None or evaluation.book_hash is None \
                 or evaluation.decision_timestamp is None:
             record.update(stage="provenance", outcome="blocked",
                           reason="V7 evaluation lacks book or decision provenance")
-            return record
+            return record, None
         try:
             context = await self.api.get_verified_market_context(
                 evaluation.condition_id, evaluation.token_id,
@@ -303,7 +304,7 @@ class LiveShadowRunner:
         except Exception as exc:
             record.update(stage="market_context", outcome="blocked",
                           reason=f"{type(exc).__name__}: {exc}")
-            return record
+            return record, None
         proposal = propose_v7_weather_order(
             evaluation, context,
             best_bid=shadow.best_bid, best_ask=shadow.best_ask,
@@ -318,7 +319,7 @@ class LiveShadowRunner:
         record["book_unchanged_since_signal"] = context.book_hash == evaluation.book_hash
         if not proposal.proposed:
             record.update(stage="proposal", outcome="blocked", reason=proposal.reason)
-            return record
+            return record, None
         intent = OrderIntent(
             condition_id=evaluation.condition_id, token_id=evaluation.token_id,
             side="BUY", price=proposal.price, shares=proposal.shares,
@@ -332,6 +333,14 @@ class LiveShadowRunner:
             price=proposal.price, shares=proposal.shares,
             notional=intent.all_in_notional, expected_edge=proposal.expected_edge,
         )
+        return record, intent
+
+    async def _shadow_intent(
+        self, evaluation: WeatherEvaluation, account: AccountView | None, now: datetime,
+    ) -> dict[str, Any]:
+        record, intent = await self._build_intent(evaluation, now)
+        if intent is None:
+            return record
         if account is None:
             record.update(stage="risk", outcome="proposal_only",
                           reason="no account snapshot; risk engine not evaluated")

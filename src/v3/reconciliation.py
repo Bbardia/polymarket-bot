@@ -96,6 +96,8 @@ class RemotePosition:
     size: Decimal
     current_value: Decimal
     initial_value: Decimal | None = None
+    # Resolved positions awaiting redemption carry no further market risk.
+    redeemable: bool = False
 
 
 @dataclass(frozen=True)
@@ -147,9 +149,16 @@ class Reconciler:
         *,
         external_condition_ids: Iterable[str] = (),
         cash_tolerance: Decimal = Decimal("0.01"),
+        cost_tolerance: Decimal = Decimal("0"),
+        allow_cash_inflows: bool = False,
     ) -> None:
         self.external_condition_ids = frozenset(external_condition_ids)
         self.cash_tolerance = cash_tolerance
+        # Remote cost basis is size x rounded average price; exact by default.
+        self.cost_tolerance = cost_tolerance
+        # Opt-in: unexplained cash *increases* (maker rebates, rewards, deposits)
+        # do not block; any unexplained decrease beyond tolerance still does.
+        self.allow_cash_inflows = allow_cash_inflows
 
     def compare(self, local: LocalSnapshot, remote: RemoteSnapshot) -> ReconciliationReport:
         valid_local = (
@@ -234,7 +243,8 @@ class Reconciler:
             or not local_quantities[token].is_finite()
             or not local_costs[token].is_finite()
             or local_quantities[token] != remote_by_token[token].size
-            or local_costs[token] != remote_by_token[token].initial_value
+            or remote_by_token[token].initial_value is None
+            or abs(local_costs[token] - remote_by_token[token].initial_value) > self.cost_tolerance
         ))
         missing_orders = tuple(sorted(local.order_ids - remote_order_ids))
         incomplete_orders = tuple(sorted(
@@ -263,7 +273,10 @@ class Reconciler:
             not invalid_snapshot
             and not duplicate_positions
             and not duplicate_orders
-            and abs(cash_delta) <= self.cash_tolerance
+            and (
+                abs(cash_delta) <= self.cash_tolerance
+                or (self.allow_cash_inflows and cash_delta > ZERO)
+            )
             and not unknown_positions
             and not unknown_orders
             and not missing_positions
