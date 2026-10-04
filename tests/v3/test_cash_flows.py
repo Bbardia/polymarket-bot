@@ -8,7 +8,7 @@ import pytest
 
 from polymarket.models.data.activity import DepositActivity, WithdrawalActivity
 
-from src.v3.api import AccountCashFlow, UnifiedPolymarketAPI
+from src.v3.api import AccountCashFlow, CompleteAccountCashFlowHistory, UnifiedPolymarketAPI
 from src.v3.config import V3Settings
 
 WALLET = "0x" + "a" * 40
@@ -79,6 +79,34 @@ def test_fetches_only_deposits_and_withdrawals_from_public_client_and_normalizes
     assert secure == [] and not api.secure_client_initialized
     with pytest.raises((FrozenInstanceError, AttributeError)):
         events[0].amount = Decimal("9")
+
+def test_complete_cash_flow_history_filters_post_baseline_after_full_read():
+    baseline = int(datetime(2026, 1, 2, tzinfo=timezone.utc).timestamp())
+    api, _ = api_for([[
+        row("DEPOSIT", tx=TX_A, timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc)),
+        row("WITHDRAWAL", tx=TX_B, amount="1", timestamp=datetime(2026, 1, 3, tzinfo=timezone.utc)),
+    ]])
+
+    history = asyncio.run(api.fetch_complete_account_cash_flow_history(
+        after=baseline, max_items=10, page_size=7,
+    ))
+
+    assert isinstance(history, CompleteAccountCashFlowHistory)
+    assert history.after == baseline
+    assert len(history.flows) == 1
+    assert history.flows[0].event_type == "WITHDRAWAL"
+    assert history.net_amount == Decimal("-1")
+    assert history.fetched_at.tzinfo is not None
+
+
+def test_complete_cash_flow_history_returns_empty_post_baseline_window():
+    baseline = int(datetime(2026, 1, 2, tzinfo=timezone.utc).timestamp())
+    api, _ = api_for([[row(timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc))]])
+
+    history = asyncio.run(api.fetch_complete_account_cash_flow_history(after=baseline))
+
+    assert history.flows == () and history.net_amount == Decimal("0")
+
 
 def test_pagination_deduplication_and_stable_order():
     a = row("DEPOSIT", tx=TX_A, timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc))

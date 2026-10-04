@@ -23,16 +23,29 @@ TRADE_HISTORY_PAGE_LIMIT = 100
 TRADE_HISTORY_TIMEOUT_SECONDS = 30.0
 
 
-@dataclass(frozen=True)
+@dataclass
 class LiveRiskContext:
-    """Caller-supplied values; this service does not persist or verify provenance.
-
-    Not safe as live risk controls until a durable, reconciled risk-state provider
-    replaces this context. Kept only for the current isolated service scaffold.
-    """
+    """Shared within a cycle and refreshed from each authenticated account snapshot."""
 
     daily_pnl: Decimal
     peak_equity: Decimal
+    day_start_equity: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        if not self.daily_pnl.is_finite() or not self.peak_equity.is_finite() or self.peak_equity <= ZERO:
+            raise ValueError("risk context P&L and peak equity must be finite; peak must be positive")
+        if self.day_start_equity is not None and (
+            not self.day_start_equity.is_finite() or self.day_start_equity <= ZERO
+        ):
+            raise ValueError("day-start equity must be finite and positive")
+
+    def refresh_from_remote(self, remote: RemoteSnapshot) -> None:
+        equity = remote.cash + sum((position.current_value for position in remote.positions), ZERO)
+        if not equity.is_finite() or equity <= ZERO:
+            raise ValueError("remote equity is invalid for risk evaluation")
+        self.peak_equity = max(self.peak_equity, equity)
+        if self.day_start_equity is not None:
+            self.daily_pnl = equity - self.day_start_equity
 
 
 class LiveOrderService:
@@ -313,6 +326,7 @@ class LiveOrderService:
             return ExecutionResult(False, "account reconciliation blocked order submission")
 
         try:
+            context.refresh_from_remote(remote)
             state = self._risk_state(
                 remote, daily_pnl=context.daily_pnl, peak_equity=context.peak_equity,
             )

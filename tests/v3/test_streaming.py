@@ -23,7 +23,7 @@ def D(value: str) -> Decimal:
 
 def order_event(
     *, event_type="PLACEMENT", status: str | None = "LIVE", matched="0", timestamp=None,
-    original_size="5", order_id="order-1",
+    expiration=None, reason=None, original_size="5", order_id="order-1",
 ):
     return SimpleNamespace(
         topic="user", type="order",
@@ -31,12 +31,13 @@ def order_event(
             id=order_id, owner="wallet", market="condition", asset_id="token",
             side="BUY", original_size=D(original_size), size_matched=D(matched),
             price=D("0.20"), type=event_type, timestamp=timestamp,
-            created_at=None, expiration=None, order_type="GTD", status=status,
+            created_at=None, expiration=expiration, order_type="GTD", status=status,
+            reason=reason,
         ),
     )
 
 
-def trade_event(*, status="CONFIRMED", fee_rate_bps: str | None = "50", trade_id="trade-1"):
+def trade_event(*, status="CONFIRMED", fee_rate_bps: str | None = "50", trade_id="trade-1", timestamp=None):
     return SimpleNamespace(
         topic="user", type="trade",
         payload=SimpleNamespace(
@@ -44,7 +45,7 @@ def trade_event(*, status="CONFIRMED", fee_rate_bps: str | None = "50", trade_id
             asset_id="token", side="BUY", size=D("2"), price=D("0.20"),
             status=status, owner="wallet",
             fee_rate_bps=None if fee_rate_bps is None else D(fee_rate_bps),
-            timestamp=None, match_time=None, last_update=None,
+            timestamp=timestamp, match_time=None, last_update=None,
         ),
     )
 
@@ -399,6 +400,30 @@ def test_processor_applies_cancellation_without_account_action(tmp_path):
     result = processor.process(order_event(event_type="CANCELLATION", status="CANCELED"))
     assert result.accepted
     assert processor.orders["order-1"].state is OrderState.CANCELED
+
+
+def test_confirmed_fill_matched_before_gtd_expiry_is_imported_after_cancel_event(tmp_path):
+    ledger = EventLedger(tmp_path / "events.db")
+    processor = StreamEventProcessor(ledger, managed_order_ids={"order-1"})
+    expires_at = datetime(2026, 10, 4, 0, 31, 14, tzinfo=timezone.utc)
+    matched_at = datetime(2026, 10, 4, 0, 21, 53, tzinfo=timezone.utc)
+    expiration = int(expires_at.timestamp())
+
+    processor.process(order_event(expiration=expiration))
+    canceled = processor.process(order_event(
+        event_type="CANCELLATION", status="CANCELED", expiration=expiration,
+        reason="gtd_expired_absent_from_open_orders",
+    ))
+    result = processor.process(trade_event(
+        status="CONFIRMED", timestamp=matched_at,
+    ))
+
+    assert canceled.accepted
+    assert result.accepted and not result.requires_reconciliation
+    assert not processor.reconciliation_required
+    order = processor.orders["order-1"]
+    assert order.state is OrderState.CANCELED
+    assert order.confirmed_size == D("2")
 
 
 def test_matched_trade_confirmed_after_cancel_is_persisted_and_replayed_without_accounting(tmp_path):

@@ -49,6 +49,29 @@ def test_fetch_trades_normalizes_timestamp_and_maker_and_deduplicates_identical_
     assert isinstance(result, tuple)
 
 
+def test_fetch_complete_account_history_returns_bounded_snapshot_after_exhaustion():
+    after = int(datetime(2025, 12, 31, tzinfo=timezone.utc).timestamp())
+
+    history = asyncio.run(api_with_pages([[trade()]]).fetch_complete_account_trade_history(
+        after=after, max_items=2, page_limit=2,
+    ))
+
+    assert history.after == after
+    assert len(history.trades) == 1
+    assert history.trades[0].trade_id == "trade-1"
+    assert history.fetched_at.tzinfo is not None
+    assert history.max_items == 2 and history.page_limit == 2
+
+
+def test_fetch_complete_account_history_refuses_truncated_results():
+    after = int(datetime(2025, 12, 31, tzinfo=timezone.utc).timestamp())
+
+    with pytest.raises(RuntimeError, match="item limit"):
+        asyncio.run(api_with_pages([[trade(), trade(id="trade-2")]]).fetch_complete_account_trade_history(
+            after=after, max_items=1, page_limit=2,
+        ))
+
+
 def test_fetch_trades_rejects_conflicting_duplicate_ids():
     with pytest.raises(RuntimeError, match="conflicting duplicate"):
         asyncio.run(api_with_pages([[trade()], [trade(price="0.6")]]).fetch_account_trades(max_items=3, page_limit=3))

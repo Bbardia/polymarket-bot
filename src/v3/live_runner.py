@@ -40,7 +40,9 @@ from .live_shadow import (
 )
 from .paper import build_weather_forecast
 from .paper_weather import NOAAStationObservations, OffsetWeatherPublicClient, evaluate_weather_universe
-from .reconciliation import LocalSnapshot, Reconciler, RemoteSnapshot
+from .reconciliation import (
+    CompleteAccountTradeHistory, LocalSnapshot, Reconciler, RemoteAccountOrder, RemoteSnapshot,
+)
 from .risk import RiskEngine
 from .streaming import StreamEventProcessor
 
@@ -57,15 +59,12 @@ def _utc_now() -> datetime:
 @dataclass(frozen=True)
 class LiveRunnerSettings:
     shadow: LiveShadowSettings
-    max_orders_per_event_per_day: int = 4
     cost_tolerance: Decimal = Decimal("0.01")
     # Wait this long after GTD expiry before recording an unseen order as
     # expired, so late fill confirmations land on the still-open aggregate.
     expiry_grace_seconds: int = 600
 
     def __post_init__(self) -> None:
-        if self.max_orders_per_event_per_day < 1:
-            raise ValueError("per-event daily order cap must be positive")
         if not self.cost_tolerance.is_finite() or self.cost_tolerance < ZERO:
             raise ValueError("cost tolerance must be finite and nonnegative")
         if self.expiry_grace_seconds < 60:
@@ -78,7 +77,6 @@ class LiveRunnerSettings:
             shadow = replace(shadow, data_dir=(root / "data/live-v7").resolve())
         return cls(
             shadow=shadow,
-            max_orders_per_event_per_day=int(os.getenv("V3_LIVE_MAX_ORDERS_PER_EVENT_PER_DAY", "4")),
             cost_tolerance=Decimal(os.getenv("V3_LIVE_COST_TOLERANCE", "0.01")),
             expiry_grace_seconds=int(os.getenv("V3_LIVE_EXPIRY_GRACE_SECONDS", "600")),
         )
@@ -162,6 +160,82 @@ def record_expired_orders(
     return expired
 
 
+async def record_verified_cancellations(
+    processor: StreamEventProcessor,
+    ledger: EventLedger,
+    api: UnifiedPolymarketAPI,
+    remote: RemoteSnapshot,
+    history: CompleteAccountTradeHistory,
+) -> list[str]:
+    """Close only missing local orders proven canceled and wholly unfilled remotely."""
+    remote_ids = {order.order_id for order in remote.open_orders}
+    missing = processor.active_order_ids - remote_ids
+    if not missing or not isinstance(history, CompleteAccountTradeHistory):
+        return []
+    accepted_by_id: dict[str, list[dict[str, Any]]] = {}
+    for event in ledger.events():
+        if event.event_type != "order.accepted":
+            continue
+        order_id = event.payload.get("order_id")
+        if isinstance(order_id, str) and order_id:
+            accepted_by_id.setdefault(order_id, []).append(dict(event.payload))
+
+    canceled: list[str] = []
+    for order_id in sorted(missing):
+        local_order = processor.orders.get(order_id)
+        accepted_rows = accepted_by_id.get(order_id, [])
+        if local_order is None or local_order.confirmed_size != ZERO or len(accepted_rows) != 1:
+            continue
+        try:
+            detail = await api.fetch_account_order(order_id)
+        except Exception:
+            continue
+        if not isinstance(detail, RemoteAccountOrder):
+            continue
+        accepted = accepted_rows[0]
+        try:
+            accepted_price = Decimal(str(accepted.get("price")))
+            accepted_size = Decimal(str(accepted.get("requested_size")))
+        except (ArithmeticError, TypeError, ValueError):
+            continue
+        if (
+            detail.order_id != order_id
+            or detail.status not in {"CANCELED", "CANCELLED"}
+            or detail.size_matched != ZERO
+            or detail.original_size != accepted_size
+            or detail.price != accepted_price
+            or detail.condition_id != accepted.get("condition_id")
+            or detail.token_id != accepted.get("token_id")
+            or detail.side != accepted.get("side")
+            or local_order.token_id != detail.token_id
+            or local_order.side != detail.side
+            or local_order.requested_size != detail.original_size
+        ):
+            continue
+        referenced_trades = [
+            trade for trade in history.trades
+            if trade.taker_order_id == order_id
+            or any(maker.order_id == order_id for maker in trade.maker_orders)
+        ]
+        if referenced_trades:
+            continue
+        result = processor.process(SimpleNamespace(topic="user", type="order", payload={
+            "id": order_id,
+            "type": "CANCELLATION",
+            "status": "CANCELED",
+            "reason": "remote_order_detail_canceled_zero_match",
+            "condition_id": detail.condition_id,
+            "token_id": detail.token_id,
+            "side": detail.side,
+            "price": str(detail.price),
+            "original_size": str(detail.original_size),
+            "size_matched": str(detail.size_matched),
+        }))
+        if result.accepted and not result.requires_reconciliation:
+            canceled.append(order_id)
+    return canceled
+
+
 def baseline_from(remote: RemoteSnapshot, now: datetime, configured_external: frozenset[str]) -> dict[str, Any]:
     if remote.open_orders:
         raise RuntimeError(
@@ -198,7 +272,7 @@ class LiveTradingRunner(LiveShadowRunner):
         self.runner_settings = runner_settings
 
     def _event_block_reason(
-        self, evaluation: Any, remote: RemoteSnapshot, local: LocalSnapshot, today: str,
+        self, evaluation: Any, remote: RemoteSnapshot, local: LocalSnapshot,
     ) -> str | None:
         if evaluation.condition_id in self.reconciler.external_condition_ids:
             return "condition is held outside the bot (external)"
@@ -208,9 +282,6 @@ class LiveTradingRunner(LiveShadowRunner):
             return "bot order for this event is still resting"
         if any(order.get("token_id") in local.position_tokens for order in orders):
             return "bot already holds a position in this event"
-        today_count = sum(1 for order in orders if str(order.get("at", "")).startswith(today))
-        if today_count >= self.runner_settings.max_orders_per_event_per_day:
-            return "per-event daily order cap reached"
         return None
 
     async def run_cycle(self, *, now: datetime | None = None) -> dict[str, Any]:
@@ -224,6 +295,48 @@ class LiveTradingRunner(LiveShadowRunner):
             "data_dir": self.store.data_dir,
         }
         entry_block: str | None = None
+        try:
+            baseline_cash = Decimal(str(self.state["baseline_cash"]))
+            baseline_epoch = self.state["baseline_epoch"]
+            stored_peak = Decimal(str(self.state["peak_equity"]))
+            stored_day_start = self.state.get("day_start_equity")
+            if (
+                type(baseline_epoch) is not int or baseline_epoch < 0
+                or not baseline_cash.is_finite() or baseline_cash < ZERO
+                or not stored_peak.is_finite() or stored_peak <= ZERO
+                or ("day" in self.state) != (stored_day_start is not None)
+            ):
+                raise ValueError("persisted risk baseline is inconsistent")
+            if stored_day_start is not None:
+                day_start_equity = Decimal(str(stored_day_start))
+                if not day_start_equity.is_finite() or day_start_equity <= ZERO:
+                    raise ValueError("persisted day-start equity is invalid")
+        except (ArithmeticError, KeyError, TypeError, ValueError):
+            status.update({
+                "healthy": False,
+                "cycle": self.state.get("cycles", 0),
+                "entry_block_reason": "persisted risk baseline invalid",
+                "weather_markets_evaluated": 0,
+                "weather_forecast_status": "not_started",
+                "weather_errors": 0,
+                "v7_candidates": 0,
+                "outcomes_this_cycle": {},
+                "limits": asdict(self.risk.limits),
+                "reconciliation": {
+                    "safe_to_trade": False,
+                    "invalid_snapshot": True,
+                    "cash_delta": ZERO,
+                    "unknown_positions": 0,
+                    "unknown_orders": 0,
+                    "missing_positions": 0,
+                    "missing_orders": 0,
+                    "position_mismatches": 0,
+                    "external_positions": 0,
+                },
+                "cycle_finished_at": _utc_now().isoformat(),
+            })
+            self.store.write_status(status)
+            return status
 
         recovery = await self.service.recover_trade_history(
             max_items=TRADE_HISTORY_MAX_ITEMS, page_limit=TRADE_HISTORY_PAGE_LIMIT,
@@ -235,6 +348,19 @@ class LiveTradingRunner(LiveShadowRunner):
             processor, self.ledger, remote, now,
             grace_seconds=self.runner_settings.expiry_grace_seconds,
         )
+        status["orders_marked_terminal_canceled"] = []
+        if processor.active_order_ids - {order.order_id for order in remote.open_orders}:
+            try:
+                history = await self.api.fetch_complete_account_trade_history(
+                    after=int(self.state["baseline_epoch"]),
+                    max_items=TRADE_HISTORY_MAX_ITEMS,
+                    page_limit=TRADE_HISTORY_PAGE_LIMIT,
+                )
+                status["orders_marked_terminal_canceled"] = await record_verified_cancellations(
+                    processor, self.ledger, self.api, remote, history,
+                )
+            except Exception as exc:
+                status["order_detail_reconciliation_error"] = type(exc).__name__
         if processor.reconciliation_required:
             entry_block = "lifecycle reconciliation latched: " + "; ".join(processor.reconciliation_reasons)
 
@@ -255,6 +381,15 @@ class LiveTradingRunner(LiveShadowRunner):
             entry_block = "daily loss limit reached"
         if entry_block is None and peak - equity >= limits.max_drawdown_amount:
             entry_block = "maximum drawdown reached"
+        if entry_block is None and limits.max_drawdown_fraction is not None and peak > ZERO and (
+            (peak - equity) / peak >= limits.max_drawdown_fraction
+        ):
+            entry_block = "maximum drawdown reached"
+        risk_context = LiveRiskContext(
+            daily_pnl=daily_pnl,
+            peak_equity=peak,
+            day_start_equity=Decimal(self.state["day_start_equity"]),
+        )
 
         status.update({
             "cash": remote.cash,
@@ -294,24 +429,19 @@ class LiveTradingRunner(LiveShadowRunner):
         )
         candidates = select_v7_candidates(result.evaluations)
         outcomes: dict[str, int] = {}
-        attempts = 0
         for evaluation in candidates:
-            if attempts >= self.shadow.max_new_orders_per_cycle:
-                break
             base = {"at": now.isoformat(), "event_key": evaluation.event_key,
                     "condition_id": evaluation.condition_id, "question": evaluation.question,
                     "submitted": False}
             if entry_block is not None:
                 record = {**base, "outcome": "blocked", "stage": "account", "reason": entry_block}
-            elif (reason := self._event_block_reason(evaluation, remote, local, today)) is not None:
+            elif (reason := self._event_block_reason(evaluation, remote, local)) is not None:
                 record = {**base, "outcome": "skipped", "stage": "event", "reason": reason}
             else:
                 record, intent = await self._build_intent(evaluation, now)
                 if intent is not None:
-                    attempts += 1
-                    execution = await self.service.submit(
-                        intent, local, LiveRiskContext(daily_pnl=daily_pnl, peak_equity=peak),
-                    )
+                    execution = await self.service.submit(intent, local, risk_context)
+                    self.state["peak_equity"] = str(risk_context.peak_equity)
                     order = execution.order
                     record.update(
                         stage="submit",
@@ -335,6 +465,71 @@ class LiveTradingRunner(LiveShadowRunner):
             self.store.append(self.store.intents_path, record)
             outcomes[record["outcome"]] = outcomes.get(record["outcome"], 0) + 1
             self.store.save_state(self.state)
+
+        if outcomes.get("accepted", 0):
+            try:
+                final_remote = await self.api.fetch_remote_snapshot()
+                final_processor = StreamEventProcessor(self.ledger)
+                final_local = local_snapshot(
+                    final_processor, Decimal(self.state["baseline_cash"]),
+                )
+                final_report = self.reconciler.compare(final_local, final_remote)
+                if final_report.invalid_snapshot:
+                    raise ValueError("post-cycle account snapshot failed validation")
+                final_equity = final_remote.cash + sum(
+                    (position.current_value for position in final_remote.positions), ZERO,
+                )
+                prior_peak = Decimal(self.state["peak_equity"])
+                day_start_equity = Decimal(self.state["day_start_equity"])
+                if (
+                    not final_equity.is_finite() or final_equity <= ZERO
+                    or not prior_peak.is_finite() or prior_peak <= ZERO
+                    or not day_start_equity.is_finite() or day_start_equity <= ZERO
+                ):
+                    raise ValueError("post-cycle account or risk baseline is invalid")
+                final_peak = max(prior_peak, final_equity)
+                final_daily_pnl = final_equity - day_start_equity
+                if not final_daily_pnl.is_finite():
+                    raise ValueError("post-cycle daily P&L is invalid")
+                if entry_block is None and not final_report.safe_to_trade:
+                    entry_block = "account reconciliation blocked entries after submission"
+                if entry_block is None and final_daily_pnl <= -limits.daily_loss_limit:
+                    entry_block = "daily loss limit reached after submission"
+                if entry_block is None and final_peak - final_equity >= limits.max_drawdown_amount:
+                    entry_block = "maximum drawdown reached after submission"
+                if entry_block is None and limits.max_drawdown_fraction is not None and final_peak > ZERO and (
+                    (final_peak - final_equity) / final_peak >= limits.max_drawdown_fraction
+                ):
+                    entry_block = "maximum drawdown reached after submission"
+                self.state["peak_equity"] = str(final_peak)
+                status.update({
+                    "cash": final_remote.cash,
+                    "expected_bot_cash": final_local.cash,
+                    "equity": final_equity,
+                    "daily_pnl": final_daily_pnl,
+                    "peak_equity": final_peak,
+                    "drawdown": final_peak - final_equity,
+                    "open_orders": len(final_remote.open_orders),
+                    "bot_active_orders": len(final_processor.active_order_ids),
+                    "bot_position_tokens": len(final_local.position_tokens),
+                    "bot_cost_basis": sum((final_local.position_cost_basis or {}).values(), ZERO),
+                    "reconciliation": {
+                        "safe_to_trade": final_report.safe_to_trade,
+                        "cash_delta": final_report.cash_delta,
+                        "unknown_positions": len(final_report.unknown_positions),
+                        "unknown_orders": len(final_report.unknown_orders),
+                        "missing_positions": len(final_report.missing_positions),
+                        "missing_orders": len(final_report.missing_orders),
+                        "position_mismatches": len(final_report.position_mismatches),
+                        "external_positions": len(final_report.external_positions),
+                    },
+                })
+            except Exception as exc:
+                status["healthy"] = False
+                status["post_cycle_reconciliation_error"] = type(exc).__name__
+                status["reconciliation"]["safe_to_trade"] = False
+                if entry_block is None:
+                    entry_block = "post-cycle account verification failed"
 
         self.state["cycles"] = int(self.state.get("cycles", 0)) + 1
         self.store.save_state(self.state)

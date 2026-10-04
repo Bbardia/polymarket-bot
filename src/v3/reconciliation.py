@@ -80,6 +80,31 @@ class RemoteTrade:
             raise ValueError("maker_orders must be an immutable tuple")
 
 
+@dataclass(frozen=True)
+class CompleteAccountTradeHistory:
+    """Bounded account-trade result returned only after the paginator is exhausted."""
+
+    after: int
+    trades: tuple[RemoteTrade, ...]
+    fetched_at: datetime
+    max_items: int
+    page_limit: int
+
+    def __post_init__(self) -> None:
+        if type(self.after) is not int or self.after < 0:
+            raise ValueError("history baseline must be a nonnegative Unix timestamp")
+        if not isinstance(self.trades, tuple) or not all(isinstance(row, RemoteTrade) for row in self.trades):
+            raise ValueError("trades must be an immutable tuple of validated records")
+        if len({row.trade_id for row in self.trades}) != len(self.trades):
+            raise ValueError("history trade IDs must be unique")
+        if not isinstance(self.fetched_at, datetime) or self.fetched_at.tzinfo is None or self.fetched_at.utcoffset() is None:
+            raise ValueError("history retrieval time must be timezone-aware")
+        if type(self.max_items) is not int or self.max_items <= 0 or type(self.page_limit) is not int or self.page_limit <= 0:
+            raise ValueError("history pagination bounds must be positive integers")
+        if len(self.trades) > self.max_items or any(row.matched_at.timestamp() < self.after for row in self.trades):
+            raise ValueError("history exceeds its bound or contains a pre-baseline trade")
+
+
 def _validate_trade_economics(price: Decimal, size: Decimal, fee: Decimal | None) -> None:
     if not isinstance(price, Decimal) or not price.is_finite() or price <= ZERO:
         raise ValueError("trade price must be finite and positive")
@@ -106,6 +131,38 @@ class RemoteOrder:
     condition_id: str
     token_id: str
     remaining_notional: Decimal | None = None
+
+
+@dataclass(frozen=True)
+class RemoteAccountOrder:
+    """Authoritative read-only order detail returned for one exact exchange ID."""
+
+    order_id: str
+    condition_id: str
+    token_id: str
+    side: str
+    price: Decimal
+    original_size: Decimal
+    size_matched: Decimal
+    status: str
+
+    def __post_init__(self) -> None:
+        if not all(isinstance(value, str) and value.strip() for value in (
+            self.order_id, self.condition_id, self.token_id,
+        )):
+            raise ValueError("remote account order identity is required")
+        if self.side not in ("BUY", "SELL"):
+            raise ValueError("remote account order side is invalid")
+        if not isinstance(self.status, str) or not self.status.strip():
+            raise ValueError("remote account order status is required")
+        if (
+            not isinstance(self.price, Decimal) or not self.price.is_finite() or self.price <= ZERO
+            or not isinstance(self.original_size, Decimal) or not self.original_size.is_finite()
+            or self.original_size <= ZERO
+            or not isinstance(self.size_matched, Decimal) or not self.size_matched.is_finite()
+            or self.size_matched < ZERO or self.size_matched > self.original_size
+        ):
+            raise ValueError("remote account order economics are invalid")
 
 
 @dataclass(frozen=True)

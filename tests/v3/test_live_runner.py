@@ -20,7 +20,10 @@ from src.v3.live_runner import (
 )
 from src.v3.live_shadow import LiveShadowSettings
 from src.v3.orders import OrderAggregate
-from src.v3.reconciliation import Reconciler, RemoteOrder, RemotePosition, RemoteSnapshot
+from src.v3.reconciliation import (
+    CompleteAccountTradeHistory, Reconciler, RemoteAccountOrder, RemoteOrder,
+    RemotePosition, RemoteSnapshot, RemoteTrade, RemoteTradeMaker,
+)
 from src.v3.streaming import StreamEventProcessor
 
 D = Decimal
@@ -100,9 +103,26 @@ class _Service:
 class _API:
     def __init__(self, cash="237.13", positions=(), orders=()):
         self.remote = RemoteSnapshot(D(cash), tuple(positions), tuple(orders))
+        self.account_order_details = {}
+        self.account_trade_history: tuple[RemoteTrade, ...] = ()
+        self.snapshot_fetches = 0
+        self.fail_snapshot_at: int | None = None
+        self.snapshot_overrides: dict[int, RemoteSnapshot] = {}
 
     async def fetch_remote_snapshot(self):
-        return self.remote
+        self.snapshot_fetches += 1
+        if self.snapshot_fetches == self.fail_snapshot_at:
+            raise OSError("simulated post-cycle snapshot failure")
+        return self.snapshot_overrides.get(self.snapshot_fetches, self.remote)
+
+    async def fetch_account_order(self, order_id):
+        return self.account_order_details[order_id]
+
+    async def fetch_complete_account_trade_history(self, *, after, max_items, page_limit):
+        return CompleteAccountTradeHistory(
+            after=after, trades=tuple(self.account_trade_history), fetched_at=NOW,
+            max_items=max_items, page_limit=page_limit,
+        )
 
     async def get_verified_market_context(self, condition_id, token_id):
         return SimpleNamespace(book_hash="h1", tick_size=D("0.01"), min_order_size=D("5"),
@@ -167,6 +187,60 @@ def test_cycle_submits_through_service_and_records_event_order(tmp_path, monkeyp
     assert state["event_orders"]["toronto:2026-10-04"][0]["order_id"] == "ord-1"
 
 
+def test_live_cycle_processes_all_selected_candidates_beyond_cycle_limit(tmp_path, monkeypatch):
+    class MultiService(_Service):
+        async def submit(self, intent, local, context):
+            self.submitted.append((intent, local, context))
+            order = OrderAggregate.new(
+                client_order_id=f"client-{len(self.submitted)}",
+                token_id=intent.token_id,
+                side="BUY",
+                requested_size=intent.shares,
+            )
+            order.accept(order_id=f"order-{len(self.submitted)}", status="live")
+            return ExecutionResult(True, "live", order)
+
+    candidates = tuple(
+        _evaluation(event_key=f"city-{i}:2026-10-04", condition=f"cond-{i}")
+        for i in range(5)
+    )
+    service = MultiService()
+    runner, _ = _runner(
+        tmp_path, monkeypatch, service=service, evaluations=candidates,
+    )
+    runner.shadow = LiveShadowSettings(
+        data_dir=runner.store.data_dir, max_new_orders_per_cycle=1,
+    )
+
+    status = asyncio.run(runner.run_cycle(now=NOW))
+
+    assert len(service.submitted) == len(candidates)
+    assert status["outcomes_this_cycle"] == {"accepted": len(candidates)}
+
+
+def test_live_cycle_does_not_apply_per_event_daily_submission_cap(tmp_path, monkeypatch):
+    event_key = "toronto:2026-10-04"
+    state = {
+        "baseline_at": NOW.isoformat(), "baseline_epoch": int(NOW.timestamp()),
+        "baseline_cash": "237.13", "baseline_equity": "237.13",
+        "external_condition_ids": ["cond-old"], "peak_equity": "237.13",
+        "event_orders": {event_key: [
+            {"at": NOW.isoformat(), "order_id": f"expired-{i}", "token_id": f"old-{i}"}
+            for i in range(4)
+        ]},
+    }
+    service = _Service()
+    runner, _ = _runner(
+        tmp_path, monkeypatch, service=service,
+        evaluations=(_evaluation(event_key=event_key),), state=state,
+    )
+
+    status = asyncio.run(runner.run_cycle(now=NOW))
+
+    assert len(service.submitted) == 1
+    assert status["outcomes_this_cycle"] == {"accepted": 1}
+
+
 def test_resting_order_blocks_requote_of_same_event(tmp_path, monkeypatch):
     service = _Service()
     api = _API(orders=(RemoteOrder("ord-1", "cond-new", "tok-cond-new", D("1.9")),))
@@ -194,6 +268,76 @@ def test_unknown_position_blocks_all_entries(tmp_path, monkeypatch):
     status = asyncio.run(runner.run_cycle(now=NOW))
     assert service.submitted == []
     assert status["entry_block_reason"] == "account reconciliation blocked entries"
+
+
+def test_missing_order_is_reconciled_only_after_remote_cancel_and_zero_fill_proof(tmp_path, monkeypatch):
+    state = {
+        "baseline_at": NOW.isoformat(), "baseline_epoch": int(NOW.timestamp()),
+        "baseline_cash": "237.13", "baseline_equity": "237.13",
+        "external_condition_ids": ["cond-old"], "peak_equity": "237.13",
+        "event_orders": {},
+    }
+    api = _API()
+    api.account_order_details["gone"] = RemoteAccountOrder(
+        order_id="gone", condition_id="cond", token_id="tok-gone", side="BUY",
+        price=D("0.19"), original_size=D("10"), size_matched=D("0"), status="CANCELED",
+    )
+    service = _Service()
+    runner, _ = _runner(
+        tmp_path, monkeypatch, api=api, service=service,
+        evaluations=(_evaluation(condition="cond-old"),), state=state,
+    )
+    _accept(runner.ledger, "gone", token="tok-gone", size="10",
+            expiration=int((NOW + timedelta(hours=1)).timestamp()))
+
+    status = asyncio.run(runner.run_cycle(now=NOW))
+
+    assert status["orders_marked_terminal_canceled"] == ["gone"]
+    assert status["reconciliation"]["safe_to_trade"] is True
+    assert status["reconciliation"]["missing_orders"] == 0
+    assert status["bot_active_orders"] == 0
+    assert StreamEventProcessor(runner.ledger).orders["gone"].state.value == "CANCELED"
+    assert service.submitted == []
+
+
+@pytest.mark.parametrize("proof", ["still_live", "partial_fill", "trade_history"])
+def test_missing_order_stays_blocked_without_complete_cancel_proof(tmp_path, monkeypatch, proof):
+    state = {
+        "baseline_at": NOW.isoformat(), "baseline_epoch": int(NOW.timestamp()),
+        "baseline_cash": "237.13", "baseline_equity": "237.13",
+        "external_condition_ids": ["cond-old"], "peak_equity": "237.13",
+        "event_orders": {},
+    }
+    api = _API()
+    matched = D("1") if proof == "partial_fill" else D("0")
+    status_text = "LIVE" if proof == "still_live" else "CANCELED"
+    api.account_order_details["gone"] = RemoteAccountOrder(
+        order_id="gone", condition_id="cond", token_id="tok-gone", side="BUY",
+        price=D("0.19"), original_size=D("10"), size_matched=matched, status=status_text,
+    )
+    if proof == "trade_history":
+        api.account_trade_history = (RemoteTrade(
+            trade_id="trade-gone", condition_id="cond", token_id="tok-gone",
+            taker_order_id="other", side="SELL", trader_side="MAKER", price=D("0.19"),
+            size=D("1"), status="MATCHED", matched_at=NOW, updated_at=None,
+            fee_rate_bps=D("0"), transaction_hash=None,
+            maker_orders=(RemoteTradeMaker(
+                order_id="gone", token_id="tok-gone", side="BUY", price=D("0.19"),
+                matched_amount=D("1"), fee_rate_bps=D("0"),
+            ),),
+        ),)
+    runner, _ = _runner(
+        tmp_path, monkeypatch, api=api, evaluations=(_evaluation(condition="cond-old"),), state=state,
+    )
+    _accept(runner.ledger, "gone", token="tok-gone", size="10",
+            expiration=int((NOW + timedelta(hours=1)).timestamp()))
+
+    status = asyncio.run(runner.run_cycle(now=NOW))
+
+    assert status["orders_marked_terminal_canceled"] == []
+    assert status["entry_block_reason"] == "account reconciliation blocked entries"
+    assert status["reconciliation"]["missing_orders"] == 1
+    assert StreamEventProcessor(runner.ledger).active_order_ids == frozenset({"gone"})
 
 
 def test_unexplained_cash_outflow_blocks_but_inflow_does_not(tmp_path, monkeypatch):
@@ -233,9 +377,17 @@ class _SdkAPI:
         self.trades = ()
         self.trade_after = []
         self.created = []
+        self.conditions_by_token = {}
+        self.external_values_after_post: list[Decimal] = []
 
     async def initialize_secure_client(self):
         return self
+
+    async def initialize_account_client(self):
+        return None
+
+    def _authenticated_client(self):
+        return SimpleNamespace(close=_async_none)
 
     async def fetch_remote_snapshot(self):
         return self.remote
@@ -245,6 +397,7 @@ class _SdkAPI:
         return tuple(t for t in self.trades if after is None or t.matched_at.timestamp() >= after)
 
     async def get_verified_market_context(self, condition_id, token_id):
+        self.conditions_by_token[token_id] = condition_id
         return SimpleNamespace(
             condition_id=condition_id, token_id=token_id, condition_matches=True,
             token_matches=True, tick_size=D("0.01"), min_order_size=D("5"), fee_rate=D("0.05"),
@@ -257,7 +410,29 @@ class _SdkAPI:
         return {"signed": kwargs}
 
     async def post_order(self, signed):
-        return SimpleNamespace(ok=True, order_id="sdk-ord-1", status="live")
+        args = signed["signed"]
+        order_id = f"sdk-ord-{len(self.created)}"
+        self.remote = RemoteSnapshot(
+            self.remote.cash,
+            self.remote.positions,
+            self.remote.open_orders + (RemoteOrder(
+                order_id,
+                self.conditions_by_token[args["token_id"]],
+                args["token_id"],
+                args["price"] * args["size"],
+            ),),
+        )
+        if self.external_values_after_post:
+            current_value = self.external_values_after_post.pop(0)
+            self.remote = RemoteSnapshot(
+                self.remote.cash,
+                tuple(RemotePosition(
+                    position.condition_id, position.token_id, position.size,
+                    current_value, position.initial_value, position.redeemable,
+                ) for position in self.remote.positions),
+                self.remote.open_orders,
+            )
+        return SimpleNamespace(ok=True, order_id=order_id, status="live")
 
 
 def test_end_to_end_baseline_submit_fill_and_reconcile(tmp_path, monkeypatch):
@@ -276,10 +451,6 @@ def test_end_to_end_baseline_submit_fill_and_reconcile(tmp_path, monkeypatch):
     api = _SdkAPI(settings, RemoteSnapshot(D("237.13"), old, ()))
     monkeypatch.setattr(live_runner, "UnifiedPolymarketAPI", lambda settings: api)
 
-    async def fake_account_client():
-        return None
-    api.initialize_account_client = fake_account_client
-    api._authenticated_client = lambda: SimpleNamespace(close=_async_none)
     runner_settings = LiveRunnerSettings(shadow=LiveShadowSettings(data_dir=tmp_path / "live"))
 
     store, _, ledger, reconciler, service = asyncio.run(_start(settings, runner_settings))
@@ -322,7 +493,10 @@ async def _async_none():
     return None
 
 
-def _runner_with(tmp_path, monkeypatch, store, ledger, reconciler, service, api, settings, runner_settings):
+def _runner_with(
+    tmp_path, monkeypatch, store, ledger, reconciler, service, api, settings, runner_settings,
+    *, evaluations=None,
+):
     from src.v3 import live_runner, v7_weather_intent
     monkeypatch.setattr(live_shadow, "station_metadata_reason", lambda path, city: None)
     monkeypatch.setattr(live_shadow, "propose_v7_weather_order", lambda *a, **k: (
@@ -330,7 +504,8 @@ def _runner_with(tmp_path, monkeypatch, store, ledger, reconciler, service, api,
                                                  expected_edge=D("0.11"), quote_age_seconds=5)))
 
     async def universe(**kwargs):
-        return SimpleNamespace(evaluations=(_evaluation(),), markets_evaluated=1,
+        selected = tuple(evaluations or (_evaluation(),))
+        return SimpleNamespace(evaluations=selected, markets_evaluated=len(selected),
                                forecast_status="available", errors=())
 
     monkeypatch.setattr(live_runner, "evaluate_weather_universe", universe)
@@ -340,3 +515,174 @@ def _runner_with(tmp_path, monkeypatch, store, ledger, reconciler, service, api,
         weather_client=None, forecast=None, observation_provider=None,
     )
     return runner, store
+
+
+def test_real_live_service_processes_every_candidate_but_honors_open_order_cap(
+    tmp_path, monkeypatch,
+):
+    from src.v3.live_runner import _start
+    from src.v3 import live_runner
+
+    candidates = tuple(
+        _evaluation(event_key=f"city-{i}:2026-10-04", condition=f"condition-{i}")
+        for i in range(5)
+    )
+    settings = V3Settings(
+        live_enabled=True, paper_trading=False, live_confirmation="I_UNDERSTAND_REAL_MONEY",
+        private_key="0x" + "1" * 64, wallet_address="0x" + "2" * 40,
+        max_capital=D("100"), max_order_notional=D("2"), reserve_fraction=D("0.25"),
+        max_daily_loss=D("10"), max_drawdown_amount=D("10"),
+    )
+    api = _SdkAPI(settings, RemoteSnapshot(D("237.13"), (), ()))
+    monkeypatch.setattr(live_runner, "UnifiedPolymarketAPI", lambda settings: api)
+
+    runner_settings = LiveRunnerSettings(shadow=LiveShadowSettings(
+        data_dir=tmp_path / "live", max_open_orders=2, max_new_orders_per_cycle=1,
+    ))
+    store, _, ledger, reconciler, service = asyncio.run(_start(settings, runner_settings))
+    runner, _ = _runner_with(
+        tmp_path, monkeypatch, store, ledger, reconciler, service, api, settings,
+        runner_settings, evaluations=candidates,
+    )
+
+    status = asyncio.run(runner.run_cycle())
+
+    assert status["outcomes_this_cycle"] == {"accepted": 2, "rejected": 3}, status
+    assert len(api.created) == 2
+    assert len(api.remote.open_orders) == 2
+    assert status["bot_active_orders"] == 2
+    assert status["reconciliation"]["safe_to_trade"] is True
+    assert status["limits"]["max_open_orders"] == 2
+
+
+def test_real_service_refreshes_daily_loss_before_each_candidate_submission(tmp_path, monkeypatch):
+    from src.v3.live_runner import _start
+    from src.v3 import live_runner
+
+    candidates = tuple(
+        _evaluation(event_key=f"city-{i}:2026-10-04", condition=f"condition-{i}")
+        for i in range(5)
+    )
+    settings = V3Settings(
+        live_enabled=True, paper_trading=False, live_confirmation="I_UNDERSTAND_REAL_MONEY",
+        private_key="0x" + "1" * 64, wallet_address="0x" + "2" * 40,
+        max_capital=D("100"), max_order_notional=D("2"), reserve_fraction=D("0.25"),
+        max_daily_loss=D("10"), max_drawdown_amount=D("100"),
+    )
+    baseline_position = RemotePosition(
+        "external-condition", "external-token", D("50"), D("10"), D("10"), True,
+    )
+    api = _SdkAPI(settings, RemoteSnapshot(D("90"), (baseline_position,), ()))
+    api.external_values_after_post = [D("0")]
+    monkeypatch.setattr(live_runner, "UnifiedPolymarketAPI", lambda settings: api)
+
+    runner_settings = LiveRunnerSettings(shadow=LiveShadowSettings(
+        data_dir=tmp_path / "live", max_open_orders=5, max_new_orders_per_cycle=1,
+    ))
+    store, _, ledger, reconciler, service = asyncio.run(_start(settings, runner_settings))
+    runner, _ = _runner_with(
+        tmp_path, monkeypatch, store, ledger, reconciler, service, api, settings,
+        runner_settings, evaluations=candidates,
+    )
+
+    status = asyncio.run(runner.run_cycle())
+
+    assert status["outcomes_this_cycle"] == {"accepted": 1, "rejected": 4}, status
+    assert len(api.created) == 1
+    assert status["daily_pnl"] == D("-10")
+    assert status["entry_block_reason"] == "daily loss limit reached after submission"
+    assert status["reconciliation"]["safe_to_trade"] is True
+
+
+def test_post_cycle_snapshot_failure_marks_status_unhealthy_and_blocked(tmp_path, monkeypatch):
+    api = _API()
+    api.fail_snapshot_at = 2
+    runner, _ = _runner(tmp_path, monkeypatch, api=api, service=_Service())
+
+    status = asyncio.run(runner.run_cycle(now=NOW))
+
+    assert status["outcomes_this_cycle"] == {"accepted": 1}
+    assert status["healthy"] is False
+    assert status["post_cycle_reconciliation_error"] == "OSError"
+    assert status["reconciliation"]["safe_to_trade"] is False
+    assert status["entry_block_reason"] == "post-cycle account verification failed"
+
+
+@pytest.mark.parametrize("corruption", ["peak", "epoch", "day_start_missing"])
+def test_malformed_persisted_risk_baseline_blocks_before_account_reads(
+    tmp_path, monkeypatch, corruption,
+):
+    api = _API()
+    service = _Service()
+    runner, _ = _runner(tmp_path, monkeypatch, api=api, service=service)
+    if corruption == "peak":
+        runner.state["peak_equity"] = "NaN"
+    elif corruption == "epoch":
+        runner.state["baseline_epoch"] = True
+    else:
+        runner.state["day"] = NOW.date().isoformat()
+
+    status = asyncio.run(runner.run_cycle(now=NOW))
+
+    assert status["healthy"] is False
+    assert status["reconciliation"]["safe_to_trade"] is False
+    assert status["entry_block_reason"] == "persisted risk baseline invalid"
+    assert api.snapshot_fetches == 0
+    assert service.submitted == []
+
+
+def test_real_service_carries_intracycle_peak_for_drawdown_fraction(tmp_path, monkeypatch):
+    from src.v3.live_runner import _start
+    from src.v3 import live_runner
+
+    candidates = tuple(
+        _evaluation(event_key=f"city-{i}:2026-10-04", condition=f"condition-{i}")
+        for i in range(5)
+    )
+    settings = V3Settings(
+        live_enabled=True, paper_trading=False, live_confirmation="I_UNDERSTAND_REAL_MONEY",
+        private_key="0x" + "1" * 64, wallet_address="0x" + "2" * 40,
+        max_capital=D("100"), max_order_notional=D("2"), reserve_fraction=D("0.25"),
+        max_daily_loss=D("10"), max_drawdown_amount=D("100"),
+        max_drawdown_fraction=D("0.04"),
+    )
+    baseline_position = RemotePosition(
+        "external-condition", "external-token", D("50"), D("10"), D("10"), True,
+    )
+    api = _SdkAPI(settings, RemoteSnapshot(D("90"), (baseline_position,), ()))
+    api.external_values_after_post = [D("20"), D("15")]
+    monkeypatch.setattr(live_runner, "UnifiedPolymarketAPI", lambda settings: api)
+
+    runner_settings = LiveRunnerSettings(shadow=LiveShadowSettings(
+        data_dir=tmp_path / "live", max_open_orders=5, max_new_orders_per_cycle=1,
+    ))
+    store, _, ledger, reconciler, service = asyncio.run(_start(settings, runner_settings))
+    runner, _ = _runner_with(
+        tmp_path, monkeypatch, store, ledger, reconciler, service, api, settings,
+        runner_settings, evaluations=candidates,
+    )
+
+    status = asyncio.run(runner.run_cycle())
+
+    assert status["outcomes_this_cycle"] == {"accepted": 2, "rejected": 3}, status
+    assert len(api.created) == 2
+    assert status["peak_equity"] == D("110")
+    assert status["equity"] == D("105")
+    assert status["drawdown"] == D("5")
+    assert status["entry_block_reason"] == "maximum drawdown reached after submission"
+
+
+@pytest.mark.parametrize("bad_cash", ["NaN", "Infinity", "-1", "0"])
+def test_invalid_post_cycle_snapshot_never_persists_invalid_peak(tmp_path, monkeypatch, bad_cash):
+    api = _API()
+    api.snapshot_overrides[2] = RemoteSnapshot(D(bad_cash), (), ())
+    runner, store = _runner(tmp_path, monkeypatch, api=api, service=_Service())
+    old_peak = runner.state["peak_equity"]
+
+    status = asyncio.run(runner.run_cycle(now=NOW))
+
+    assert status["healthy"] is False
+    assert status["post_cycle_reconciliation_error"] == "ValueError"
+    assert status["reconciliation"]["safe_to_trade"] is False
+    assert status["entry_block_reason"] == "post-cycle account verification failed"
+    assert json.loads(store.state_path.read_text())["peak_equity"] == old_peak

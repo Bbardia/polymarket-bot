@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 
@@ -55,6 +56,7 @@ class OrderAggregate:
     confirmed_notional: Decimal = ZERO
     confirmed_fees: Decimal = ZERO
     trades: dict[str, TradeRecord] = field(default_factory=dict)
+    canceled_at: datetime | None = None
 
     @classmethod
     def new(cls, *, client_order_id: str, token_id: str, side: str, requested_size: Decimal) -> "OrderAggregate":
@@ -84,11 +86,27 @@ class OrderAggregate:
         self.order_id = order_id
         self.state = mapping[status]
 
-    def cancel(self) -> None:
-        """Record exchange cancellation without performing an account action."""
+    def cancel(self, *, canceled_at: datetime | None = None) -> None:
+        """Record exchange cancellation without performing an account action.
+
+        A confirmed fill may arrive after this message only when its verified
+        match time is strictly earlier than the cancellation time.
+        """
         if self.state is OrderState.FILLED:
             raise ValueError("filled order cannot transition to canceled")
-        self.state = OrderState.CANCELED
+        if canceled_at is not None and (
+            not isinstance(canceled_at, datetime)
+            or canceled_at.tzinfo is None
+            or canceled_at.utcoffset() is None
+        ):
+            raise ValueError("cancellation time must be timezone-aware")
+        if self.state is not OrderState.CANCELED:
+            self.state = OrderState.CANCELED
+            self.canceled_at = canceled_at
+        elif canceled_at is not None and (
+            self.canceled_at is None or canceled_at < self.canceled_at
+        ):
+            self.canceled_at = canceled_at
 
     def record_trade(
         self,
@@ -98,8 +116,12 @@ class OrderAggregate:
         price: Decimal,
         fee: Decimal,
         status: TradeStatus,
+        matched_at: datetime | None = None,
     ) -> None:
-        self.validate_trade(trade_id, size=size, price=price, fee=fee, status=status)
+        self.validate_trade(
+            trade_id, size=size, price=price, fee=fee, status=status,
+            matched_at=matched_at,
+        )
         existing = self.trades.get(trade_id)
         if existing:
             if not existing.accounted:
@@ -114,15 +136,15 @@ class OrderAggregate:
             self.trades[trade_id] = record
 
         if status is TradeStatus.CONFIRMED and not record.accounted:
+            was_canceled = self.state is OrderState.CANCELED
             self.confirmed_size += size
             self.confirmed_notional += size * price
             self.confirmed_fees += fee
             record.accounted = True
-            self.state = (
-                OrderState.FILLED
-                if self.confirmed_size == self.requested_size
-                else OrderState.PARTIALLY_FILLED
-            )
+            if self.confirmed_size == self.requested_size:
+                self.state = OrderState.FILLED
+            elif not was_canceled:
+                self.state = OrderState.PARTIALLY_FILLED
 
     def validate_trade(
         self,
@@ -132,12 +154,20 @@ class OrderAggregate:
         price: Decimal,
         fee: Decimal,
         status: TradeStatus,
+        matched_at: datetime | None = None,
     ) -> None:
-        """Validate trade economics and lifecycle without changing aggregate state."""
+        """Validate trade economics and chronology without changing aggregate state."""
         if size <= ZERO or price <= ZERO or fee < ZERO:
             raise ValueError("invalid trade values")
         if self.state is OrderState.CANCELED and status is TradeStatus.CONFIRMED:
-            raise OrderReconciliationRequired("confirmed trade after cancellation requires reconciliation")
+            if (
+                self.canceled_at is None
+                or not isinstance(matched_at, datetime)
+                or matched_at.tzinfo is None
+                or matched_at.utcoffset() is None
+                or matched_at >= self.canceled_at
+            ):
+                raise OrderReconciliationRequired("confirmed trade after cancellation requires reconciliation")
         existing = self.trades.get(trade_id)
         if existing:
             if (existing.size, existing.price) != (size, price):

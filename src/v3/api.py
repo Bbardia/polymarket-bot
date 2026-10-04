@@ -19,8 +19,8 @@ from polymarket import AsyncPublicClient, AsyncSecureClient, BuilderApiKey
 
 from .config import V3Settings
 from .reconciliation import (
-    TRADE_STATUSES, TRADE_TRADER_SIDES, RemoteOrder, RemotePosition,
-    RemoteSnapshot, RemoteTrade, RemoteTradeMaker,
+    CompleteAccountTradeHistory, TRADE_STATUSES, TRADE_TRADER_SIDES,
+    RemoteAccountOrder, RemoteOrder, RemotePosition, RemoteSnapshot, RemoteTrade, RemoteTradeMaker,
 )
 
 PUSD_BASE_UNITS = Decimal("1000000")
@@ -37,8 +37,14 @@ class AccountCashFlow:
     amount: Decimal
 
     def __post_init__(self) -> None:
+        if not isinstance(self.event_id, str) or not self.event_id:
+            raise ValueError("event_id must be a nonempty string")
         if self.event_type not in ("DEPOSIT", "WITHDRAWAL"):
             raise ValueError("event_type must be DEPOSIT or WITHDRAWAL")
+        if not isinstance(self.timestamp, datetime) or self.timestamp.tzinfo is None or self.timestamp.utcoffset() is None:
+            raise ValueError("timestamp must be timezone-aware")
+        if not isinstance(self.transaction_hash, str) or not self.transaction_hash:
+            raise ValueError("transaction_hash must be a nonempty string")
         if not isinstance(self.amount, Decimal) or not self.amount.is_finite() or self.amount <= 0:
             raise ValueError("amount must be a finite positive Decimal")
 
@@ -49,6 +55,35 @@ class AccountCashFlow:
         if self.event_type == "WITHDRAWAL":
             return -self.amount
         raise ValueError("event_type must be DEPOSIT or WITHDRAWAL")
+
+
+@dataclass(frozen=True)
+class CompleteAccountCashFlowHistory:
+    """Complete bounded public deposit/withdrawal history after a baseline."""
+
+    after: int
+    flows: tuple[AccountCashFlow, ...]
+    fetched_at: datetime
+    max_items: int
+    page_size: int
+
+    def __post_init__(self) -> None:
+        if type(self.after) is not int or self.after < 0:
+            raise ValueError("cash-flow baseline must be a nonnegative Unix timestamp")
+        if not isinstance(self.flows, tuple) or not all(isinstance(row, AccountCashFlow) for row in self.flows):
+            raise ValueError("cash flows must be an immutable tuple of validated records")
+        if len({row.event_id for row in self.flows}) != len(self.flows):
+            raise ValueError("cash-flow event IDs must be unique")
+        if not isinstance(self.fetched_at, datetime) or self.fetched_at.tzinfo is None or self.fetched_at.utcoffset() is None:
+            raise ValueError("cash-flow retrieval time must be timezone-aware")
+        if type(self.max_items) is not int or self.max_items <= 0 or type(self.page_size) is not int or self.page_size <= 0:
+            raise ValueError("cash-flow pagination bounds must be positive integers")
+        if len(self.flows) > self.max_items or any(flow.timestamp.timestamp() < self.after for flow in self.flows):
+            raise ValueError("cash-flow history exceeds its bound or includes a pre-baseline record")
+
+    @property
+    def net_amount(self) -> Decimal:
+        return sum((flow.signed_amount for flow in self.flows), Decimal("0"))
 
 
 SecureClientFactory = Callable[..., Awaitable[Any]]
@@ -336,6 +371,18 @@ class UnifiedPolymarketAPI:
             raise RuntimeError(f"invalid account trade: {exc}") from exc
         return tuple(sorted(records.values(), key=lambda trade: (trade.matched_at, trade.trade_id)))
 
+    async def fetch_complete_account_trade_history(
+        self, *, after: int, max_items: int, page_limit: int,
+    ) -> CompleteAccountTradeHistory:
+        """Fetch post-baseline history; no object is returned on truncation or parse errors."""
+        trades = await self.fetch_account_trades(
+            after=after, max_items=max_items, page_limit=page_limit,
+        )
+        return CompleteAccountTradeHistory(
+            after=after, trades=trades, fetched_at=datetime.now(timezone.utc),
+            max_items=max_items, page_limit=page_limit,
+        )
+
     async def fetch_account_cash_flows(
         self, *, max_items: int = 10_000, page_size: int = ACTIVITY_PAGE_SIZE_CAP
     ) -> tuple[AccountCashFlow, ...]:
@@ -406,6 +453,19 @@ class UnifiedPolymarketAPI:
                     continue
                 records[event.event_id] = event
         return tuple(sorted(records.values(), key=lambda event: (event.timestamp, event.event_id)))
+
+    async def fetch_complete_account_cash_flow_history(
+        self, *, after: int, max_items: int = 10_000, page_size: int = ACTIVITY_PAGE_SIZE_CAP,
+    ) -> CompleteAccountCashFlowHistory:
+        """Return the post-baseline flow set only after bounded pagination finishes."""
+        if type(after) is not int or after < 0:
+            raise ValueError("after must be a nonnegative Unix timestamp")
+        flows = await self.fetch_account_cash_flows(max_items=max_items, page_size=page_size)
+        filtered = tuple(flow for flow in flows if flow.timestamp.timestamp() >= after)
+        return CompleteAccountCashFlowHistory(
+            after=after, flows=filtered, fetched_at=datetime.now(timezone.utc),
+            max_items=max_items, page_size=page_size,
+        )
 
     async def fetch_account_cash_flows_window(
         self, *, start: int, end: int, max_items: int = 20_000,
@@ -548,6 +608,34 @@ class UnifiedPolymarketAPI:
     async def get_order_book(self, token_id: str):
         """Read-only typed Decimal order book from CLOB V2."""
         return await self.public_client.get_order_book(token_id=token_id)
+
+    async def fetch_account_order(self, order_id: str) -> RemoteAccountOrder:
+        """Read one exact authenticated order record; never submits or cancels it."""
+        if not isinstance(order_id, str) or not order_id.strip():
+            raise ValueError("order_id must be a nonempty string")
+        raw = await self._authenticated_client().get_order(order_id=order_id)
+        raw_id = str(getattr(raw, "id", "") or "")
+        if raw_id != order_id:
+            raise RuntimeError("account order lookup returned a different order ID")
+        condition_id = str(
+            getattr(raw, "condition_id", None) or getattr(raw, "market", "") or ""
+        )
+        token_id = str(
+            getattr(raw, "token_id", None) or getattr(raw, "asset_id", "") or ""
+        )
+        try:
+            return RemoteAccountOrder(
+                order_id=raw_id,
+                condition_id=condition_id,
+                token_id=token_id,
+                side=str(getattr(raw, "side", "") or "").upper(),
+                price=Decimal(str(getattr(raw, "price"))),
+                original_size=Decimal(str(getattr(raw, "original_size"))),
+                size_matched=Decimal(str(getattr(raw, "size_matched"))),
+                status=str(getattr(raw, "status", "") or "").upper(),
+            )
+        except (ArithmeticError, TypeError, ValueError, InvalidOperation) as exc:
+            raise RuntimeError("account order detail is malformed") from exc
 
     async def get_market(self, *, market_id: str | None = None, slug: str | None = None):
         if not market_id and not slug:

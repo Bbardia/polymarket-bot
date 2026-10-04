@@ -77,3 +77,25 @@ def test_matched_trade_confirmation_after_cancel_raises_without_mutation():
         order.record_trade("trade-2", size=D("1"), price=D("0.50"), fee=D("0.01"), status=TradeStatus.CONFIRMED)
 
     assert (order.state, order.confirmed_size, order.confirmed_notional, order.confirmed_fees, order.trades["trade-2"].status) == before
+
+
+def test_late_fill_after_timestamped_cancellation_remains_blocked():
+    from datetime import datetime, timezone, timedelta
+
+    order = OrderAggregate.new(client_order_id="client-1", token_id="token", side="BUY", requested_size=D("10"))
+    canceled_at = datetime(2026, 10, 4, 0, 31, tzinfo=timezone.utc)
+    matched_at = datetime(2026, 10, 4, 0, 40, tzinfo=timezone.utc)
+    order.accept(order_id="exchange-1", status="live")
+    order.cancel(canceled_at=canceled_at)
+    order.cancel()
+    order.cancel(canceled_at=canceled_at + timedelta(seconds=5))
+    assert order.canceled_at == canceled_at
+    before = (order.state, order.confirmed_size, order.confirmed_notional, order.confirmed_fees, dict(order.trades))
+
+    with pytest.raises(ValueError, match="confirmed trade after cancellation requires reconciliation"):
+        order.record_trade(
+            "late-trade", size=D("1"), price=D("0.50"), fee=D("0"),
+            status=TradeStatus.CONFIRMED, matched_at=matched_at,
+        )
+
+    assert (order.state, order.confirmed_size, order.confirmed_notional, order.confirmed_fees, order.trades) == before
