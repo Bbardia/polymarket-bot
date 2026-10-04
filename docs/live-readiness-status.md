@@ -39,7 +39,7 @@ The user selected the existing V7 weather strategy as the live integration targe
 
 ## Isolated work
 
-Branch: `experiment/live-readiness-20261002` in `/home/rasbardi/polymarket-live-readiness`.
+Originally developed on `experiment/live-readiness-20261002` / `feature/v7-live-gated-readiness` in a separate worktree. Since 2026-10-04 all live code is on `main` and the live unit `polymarket-v7-live` runs from `/home/rasbardi/polymarket-bot` (data in `data/live-v7/`); the old branches are preserved in `~/polymarket-archive/git-branches-before-cleanup-2026-10-04.bundle`.
 
 The branch has fail-closed gates and tests for risk inputs, market metadata, account snapshots/reconciliation, submission ambiguity, kill-switch latching, accepted-order/fill replay, and market-context preflight. The V7 paper process must not be modified or restarted. Read-only check at 2026-10-02 14:36 CEST showed systemd `active/running`, PID `721762`; persisted status had advanced to cycle `3627`, `healthy=true`, `running=true`, `errors_this_cycle=0`, last scan `12:34:58 UTC` (about 65 seconds old at the check), with live trading and account reads disabled. It was not restarted or modified. Treat the saved status as historical if its timestamp stops advancing.
 
