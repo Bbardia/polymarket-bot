@@ -93,6 +93,21 @@ class EventLedger:
             )
             return cursor.rowcount == 1
 
+    def append_batch(self, events: tuple[LedgerEvent, ...]) -> tuple[str, ...]:
+        """Insert an all-or-nothing set of unique events in one SQLite transaction."""
+        if len({event.event_id for event in events}) != len(events):
+            raise ValueError("duplicate event id in batch")
+        with self._connect() as connection:
+            for event in events:
+                connection.execute(
+                    """INSERT INTO events(event_id, event_type, occurred_at, payload_json)
+                       VALUES (?, ?, ?, ?)""",
+                    (event.event_id, event.event_type, event.occurred_at,
+                     json.dumps(dict(event.payload), sort_keys=True,
+                                separators=(",", ":"), default=_json_default)),
+                )
+        return tuple(event.event_id for event in events)
+
     def events(self) -> Iterator[LedgerEvent]:
         with self._connect() as connection:
             rows = connection.execute(

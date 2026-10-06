@@ -111,6 +111,20 @@ def local_snapshot(processor: StreamEventProcessor, baseline_cash: Decimal) -> L
         quantities[order.token_id] = quantities.get(order.token_id, ZERO) + order.confirmed_size
         costs[order.token_id] = costs.get(order.token_id, ZERO) + order.confirmed_notional
         cash -= order.confirmed_notional
+    # Redemption audit rows are replayed separately from confirmed fill/order state.
+    # Malformed, duplicate, or unattributed rows fail closed rather than clearing inventory.
+    if isinstance(processor, StreamEventProcessor):
+        from .live_redemption import redemption_adjustments
+        redeemed, payout = redemption_adjustments(processor.ledger, processor)
+        for token, quantity in redeemed.items():
+            if quantities.get(token) != quantity:
+                raise ValueError("redeemed token does not match confirmed inventory")
+            del quantities[token]
+            del costs[token]
+        cash += payout
+    # The account collateral balance is denominated in six-decimal pUSD. SDK
+    # float-to-Decimal fill sizes can leave sub-micro-unit arithmetic residue.
+    cash = cash.quantize(Decimal("0.000001"))
     return LocalSnapshot(
         cash=cash,
         position_tokens=frozenset(quantities),
@@ -372,7 +386,21 @@ class LiveTradingRunner(LiveShadowRunner):
         self.state["peak_equity"] = str(peak)
         daily_pnl = equity - Decimal(self.state["day_start_equity"])
 
-        local = local_snapshot(processor, Decimal(self.state["baseline_cash"]))
+        # Only public, bounded evidence plus exact full-account parity may clear
+        # locally held tokens absent from the remote snapshot. A failed lookup
+        # blocks entries even if a later comparison appears otherwise safe.
+        from .live_redemption import recognize_remote_redemptions
+        status["redemptions_recorded"] = []
+        try:
+            status["redemptions_recorded"] = list(await recognize_remote_redemptions(
+                self.ledger, processor, baseline_cash, remote, self.api,
+                baseline_epoch=baseline_epoch, now=now, reconciler=self.reconciler,
+            ))
+        except Exception as exc:
+            status["redemption_reconciliation_error"] = type(exc).__name__
+            status["healthy"] = False
+            entry_block = entry_block or "redemption evidence or account parity could not be verified"
+        local = local_snapshot(processor, baseline_cash)
         report = self.reconciler.compare(local, remote)
         if entry_block is None and not report.safe_to_trade:
             entry_block = "account reconciliation blocked entries"
@@ -567,7 +595,8 @@ async def _start(settings: V3Settings, runner_settings: LiveRunnerSettings):
     reconciler = Reconciler(
         external_condition_ids=frozenset(state["external_condition_ids"]),
         cost_tolerance=runner_settings.cost_tolerance,
-        allow_cash_inflows=True,
+        cash_tolerance=ZERO,
+        allow_cash_inflows=False,
     )
     # The gated factory builds the signing client and replays post-baseline fills.
     service = await LiveOrderService.create(
