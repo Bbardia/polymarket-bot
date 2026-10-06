@@ -14,6 +14,8 @@ import requests
 
 RPC = "https://polygon-bor-rpc.publicnode.com"
 CTF = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
+PUSD = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
+TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 SINGLE = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62"
 BATCH = "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb"
 _HASH = re.compile(r"0x[0-9a-fA-F]{64}\Z")
@@ -59,7 +61,7 @@ def _transfers(log: dict) -> list[tuple[str, str, int, int]]:
 def _receipt(tx_hash: str) -> dict:
     response = requests.post(RPC, json={"jsonrpc": "2.0", "id": 1,
         "method": "eth_getTransactionReceipt", "params": [tx_hash]},
-        timeout=15, stream=True, headers={"Accept": "application/json"})
+        timeout=(5, 30), stream=True, headers={"Accept": "application/json"})
     response.raise_for_status()
     with response:
         chunks, size = [], 0
@@ -93,6 +95,24 @@ def confirm_ctf_redemption_receipt(receipt: dict, *, tx_hash: str,
         raise ValueError("malformed or unbounded receipt logs")
     wanted, owner = int(token_id), wallet.lower()
     units = int(quantity * _UNITS)
+    zero = "0x" + "0" * 40
+    # The wallet must receive this exact redemption payout in the same
+    # transaction. Unit-by-unit tracing through a pooled ERC-1155 router is
+    # impossible, so require the economically attributable debit AND credit.
+    credits = 0
+    for log in logs:
+        if not isinstance(log, dict) or str(log.get("address", "")).lower() != PUSD:
+            continue
+        topics, raw = log.get("topics"), log.get("data")
+        if (not isinstance(topics, list) or len(topics) != 3 or topics[0] != TRANSFER
+                or not all(isinstance(t, str) and _HASH.fullmatch(t) for t in topics)
+                or not isinstance(raw, str) or not re.fullmatch(r"0x[0-9a-fA-F]{64}", raw)):
+            continue
+        sender, recipient = "0x" + topics[1][-40:].lower(), "0x" + topics[2][-40:].lower()
+        if sender == zero and recipient == owner and int(raw, 16) == units:
+            credits += 1
+    if credits != 1:
+        raise ValueError("exact pUSD redemption mint to wallet is not proven")
     edges: list[tuple[str, str]] = []
     for log in logs:
         if not isinstance(log, dict) or str(log.get("address", "")).lower() != CTF:

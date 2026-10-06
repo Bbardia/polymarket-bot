@@ -2,7 +2,7 @@ from decimal import Decimal as D
 
 import pytest
 
-from src.v3.live_redemption_chain import BATCH, CTF, confirm_ctf_redemption_receipt
+from src.v3.live_redemption_chain import BATCH, CTF, PUSD, TRANSFER, confirm_ctf_redemption_receipt
 
 TX = '0x' + 'a' * 64
 WALLET = '0x' + '1' * 40
@@ -25,8 +25,14 @@ def transfer(sender, recipient, *, token=TOKEN, amount=5260000, contract=CTF):
             'data': '0x' + word(64) + word(128) + word(1) + word(int(token)) + word(1) + word(amount)}
 
 
+def payout_mint(*, recipient=WALLET, amount=5260000):
+    return {'address': PUSD, 'topics': [TRANSFER, topic(ZERO), topic(recipient)],
+            'data': '0x' + word(amount)}
+
+
 def receipt(logs):
-    return {'status': '0x1', 'transactionHash': TX, 'blockNumber': '0x1', 'logs': logs}
+    return {'status': '0x1', 'transactionHash': TX, 'blockNumber': '0x1',
+            'logs': [*logs, payout_mint()]}
 
 
 def check(logs):
@@ -36,6 +42,14 @@ def check(logs):
 
 def test_matching_wallet_outflow_and_burn():
     assert check([transfer(WALLET, ROUTER), transfer(ROUTER, ZERO)])
+
+
+def test_without_exact_wallet_pusd_credit_is_refused():
+    proof = receipt([transfer(WALLET, ROUTER), transfer(ROUTER, ZERO)])
+    proof['logs'][-1] = payout_mint(recipient=ROUTER)
+    with pytest.raises(ValueError, match='mint'):
+        confirm_ctf_redemption_receipt(proof, tx_hash=TX, wallet=WALLET,
+                                       token_id=TOKEN, quantity=D('5.26'))
 
 
 @pytest.mark.parametrize('logs', [
