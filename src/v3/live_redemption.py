@@ -265,6 +265,11 @@ async def recognize_remote_redemptions(
         winner = await api.fetch_resolved_winner(condition)
         if winner != token:
             raise ValueError('missing token is not the unique resolved winner')
+        from .live_redemption_chain import verify_ctf_redemption_transaction
+        await verify_ctf_redemption_transaction(
+            tx_hash=row.transaction_hash, wallet=wallet,
+            token_id=token, quantity=quantity,
+        )
         evidence.append(RedemptionEvidence(
             condition_id=condition, token_id=token, quantity=quantity,
             payout=row.amount, transaction_hash=row.transaction_hash,

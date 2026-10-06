@@ -2,6 +2,7 @@ import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal as D
+from unittest.mock import AsyncMock, patch
 from types import SimpleNamespace as NS
 
 import pytest
@@ -193,12 +194,13 @@ def fake_api(*, rows=None, prices=(D('1'), D('0')), closed=True, resolution_stat
 
 
 async def auto_redeem(ledger, api, remote=None):
-    return await recognize_remote_redemptions(
-        ledger, StreamEventProcessor(ledger), D('100'),
-        remote or RemoteSnapshot(D('102.63'), (), ()), api,
-        baseline_epoch=int(NOW.timestamp()) - 10, now=NOW,
-        reconciler=Reconciler(cash_tolerance=D('0')),
-    )
+    with patch('src.v3.live_redemption_chain.verify_ctf_redemption_transaction', new_callable=AsyncMock):
+        return await recognize_remote_redemptions(
+            ledger, StreamEventProcessor(ledger), D('100'),
+            remote or RemoteSnapshot(D('102.63'), (), ()), api,
+            baseline_epoch=int(NOW.timestamp()) - 10, now=NOW,
+            reconciler=Reconciler(cash_tolerance=D('0')),
+        )
 
 
 def test_public_evidence_recognizes_once_and_replays():
