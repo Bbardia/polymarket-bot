@@ -1,16 +1,16 @@
-"""Explicit, append-only accounting for independently verified winning-token redemptions.
+"""Append-only accounting for verified winning-token redemptions.
 
-No market resolution lookup or redemption is performed here. A reviewer must
-supply wallet REDEEM activity and an independently verified winning token; the
-entire resulting account snapshot must reconcile before any event is appended.
+The automatic runner derives wallet activity and a unique resolved winner from
+public read-only providers; the entire resulting account snapshot must reconcile
+before any audit event is appended. Offline callers may supply the same evidence.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 import re
-from typing import Iterable
+from typing import Any, Iterable
 
 from .ledger import EventLedger, LedgerEvent
 from .reconciliation import Reconciler, RemoteSnapshot
@@ -117,7 +117,7 @@ def record_verified_redemptions(
     remote: RemoteSnapshot, evidence: Iterable[RedemptionEvidence], *,
     reconciler: Reconciler | None = None,
 ) -> tuple[str, ...]:
-    """Explicit offline audit append; never invoked automatically by the runner.
+    """Atomic audit append after exact full-account parity.
 
     Caller must independently check that each wallet activity is for the account
     and condition and that winning_token_id is the one-hot resolved winner.
@@ -146,6 +146,10 @@ def record_verified_redemptions(
             recorded[r.token_id].get(key) == value
             for key, value in r.payload(recorded[r.token_id]['account_snapshot_sha256']).items()
         ) for r in rows):
+            comparator = reconciler or Reconciler(cash_tolerance=ZERO)
+            report = comparator.compare(current, remote)
+            if not report.safe_to_trade or report.cash_delta != ZERO:
+                raise ValueError('idempotent redemption retry has lost account parity')
             return ()
         raise ValueError('conflicting redemption evidence')
     if len(new) != len(rows):
@@ -176,10 +180,97 @@ def record_verified_redemptions(
     if not report.safe_to_trade or report.cash_delta != ZERO:
         raise ValueError('full account cash, positions, or orders fail reconciliation')
     digest = remote_snapshot_sha256(remote)
-    ids = []
-    for row in new:
-        event = LedgerEvent.create('position.redeemed', row.payload(digest))
-        if not ledger.append(event):
-            raise ValueError('redemption audit append failed')
-        ids.append(event.event_id)
-    return tuple(ids)
+    events = tuple(LedgerEvent.create('position.redeemed', row.payload(digest)) for row in new)
+    return ledger.append_batch(events)
+
+
+async def recognize_remote_redemptions(
+    ledger: EventLedger, processor: StreamEventProcessor, baseline_cash: Decimal,
+    remote: RemoteSnapshot, api: Any, *, baseline_epoch: int, now: datetime,
+    reconciler: Reconciler,
+) -> tuple[str, ...]:
+    """Append only proven full winning-token redemptions with exact account parity.
+
+    Public REDEEM activities are condition-level cash amounts (no token field);
+    a unique locally held token and independently resolved Gamma winner provide
+    the token identity. Any incomplete/ambiguous evidence blocks the entire batch.
+    """
+    if (processor.reconciliation_required or not isinstance(now, datetime)
+            or now.tzinfo is None or now.utcoffset() is None):
+        raise ValueError('redemption requires a valid lifecycle and time')
+    if type(baseline_epoch) is not int or baseline_epoch < 0 or now.timestamp() < baseline_epoch:
+        raise ValueError('invalid redemption baseline')
+    from .live_runner import local_snapshot
+    current = local_snapshot(processor, baseline_cash)
+    if current.position_quantities is None:
+        raise ValueError('managed position quantities unavailable')
+    missing = set(current.position_tokens) - {p.token_id for p in remote.positions}
+    if not missing:
+        return ()
+    conditions: dict[str, set[str]] = {}
+    for event in ledger.events():
+        if event.event_type == 'order.accepted' and event.payload.get('side') == 'BUY':
+            token_id, condition_id = event.payload.get('token_id'), event.payload.get('condition_id')
+            if isinstance(token_id, str) and isinstance(condition_id, str):
+                conditions.setdefault(token_id, set()).add(condition_id)
+    missing_conditions: dict[str, str] = {}
+    for token in missing:
+        ids = conditions.get(token)
+        if ids is None or len(ids) != 1:
+            raise ValueError('missing token lacks unique managed condition')
+        condition = next(iter(ids))
+        if condition in reconciler.external_condition_ids:
+            raise ValueError('redemption condition overlaps external inventory')
+        if condition in missing_conditions:
+            raise ValueError('multiple missing tokens share a condition')
+        missing_conditions[condition] = token
+    activities = await api.fetch_redemption_activity(after=baseline_epoch, end=int(now.timestamp()))
+    wallet = str(api.settings.wallet_address or '').lower()
+    if not wallet:
+        raise ValueError('redemption wallet missing')
+    by_condition: dict[str, list[Any]] = {condition: [] for condition in missing_conditions}
+    for row in activities:
+        kind = getattr(row, 'type', None)
+        timestamp = getattr(row, 'timestamp', None)
+        tx = getattr(row, 'transaction_hash', None)
+        if (kind not in {'REDEEM', 'DEPOSIT', 'WITHDRAWAL'}
+                or not isinstance(getattr(row, 'wallet', None), str)
+                or row.wallet.lower() != wallet
+                or not isinstance(timestamp, datetime) or timestamp.tzinfo is None
+                or not baseline_epoch <= timestamp.timestamp() <= now.timestamp()
+                or not isinstance(tx, str) or not _HASH.fullmatch(tx)):
+            raise ValueError('invalid wallet activity evidence')
+        if kind != 'REDEEM':
+            raise ValueError('unknown cash flow prevents automatic redemption recognition')
+        condition = getattr(row, 'condition_id', None)
+        amount = getattr(row, 'amount', None)
+        if (not isinstance(condition, str) or not condition
+                or not isinstance(amount, Decimal) or not amount.is_finite() or amount <= ZERO):
+            raise ValueError('malformed redemption activity')
+        if condition in by_condition:
+            by_condition[condition].append(row)
+    evidence = []
+    hashes: set[str] = set()
+    for condition, token in sorted(missing_conditions.items()):
+        rows = by_condition[condition]
+        if len(rows) != 1:
+            raise ValueError('missing token has no unique wallet redemption')
+        row = rows[0]
+        if row.transaction_hash.lower() in hashes:
+            raise ValueError('shared redemption transaction is ambiguous')
+        hashes.add(row.transaction_hash.lower())
+        quantity = current.position_quantities[token]
+        if row.amount != quantity:
+            raise ValueError('redemption payout does not equal full managed holding')
+        winner = await api.fetch_resolved_winner(condition)
+        if winner != token:
+            raise ValueError('missing token is not the unique resolved winner')
+        evidence.append(RedemptionEvidence(
+            condition_id=condition, token_id=token, quantity=quantity,
+            payout=row.amount, transaction_hash=row.transaction_hash,
+            redeemed_at=row.timestamp.astimezone(timezone.utc),
+            activity_type='REDEEM', winning_token_id=winner,
+        ))
+    return record_verified_redemptions(
+        ledger, processor, baseline_cash, remote, evidence, reconciler=reconciler,
+    )

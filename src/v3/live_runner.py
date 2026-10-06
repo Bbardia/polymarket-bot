@@ -386,7 +386,21 @@ class LiveTradingRunner(LiveShadowRunner):
         self.state["peak_equity"] = str(peak)
         daily_pnl = equity - Decimal(self.state["day_start_equity"])
 
-        local = local_snapshot(processor, Decimal(self.state["baseline_cash"]))
+        # Only public, bounded evidence plus exact full-account parity may clear
+        # locally held tokens absent from the remote snapshot. A failed lookup
+        # blocks entries even if a later comparison appears otherwise safe.
+        from .live_redemption import recognize_remote_redemptions
+        status["redemptions_recorded"] = []
+        try:
+            status["redemptions_recorded"] = list(await recognize_remote_redemptions(
+                self.ledger, processor, baseline_cash, remote, self.api,
+                baseline_epoch=baseline_epoch, now=now, reconciler=self.reconciler,
+            ))
+        except Exception as exc:
+            status["redemption_reconciliation_error"] = type(exc).__name__
+            status["healthy"] = False
+            entry_block = entry_block or "redemption evidence or account parity could not be verified"
+        local = local_snapshot(processor, baseline_cash)
         report = self.reconciler.compare(local, remote)
         if entry_block is None and not report.safe_to_trade:
             entry_block = "account reconciliation blocked entries"

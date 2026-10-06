@@ -573,6 +573,67 @@ class UnifiedPolymarketAPI:
             raise RuntimeError(f"cash-flow activity retrieval failed: {exc}") from exc
         return tuple(sorted(records.values(), key=lambda event: (event.timestamp, event.event_id)))
 
+    async def fetch_redemption_activity(
+        self, *, after: int, end: int, max_items: int = 4000, page_limit: int = 40,
+    ) -> tuple[Any, ...]:
+        """Bounded public wallet activity; never use a truncated feed as evidence."""
+        if (type(after) is not int or type(end) is not int or after < 0 or end < after
+                or type(max_items) is not int or not 0 < max_items < 5000
+                or type(page_limit) is not int or page_limit <= 0):
+            raise ValueError("invalid redemption activity bounds")
+        wallet = str(self.settings.wallet_address or "").strip()
+        if not wallet:
+            raise RuntimeError("configured wallet required for redemption activity")
+        rows: list[Any] = []
+        pages = 0
+        async for page in self.public_client.list_activity(
+            user=wallet, activity_types=["REDEEM", "DEPOSIT", "WITHDRAWAL"],
+            start=after, end=end, sort_direction="ASC", page_size=100,
+        ):
+            pages += 1
+            if pages > page_limit:
+                raise RuntimeError("redemption activity page limit exceeded")
+            items = getattr(page, "items", None)
+            if items is None or isinstance(items, (str, bytes)):
+                raise RuntimeError("malformed redemption activity page")
+            batch = list(items)
+            if len(batch) > 100 or len(rows) + len(batch) >= max_items:
+                raise RuntimeError("redemption activity bound reached")
+            rows.extend(batch)
+        return tuple(rows)
+
+    async def fetch_resolved_winner(self, condition_id: str) -> str:
+        """Require exactly one closed Gamma market with one-hot outcome prices."""
+        matches: list[Any] = []
+        pages = 0
+        async for page in self.public_client.list_markets(condition_ids=[condition_id], closed=True, page_size=20):
+            pages += 1
+            if pages > 5:
+                raise RuntimeError("resolution market page limit exceeded")
+            items = getattr(page, "items", None)
+            if items is None or isinstance(items, (str, bytes)):
+                raise RuntimeError("malformed resolution market page")
+            batch = list(items)
+            if len(batch) > 20:
+                raise RuntimeError("resolution market page size exceeded")
+            matches.extend(m for m in batch if str(getattr(m, "condition_id", "")) == condition_id)
+        if len(matches) != 1 or getattr(matches[0].state, "closed", None) is not True:
+            raise RuntimeError("condition lacks a unique closed market")
+        resolution = getattr(matches[0], "resolution", None)
+        status = getattr(resolution, "uma_resolution_status", None)
+        if getattr(status, "value", status) != "resolved":
+            raise RuntimeError("condition resolution is not finalized")
+        outcomes = matches[0].outcomes
+        yes, no = outcomes.yes, outcomes.no
+        prices = (yes.price, no.price)
+        tokens = (yes.token_id, no.token_id)
+        if (not all(isinstance(p, Decimal) for p in prices)
+                or set(prices) != {Decimal("0"), Decimal("1")}
+                or not all(isinstance(t, str) and t for t in tokens)
+                or tokens[0] == tokens[1]):
+            raise RuntimeError("market lacks an unambiguous one-hot winner")
+        return tokens[prices.index(Decimal("1"))]
+
     async def get_verified_market_context(self, condition_id: str, token_id: str):
         """Resolve a condition and token to fresh public market/book constraints."""
         from .market_context import MarketContext
