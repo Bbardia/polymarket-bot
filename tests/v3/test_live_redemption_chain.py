@@ -45,6 +45,8 @@ def test_matching_wallet_outflow_and_burn():
     [transfer(WALLET, ROUTER, token='123'), transfer(ROUTER, ZERO)],
     [transfer(WALLET, ROUTER, contract='0x'+'3'*40), transfer(ROUTER, ZERO)],
     [transfer(WALLET, ROUTER), transfer(WALLET, ROUTER), transfer(ROUTER, ZERO)],
+    [transfer(WALLET, ROUTER), transfer('0x'+'4'*40, ZERO)],
+    [transfer('0x'+'4'*40, ROUTER), transfer(WALLET, ROUTER), transfer(ROUTER, ZERO)],
 ])
 def test_unattributed_or_duplicate_transfers_fail_closed(logs):
     with pytest.raises(ValueError):

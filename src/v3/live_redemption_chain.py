@@ -93,17 +93,33 @@ def confirm_ctf_redemption_receipt(receipt: dict, *, tx_hash: str,
         raise ValueError("malformed or unbounded receipt logs")
     wanted, owner = int(token_id), wallet.lower()
     units = int(quantity * _UNITS)
-    outflows, burns = 0, 0
+    edges: list[tuple[str, str]] = []
     for log in logs:
         if not isinstance(log, dict) or str(log.get("address", "")).lower() != CTF:
             continue
         for sender, recipient, token, amount in _transfers(log):
             if token == wanted and amount == units:
-                outflows += sender == owner and recipient != owner
-                burns += recipient == "0x" + "0" * 40
-    if outflows != 1 or burns < 1:
-        raise ValueError("wallet token outflow and burn are not proven by receipt")
-    return True
+                edges.append((sender, recipient))
+    starts = [i for i, (sender, recipient) in enumerate(edges)
+              if sender == owner and recipient != owner]
+    if len(starts) != 1:
+        raise ValueError("wallet's exact token outflow is not unique")
+    index = starts[0]
+    current = edges[index][1]
+    zero = "0x" + "0" * 40
+    for _ in range(len(edges)):
+        if current == zero:
+            return True
+        # ERC-1155 balances are fungible. If another equal-sized transfer entered
+        # this intermediary, attribution is ambiguous even if a path exists.
+        if sum(recipient == current for _, recipient in edges[:index + 1]) != 1:
+            raise ValueError("intermediary received an ambiguous token transfer")
+        continuations = [i for i in range(index + 1, len(edges)) if edges[i][0] == current]
+        if len(continuations) != 1:
+            raise ValueError("wallet transfer lacks a unique path to a burn")
+        index = continuations[0]
+        current = edges[index][1]
+    raise ValueError("token transfer path has no burn")
 
 
 async def verify_ctf_redemption_transaction(*, tx_hash: str, wallet: str,
