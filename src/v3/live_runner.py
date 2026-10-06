@@ -111,6 +111,20 @@ def local_snapshot(processor: StreamEventProcessor, baseline_cash: Decimal) -> L
         quantities[order.token_id] = quantities.get(order.token_id, ZERO) + order.confirmed_size
         costs[order.token_id] = costs.get(order.token_id, ZERO) + order.confirmed_notional
         cash -= order.confirmed_notional
+    # Redemption audit rows are replayed separately from confirmed fill/order state.
+    # Malformed, duplicate, or unattributed rows fail closed rather than clearing inventory.
+    if isinstance(processor, StreamEventProcessor):
+        from .live_redemption import redemption_adjustments
+        redeemed, payout = redemption_adjustments(processor.ledger, processor)
+        for token, quantity in redeemed.items():
+            if quantities.get(token) != quantity:
+                raise ValueError("redeemed token does not match confirmed inventory")
+            del quantities[token]
+            del costs[token]
+        cash += payout
+    # The account collateral balance is denominated in six-decimal pUSD. SDK
+    # float-to-Decimal fill sizes can leave sub-micro-unit arithmetic residue.
+    cash = cash.quantize(Decimal("0.000001"))
     return LocalSnapshot(
         cash=cash,
         position_tokens=frozenset(quantities),
@@ -567,7 +581,8 @@ async def _start(settings: V3Settings, runner_settings: LiveRunnerSettings):
     reconciler = Reconciler(
         external_condition_ids=frozenset(state["external_condition_ids"]),
         cost_tolerance=runner_settings.cost_tolerance,
-        allow_cash_inflows=True,
+        cash_tolerance=ZERO,
+        allow_cash_inflows=False,
     )
     # The gated factory builds the signing client and replays post-baseline fills.
     service = await LiveOrderService.create(

@@ -114,6 +114,18 @@ def _validate_trade_economics(price: Decimal, size: Decimal, fee: Decimal | None
         raise ValueError("trade fee must be finite and nonnegative")
 
 
+def _quantity_matches(local: Decimal, remote: Decimal) -> bool:
+    """Only a four-decimal remote display may round higher-precision inventory."""
+    quantum = Decimal('0.0001')
+    return local == remote or (
+        remote.as_tuple().exponent == -4
+        and isinstance(local.as_tuple().exponent, int)
+        and local.as_tuple().exponent < -4
+        and local.quantize(quantum) == remote
+        and abs(local - remote) <= quantum / 2
+    )
+
+
 @dataclass(frozen=True)
 class RemotePosition:
     condition_id: str
@@ -299,7 +311,7 @@ class Reconciler:
             or token not in remote_by_token
             or not local_quantities[token].is_finite()
             or not local_costs[token].is_finite()
-            or local_quantities[token] != remote_by_token[token].size
+            or not _quantity_matches(local_quantities[token], remote_by_token[token].size)
             or remote_by_token[token].initial_value is None
             or abs(local_costs[token] - remote_by_token[token].initial_value) > self.cost_tolerance
         ))

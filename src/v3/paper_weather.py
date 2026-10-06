@@ -2688,6 +2688,11 @@ def _build_event_evaluations(
     return tuple(events)
 
 
+def _preferred_weather_side(options: tuple[WeatherEvaluation, ...]) -> WeatherEvaluation:
+    """Choose an executable side before comparing edge; never discard its opposite."""
+    return max(options, key=lambda item: (item.paper_tradeable, item.decision.net_edge))
+
+
 async def evaluate_weather_universe(
     *,
     client: WeatherPublicClient,
@@ -2908,7 +2913,7 @@ async def evaluate_weather_universe(
             )))
             if options:
                 markets_side_evaluable += 1
-                evaluations.append(max(options, key=lambda item: item.decision.net_edge))
+                evaluations.append(_preferred_weather_side(options))
         except Exception as exc:
             errors.append(f"{getattr(market, 'id', '')}: {type(exc).__name__}: {exc}")
 

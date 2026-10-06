@@ -20,6 +20,7 @@ from src.v3.paper_weather import (
     ObservationBoundResult,
     ObservationUnavailableError,
     OffsetWeatherPublicClient,
+    _preferred_weather_side,
     _ensemble_probability,
     ProbabilityCalibration,
     ResilientForecastEnsemble,
@@ -35,6 +36,17 @@ from src.v3.paper_weather import (
 
 def D(value: str) -> Decimal:
     return Decimal(value)
+
+
+def test_preferred_weather_side_preserves_tradeable_opposite_side():
+    blocked_high_edge = SimpleNamespace(paper_tradeable=False, decision=SimpleNamespace(net_edge=D("0.20")))
+    tradeable_lower_edge = SimpleNamespace(paper_tradeable=True, decision=SimpleNamespace(net_edge=D("0.10")))
+    assert _preferred_weather_side((blocked_high_edge, tradeable_lower_edge)) is tradeable_lower_edge
+    assert _preferred_weather_side((tradeable_lower_edge, blocked_high_edge)) is tradeable_lower_edge
+
+    tradeable_best = SimpleNamespace(paper_tradeable=True, decision=SimpleNamespace(net_edge=D("0.15")))
+    assert _preferred_weather_side((tradeable_lower_edge, tradeable_best)) is tradeable_best
+    assert _preferred_weather_side((blocked_high_edge,)) is blocked_high_edge
 
 
 def weather_market(*, market_id: str = "weather-1", question: str | None = None):
