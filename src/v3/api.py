@@ -602,6 +602,27 @@ class UnifiedPolymarketAPI:
             rows.extend(batch)
         return tuple(rows)
 
+    async def fetch_market_is_neg_risk(self, condition_id: str) -> bool | None:
+        """Return explicit market neg-risk metadata; refuse unknown/ambiguous markets."""
+        if not isinstance(condition_id, str) or not condition_id:
+            raise ValueError("condition_id is required")
+        matches: list[Any] = []
+        pages = 0
+        async for page in self.public_client.list_markets(condition_ids=[condition_id], page_size=20):
+            pages += 1
+            if pages > 5:
+                raise RuntimeError("market metadata page limit exceeded")
+            items = getattr(page, "items", None)
+            if items is None or isinstance(items, (str, bytes)):
+                raise RuntimeError("malformed market metadata page")
+            matches.extend(m for m in items if str(getattr(m, "condition_id", "")) == condition_id)
+            if len(matches) > 1:
+                raise RuntimeError("condition resolved to multiple market records")
+        if len(matches) != 1:
+            raise RuntimeError("condition did not resolve to exactly one market")
+        value = getattr(getattr(matches[0], "state", None), "neg_risk", None)
+        return value if type(value) is bool else None
+
     async def fetch_resolved_winner(self, condition_id: str) -> str:
         """Require exactly one closed Gamma market with one-hot outcome prices."""
         matches: list[Any] = []
