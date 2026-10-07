@@ -10,8 +10,8 @@ The April-era execution loop now lives in `legacy/` (`legacy/run_full_loop.py`
 and its supporting modules). It is retained only for offline research
 compatibility; its live path is permanently disabled.
 
-> Experimental software, not financial advice. No strategy is enabled for live
-> trading in this foundation.
+> Experimental software, not financial advice. The V3 real-money runner is
+> separately gated; its optional auto-redemption path is off by default.
 
 ## Current safety state
 
@@ -37,6 +37,10 @@ compatibility; its live path is permanently disabled.
   successive pages are deduplicated and bounded by the existing scan limits.
 - Authenticated account reads and live-capable client construction are lazy and
   use separate gates; reconciliation can run while paper mode remains enabled.
+- Optional V3 live auto-redemption is off by default. When explicitly enabled,
+  it submits only exact, reconciled bot-managed winning positions in supported
+  non-neg-risk binary markets. It never sweeps external positions or burns
+  zero-value losing tokens; ambiguous submissions remain blocked for review.
 - User/market stream events can be normalized, durably replayed, deduplicated,
   and supervised with bounded reconnect backoff; any disconnect or stream end
   sets a sticky reconciliation blocker. No stream worker command exists and no

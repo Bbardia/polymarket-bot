@@ -18,6 +18,7 @@ PUSD = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
 TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 SINGLE = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62"
 BATCH = "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb"
+PAYOUT_REDEMPTION = "0x2682012a4a4f1973119f1c9b90745d1bd91fa2bab387344f044cb3586864d18d"
 _HASH = re.compile(r"0x[0-9a-fA-F]{64}\Z")
 _WALLET = re.compile(r"0x[0-9a-fA-F]{40}\Z")
 _UNITS = Decimal("1000000")
@@ -77,10 +78,12 @@ def _receipt(tx_hash: str) -> dict:
     return payload["result"]
 
 
-def confirm_ctf_redemption_receipt(receipt: dict, *, tx_hash: str,
-                                   wallet: str, token_id: str, quantity: Decimal) -> bool:
-    """Fail closed unless the exact wallet outflow and token burn are in this tx."""
+def confirm_ctf_redemption_receipt(receipt: dict, *, tx_hash: str, wallet: str,
+                                   token_id: str, quantity: Decimal,
+                                   condition_id: str) -> bool:
+    """Require the exact CTF redemption event, wallet burn, and pUSD payout."""
     if (not isinstance(tx_hash, str) or not _HASH.fullmatch(tx_hash)
+            or not isinstance(condition_id, str) or not _HASH.fullmatch(condition_id)
             or not isinstance(wallet, str) or not _WALLET.fullmatch(wallet)
             or not isinstance(token_id, str) or not token_id.isdecimal()
             or not isinstance(quantity, Decimal) or not quantity.is_finite()
@@ -96,9 +99,36 @@ def confirm_ctf_redemption_receipt(receipt: dict, *, tx_hash: str,
     wanted, owner = int(token_id), wallet.lower()
     units = int(quantity * _UNITS)
     zero = "0x" + "0" * 40
-    # The wallet must receive this exact redemption payout in the same
-    # transaction. Unit-by-unit tracing through a pooled ERC-1155 router is
-    # impossible, so require the economically attributable debit AND credit.
+    zero_topic = "0x" + "0" * 64
+    redemption_events = []
+    for log in logs:
+        if not isinstance(log, dict) or str(log.get("address", "")).lower() != CTF:
+            continue
+        topics, raw = log.get("topics"), log.get("data")
+        if not isinstance(topics, list) or not topics or str(topics[0]).lower() != PAYOUT_REDEMPTION:
+            continue
+        if (len(topics) != 4
+                or not all(isinstance(t, str) and _HASH.fullmatch(t) for t in topics)
+                or topics[1][-40:].lower() != owner[2:]
+                or topics[2][-40:].lower() != PUSD[2:]
+                or topics[3].lower() != zero_topic
+                or not isinstance(raw, str)
+                or not re.fullmatch(r"0x(?:[0-9a-fA-F]{64}){6}", raw)):
+            raise ValueError("malformed or unattributed CTF payout-redemption event")
+        data = bytes.fromhex(raw[2:])
+        offset = int.from_bytes(data[32:64], "big")
+        payout = int.from_bytes(data[64:96], "big")
+        length = int.from_bytes(data[offset:offset + 32], "big") if offset + 32 <= len(data) else -1
+        index_sets = [int.from_bytes(data[offset + 32 + 32 * i:offset + 64 + 32 * i], "big")
+                      for i in range(length)] if length == 2 and offset + 96 <= len(data) else []
+        if (data[:32].hex().lower() != condition_id[2:].lower()
+                or offset != 96 or length != 2 or index_sets != [1, 2] or payout != units):
+            raise ValueError("CTF payout-redemption event does not match condition, quantity, and payout")
+        redemption_events.append(log)
+    if len(redemption_events) != 1:
+        raise ValueError("unique exact CTF payout-redemption event is not proven")
+    # The wallet must receive this exact payout in the same transaction, and
+    # the receipt must show the corresponding CTF redemption event above.
     credits = 0
     for log in logs:
         if not isinstance(log, dict) or str(log.get("address", "")).lower() != PUSD:
@@ -143,9 +173,12 @@ def confirm_ctf_redemption_receipt(receipt: dict, *, tx_hash: str,
 
 
 async def verify_ctf_redemption_transaction(*, tx_hash: str, wallet: str,
-                                            token_id: str, quantity: Decimal) -> None:
+                                            token_id: str, quantity: Decimal,
+                                            condition_id: str) -> None:
     if not isinstance(tx_hash, str) or not _HASH.fullmatch(tx_hash):
         raise ValueError("invalid redemption transaction hash")
     receipt = await asyncio.to_thread(_receipt, tx_hash)
-    confirm_ctf_redemption_receipt(receipt, tx_hash=tx_hash, wallet=wallet,
-                                   token_id=token_id, quantity=quantity)
+    confirm_ctf_redemption_receipt(
+        receipt, tx_hash=tx_hash, wallet=wallet, token_id=token_id,
+        quantity=quantity, condition_id=condition_id,
+    )

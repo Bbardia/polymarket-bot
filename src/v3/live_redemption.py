@@ -268,7 +268,7 @@ async def recognize_remote_redemptions(
         from .live_redemption_chain import verify_ctf_redemption_transaction
         await verify_ctf_redemption_transaction(
             tx_hash=row.transaction_hash, wallet=wallet,
-            token_id=token, quantity=quantity,
+            token_id=token, quantity=quantity, condition_id=condition,
         )
         evidence.append(RedemptionEvidence(
             condition_id=condition, token_id=token, quantity=quantity,

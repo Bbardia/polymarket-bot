@@ -2,7 +2,9 @@ from decimal import Decimal as D
 
 import pytest
 
-from src.v3.live_redemption_chain import BATCH, CTF, PUSD, TRANSFER, confirm_ctf_redemption_receipt
+from src.v3.live_redemption_chain import (
+    BATCH, CTF, PAYOUT_REDEMPTION, PUSD, TRANSFER, confirm_ctf_redemption_receipt,
+)
 
 TX = '0x' + 'a' * 64
 WALLET = '0x' + '1' * 40
@@ -30,14 +32,26 @@ def payout_mint(*, recipient=WALLET, amount=5260000):
             'data': '0x' + word(amount)}
 
 
+def redemption_event(*, condition='c' * 64, redeemer=WALLET, collateral=PUSD,
+                     parent='0x' + '0' * 64, amount=5260000, index_sets=(1, 2)):
+    return {
+        'address': CTF,
+        'topics': [PAYOUT_REDEMPTION, topic(redeemer), topic(collateral), parent],
+        'data': '0x' + word(int(condition.removeprefix('0x'), 16))
+                + word(96) + word(amount) + word(len(index_sets))
+                + ''.join(word(i) for i in index_sets),
+    }
+
+
 def receipt(logs):
     return {'status': '0x1', 'transactionHash': TX, 'blockNumber': '0x1',
-            'logs': [*logs, payout_mint()]}
+            'logs': [*logs, redemption_event(), payout_mint()]}
 
 
 def check(logs):
     return confirm_ctf_redemption_receipt(receipt(logs), tx_hash=TX, wallet=WALLET,
-                                          token_id=TOKEN, quantity=D('5.26'))
+                                          token_id=TOKEN, quantity=D('5.26'),
+                                          condition_id='0x' + 'c' * 64)
 
 
 def test_matching_wallet_outflow_and_burn():
@@ -49,7 +63,25 @@ def test_without_exact_wallet_pusd_credit_is_refused():
     proof['logs'][-1] = payout_mint(recipient=ROUTER)
     with pytest.raises(ValueError, match='mint'):
         confirm_ctf_redemption_receipt(proof, tx_hash=TX, wallet=WALLET,
-                                       token_id=TOKEN, quantity=D('5.26'))
+                                       token_id=TOKEN, quantity=D('5.26'),
+                                       condition_id='0x' + 'c' * 64)
+
+
+@pytest.mark.parametrize('changed', [
+    redemption_event(condition='d' * 64),
+    redemption_event(redeemer=ROUTER),
+    redemption_event(collateral=ROUTER),
+    redemption_event(amount=5260001),
+    redemption_event(index_sets=(1,)),
+])
+def test_payout_event_must_bind_wallet_condition_and_exact_payout(changed):
+    proof = receipt([transfer(WALLET, ROUTER), transfer(ROUTER, ZERO)])
+    proof['logs'][-2] = changed
+    with pytest.raises(ValueError):
+        confirm_ctf_redemption_receipt(
+            proof, tx_hash=TX, wallet=WALLET, token_id=TOKEN,
+            quantity=D('5.26'), condition_id='0x' + 'c' * 64,
+        )
 
 
 @pytest.mark.parametrize('logs', [
@@ -72,9 +104,11 @@ def test_failed_or_wrong_transaction_cannot_prove_redemption():
     bad['status'] = '0x0'
     with pytest.raises(ValueError):
         confirm_ctf_redemption_receipt(bad, tx_hash=TX, wallet=WALLET,
-                                       token_id=TOKEN, quantity=D('5.26'))
+                                       token_id=TOKEN, quantity=D('5.26'),
+                                       condition_id='0x' + 'c' * 64)
     bad['status'] = '0x1'
     bad['transactionHash'] = '0x' + 'b' * 64
     with pytest.raises(ValueError):
         confirm_ctf_redemption_receipt(bad, tx_hash=TX, wallet=WALLET,
-                                       token_id=TOKEN, quantity=D('5.26'))
+                                       token_id=TOKEN, quantity=D('5.26'),
+                                       condition_id='0x' + 'c' * 64)

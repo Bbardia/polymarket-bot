@@ -4,8 +4,10 @@ Entries are post-only GTD BUY orders built by the same path as ``live-shadow``
 (V7 evaluation and selection, resolver-station gate, fresh verified context,
 unchanged V7 proposal bridge) and submitted only through the factory-built
 ``LiveOrderService``, which re-checks market rules, account reconciliation and
-the hard ``RiskEngine`` limits before every order. Positions are held to
-resolution; this runner never sells, merges or redeems.
+the hard ``RiskEngine`` limits before any order. Positions are held to
+resolution. Optional auto-redemption can claim only bot-managed finalized
+winning positions after exact full-account reconciliation; external inventory
+and zero-value losses are never submitted.
 
 Account baseline: on first start the runner records the account's existing
 positions as external and the start time as the trade-history baseline. Any
@@ -27,7 +29,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from .api import UnifiedPolymarketAPI
-from .config import V3Settings
+from .config import V3Settings, _env_bool
 from .ledger import EventLedger
 from .live_service import LiveOrderService, LiveRiskContext
 from .live_shadow import (
@@ -63,8 +65,11 @@ class LiveRunnerSettings:
     # Wait this long after GTD expiry before recording an unseen order as
     # expired, so late fill confirmations land on the still-open aggregate.
     expiry_grace_seconds: int = 600
+    auto_redeem_enabled: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.auto_redeem_enabled) is not bool:
+            raise ValueError("auto-redeem setting must be boolean")
         if not self.cost_tolerance.is_finite() or self.cost_tolerance < ZERO:
             raise ValueError("cost tolerance must be finite and nonnegative")
         if self.expiry_grace_seconds < 60:
@@ -79,6 +84,7 @@ class LiveRunnerSettings:
             shadow=shadow,
             cost_tolerance=Decimal(os.getenv("V3_LIVE_COST_TOLERANCE", "0.01")),
             expiry_grace_seconds=int(os.getenv("V3_LIVE_EXPIRY_GRACE_SECONDS", "600")),
+            auto_redeem_enabled=_env_bool("V3_LIVE_AUTO_REDEEM", False),
         )
 
 
@@ -400,6 +406,36 @@ class LiveTradingRunner(LiveShadowRunner):
             status["redemption_reconciliation_error"] = type(exc).__name__
             status["healthy"] = False
             entry_block = entry_block or "redemption evidence or account parity could not be verified"
+
+        status["auto_redeem_enabled"] = self.runner_settings.auto_redeem_enabled
+        status["auto_redemptions_recorded"] = []
+        if self.runner_settings.auto_redeem_enabled and entry_block is None:
+            try:
+                from .live_auto_redeem import auto_redeem_one_managed_winner
+                remote, auto_records, pending_reason = await auto_redeem_one_managed_winner(
+                    ledger=self.ledger, processor=processor,
+                    baseline_cash=baseline_cash, remote=remote, api=self.api,
+                    reconciler=self.reconciler,
+                    external_condition_ids=self.reconciler.external_condition_ids,
+                    baseline_epoch=baseline_epoch, now=now,
+                )
+                status["auto_redemptions_recorded"] = list(auto_records)
+                status["redemptions_recorded"].extend(auto_records)
+                if pending_reason:
+                    status["healthy"] = False
+                    status["auto_redemption_pending_reconciliation"] = True
+                    entry_block = pending_reason
+                if auto_records:
+                    processor = StreamEventProcessor(self.ledger)
+                    equity = remote.cash + sum((p.current_value for p in remote.positions), ZERO)
+                    peak = max(Decimal(self.state["peak_equity"]), equity)
+                    daily_pnl = equity - Decimal(self.state["day_start_equity"])
+                    self.state["peak_equity"] = str(peak)
+            except Exception as exc:
+                status["healthy"] = False
+                status["auto_redemption_error"] = type(exc).__name__
+                entry_block = entry_block or "auto-redemption submission requires reconciliation"
+
         local = local_snapshot(processor, baseline_cash)
         report = self.reconciler.compare(local, remote)
         if entry_block is None and not report.safe_to_trade:
