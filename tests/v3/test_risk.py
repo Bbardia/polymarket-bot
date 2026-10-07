@@ -134,3 +134,22 @@ def test_wrong_runtime_types_in_risk_state_fail_closed():
     assert not engine.evaluate(intent(), state(equity="230")).allowed
     assert not engine.evaluate(intent(), state(event_exposure={"condition": "0"})).allowed
     assert not engine.evaluate(intent(), state(open_orders="0")).allowed
+
+
+def test_sell_requires_reconciled_bot_inventory_but_bypasses_entry_cash_and_loss_caps():
+    engine = RiskEngine(limits())
+    exit_intent = intent(side="SELL", shares=D("5"))
+    constrained = state(
+        cash=D("0"), total_exposure=D("75"), open_positions=5,
+        daily_pnl=D("-10"), equity=D("220"), peak_equity=D("230"),
+        position_quantities={"token": D("5")},
+    )
+    assert engine.evaluate(exit_intent, constrained).allowed
+    assert not engine.evaluate(exit_intent, state()).allowed
+    assert not engine.evaluate(
+        intent(side="SELL", shares=D("5.01")),
+        state(position_quantities={"token": D("5")}),
+    ).allowed
+    assert not engine.evaluate(
+        exit_intent, state(position_quantities={"token": D("Infinity")}),
+    ).allowed

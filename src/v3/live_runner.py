@@ -45,7 +45,7 @@ from .paper_weather import NOAAStationObservations, OffsetWeatherPublicClient, e
 from .reconciliation import (
     CompleteAccountTradeHistory, LocalSnapshot, Reconciler, RemoteAccountOrder, RemoteSnapshot,
 )
-from .risk import RiskEngine
+from .risk import OrderIntent, RiskEngine
 from .streaming import StreamEventProcessor
 
 ZERO = Decimal("0")
@@ -66,10 +66,13 @@ class LiveRunnerSettings:
     # expired, so late fill confirmations land on the still-open aggregate.
     expiry_grace_seconds: int = 600
     auto_redeem_enabled: bool = False
+    live_early_exit_enabled: bool = False
 
     def __post_init__(self) -> None:
         if type(self.auto_redeem_enabled) is not bool:
             raise ValueError("auto-redeem setting must be boolean")
+        if type(self.live_early_exit_enabled) is not bool:
+            raise ValueError("live early-exit setting must be boolean")
         if not self.cost_tolerance.is_finite() or self.cost_tolerance < ZERO:
             raise ValueError("cost tolerance must be finite and nonnegative")
         if self.expiry_grace_seconds < 60:
@@ -85,6 +88,7 @@ class LiveRunnerSettings:
             cost_tolerance=Decimal(os.getenv("V3_LIVE_COST_TOLERANCE", "0.01")),
             expiry_grace_seconds=int(os.getenv("V3_LIVE_EXPIRY_GRACE_SECONDS", "600")),
             auto_redeem_enabled=_env_bool("V3_LIVE_AUTO_REDEEM", False),
+            live_early_exit_enabled=_env_bool("V3_LIVE_EARLY_EXIT_ENABLED", False),
         )
 
 
@@ -100,23 +104,93 @@ class LiveStore(ShadowStore):
 def local_snapshot(processor: StreamEventProcessor, baseline_cash: Decimal) -> LocalSnapshot:
     """Bot-attributable holdings and expected cash from confirmed fills only.
 
-    Bot orders are post-only makers on fee-free or taker-only schedules (the V7
-    bridge refuses anything else), so they pay no fee. Venue trade rows still
-    carry the market's taker rate, which the ledger books as a fee; it is
-    excluded here. A fee actually charged would appear as an unexplained cash
-    decrease, which reconciliation blocks.
+    BUY accounting preserves the maker-fee treatment: the venue's reported
+    taker rate is excluded. Confirmed SELL fees reduce net proceeds. Sell cost
+    basis is allocated at the token's average confirmed BUY cost; oversells and
+    invalid fill economics fail closed. This is read-model accounting only.
     """
     quantities: dict[str, Decimal] = {}
     costs: dict[str, Decimal] = {}
     cash = baseline_cash
-    for order in processor.orders.values():
-        if order.confirmed_size <= ZERO:
-            continue
-        if order.side != "BUY":
-            raise ValueError("live runner only manages BUY orders")
-        quantities[order.token_id] = quantities.get(order.token_id, ZERO) + order.confirmed_size
-        costs[order.token_id] = costs.get(order.token_id, ZERO) + order.confirmed_notional
-        cash -= order.confirmed_notional
+    if isinstance(processor, StreamEventProcessor):
+        from .live_accounting import confirmed_fills
+        try:
+            fills = confirmed_fills(processor)
+        except (ArithmeticError, KeyError, TypeError, ValueError):
+            processor.require_reconciliation("confirmed fill chronology or ledger association is invalid")
+            raise ValueError("confirmed fill chronology or ledger association is invalid")
+        for fill in fills:
+            size, notional, fees = fill.size, fill.notional, fill.fee
+            token = fill.token_id
+            if not all(value.is_finite() for value in (size, notional, fees)):
+                raise ValueError("confirmed fill economics are invalid")
+            if size <= ZERO or notional <= ZERO or fees < ZERO:
+                raise ValueError("confirmed fill economics are invalid")
+            if fill.side == "BUY":
+                quantities[token] = quantities.get(token, ZERO) + size
+                costs[token] = costs.get(token, ZERO) + notional
+                cash -= notional
+            elif fill.side == "SELL":
+                held = quantities.get(token, ZERO)
+                if size > held or held <= ZERO or fees > notional:
+                    processor.require_reconciliation(
+                        "chronological confirmed SELL exceeds managed inventory or has invalid proceeds"
+                    )
+                    raise ValueError("confirmed SELL exceeds managed inventory or has invalid proceeds")
+                basis = costs[token]
+                allocated = basis * size / held
+                remaining = held - size
+                cash += notional - fees
+                if remaining == ZERO:
+                    quantities.pop(token)
+                    costs.pop(token)
+                else:
+                    quantities[token] = remaining
+                    costs[token] = basis - allocated
+            else:
+                raise ValueError("confirmed order side is invalid")
+    else:
+        # Lightweight accounting fixtures may provide only aggregate snapshots;
+        # production always uses StreamEventProcessor and chronological fills.
+        sells = []
+        for order in processor.orders.values():
+            size, notional, fees = (
+                order.confirmed_size, order.confirmed_notional, order.confirmed_fees,
+            )
+            if any(not isinstance(value, Decimal) or not value.is_finite() for value in (size, notional, fees)):
+                raise ValueError("confirmed order economics are invalid")
+            if size < ZERO or notional < ZERO or fees < ZERO or (size > ZERO and notional <= ZERO):
+                raise ValueError("confirmed order economics are invalid")
+            if size == ZERO:
+                if notional != ZERO or fees != ZERO:
+                    raise ValueError("unfilled order has confirmed economics")
+                continue
+            if not isinstance(order.token_id, str) or not order.token_id:
+                raise ValueError("confirmed order token is invalid")
+            if order.side == "BUY":
+                quantities[order.token_id] = quantities.get(order.token_id, ZERO) + size
+                costs[order.token_id] = costs.get(order.token_id, ZERO) + notional
+                cash -= notional
+            elif order.side == "SELL":
+                sells.append(order)
+            else:
+                raise ValueError("confirmed order side is invalid")
+        for order in sells:
+            token = order.token_id
+            size, notional, fees = order.confirmed_size, order.confirmed_notional, order.confirmed_fees
+            held = quantities.get(token, ZERO)
+            if size > held or held <= ZERO or fees > notional:
+                raise ValueError("confirmed SELL exceeds managed inventory or has invalid proceeds")
+            basis = costs[token]
+            allocated = basis * size / held
+            remaining = held - size
+            cash += notional - fees
+            if remaining == ZERO:
+                quantities.pop(token)
+                costs.pop(token)
+            else:
+                quantities[token] = remaining
+                costs[token] = basis - allocated
     # Redemption audit rows are replayed separately from confirmed fill/order state.
     # Malformed, duplicate, or unattributed rows fail closed rather than clearing inventory.
     if isinstance(processor, StreamEventProcessor):
@@ -291,6 +365,145 @@ class LiveTradingRunner(LiveShadowRunner):
         self.reconciler = reconciler
         self.runner_settings = runner_settings
 
+    async def _run_early_exits(self, *, processor, local, remote, risk_context, now):
+        from uuid import uuid4
+        from .live_early_exit import ExitPosition, plan_live_early_exit, verified_book_from_api
+        from .math import execution_fee
+
+        results = []
+        accepted_buys = {}
+        for event in self.ledger.events():
+            if event.event_type == "order.accepted" and event.payload.get("side") == "BUY":
+                accepted_buys.setdefault(event.payload.get("token_id"), set()).add(event.payload.get("condition_id"))
+        for token_id, shares in (local.position_quantities or {}).items():
+            conditions = accepted_buys.get(token_id, set())
+            matching = [p for p in remote.positions if p.token_id == token_id]
+            if len(conditions) != 1 or len(matching) != 1 or matching[0].condition_id not in conditions:
+                continue
+            condition_id = next(iter(conditions))
+            if condition_id in self.reconciler.external_condition_ids:
+                continue
+            if any(o.token_id == token_id and o.order_id in processor.active_order_ids
+                   for o in processor.orders.values()):
+                results.append({"token_id": token_id, "outcome": "blocked", "reason": "active managed order"})
+                continue
+            sells = [o for o in processor.orders.values() if o.token_id == token_id and o.side == "SELL"]
+            accepted_sells = {}
+            for event in self.ledger.events():
+                if event.event_type == "order.accepted" and event.payload.get("side") == "SELL" \
+                        and event.payload.get("token_id") == token_id:
+                    accepted_sells.setdefault(event.payload.get("order_id"), []).append(event.payload)
+            sell_metadata = {}
+            for order in sells:
+                rows = accepted_sells.get(order.order_id, [])
+                if (
+                    len(rows) != 1 or not isinstance(rows[0].get("decision_id"), str)
+                    or not rows[0]["decision_id"]
+                    or rows[0].get("exit_stage") not in {"first_tranche", "runner", "full"}
+                ):
+                    results.append({"token_id": token_id, "outcome": "blocked",
+                                    "reason": "SELL lacks unique durable early-exit metadata"})
+                    break
+                sell_metadata[order.order_id] = rows[0]
+            if len(sell_metadata) != len(sells):
+                continue
+            decision_ids = [row["decision_id"] for row in sell_metadata.values()]
+            if len(decision_ids) != len(set(decision_ids)):
+                results.append({"token_id": token_id, "outcome": "blocked",
+                                "reason": "duplicate durable early-exit decision IDs"})
+                continue
+            from .orders import OrderState
+            first_tranche_orders = [o for o in sells
+                                    if sell_metadata[o.order_id].get("exit_stage") == "first_tranche"]
+            runner_orders = [o for o in sells if sell_metadata[o.order_id].get("exit_stage") == "runner"]
+            # No documented finality fence exists for late pre-cancel matches.
+            # Account detail cannot make a replacement SELL safe.
+            incomplete = [o for o in sells if o.confirmed_size < o.requested_size]
+            inconsistent_filled = [o for o in sells
+                                   if o.state is OrderState.FILLED and o.confirmed_size != o.requested_size]
+            if incomplete or inconsistent_filled:
+                if not processor.reconciliation_required:
+                    processor.require_reconciliation(
+                        "incomplete early-exit SELL requires manual reconciliation: "
+                        + ",".join(o.order_id for o in incomplete + inconsistent_filled)
+                    )
+                results.append({"token_id": token_id, "outcome": "manual_review",
+                                "reason": "incomplete SELL has no provable cancellation finality"})
+                continue
+            done = False
+            tranche_remaining = None
+            if first_tranche_orders:
+                target = first_tranche_orders[0].requested_size
+                confirmed = ZERO
+                for order in first_tranche_orders:
+                    if not isinstance(order.requested_size, Decimal) or not order.requested_size.is_finite() or order.requested_size <= ZERO:
+                        target = ZERO
+                        break
+                    confirmed += order.confirmed_size
+                if (target <= ZERO or not target.is_finite() or confirmed > target
+                        or any(o.state is not OrderState.CANCELED
+                               for o in first_tranche_orders if o.confirmed_size < o.requested_size)
+                        or any(o.confirmed_size > o.requested_size for o in first_tranche_orders)):
+                    results.append({"token_id": token_id, "outcome": "blocked",
+                                    "reason": "first-tranche target/state inconsistent"})
+                    continue
+                done = confirmed == target
+                if not done:
+                    if any(sell_metadata[o.order_id].get("exit_stage") != "first_tranche" for o in sells):
+                        results.append({"token_id": token_id, "outcome": "blocked",
+                                        "reason": "runner SELL exists before first tranche completion"})
+                        continue
+                    tranche_remaining = target - confirmed
+            elif sells and any(o.confirmed_size < o.requested_size for o in sells):
+                results.append({"token_id": token_id, "outcome": "blocked",
+                                "reason": "incomplete SELL has no first-tranche target"})
+                continue
+            if runner_orders and not done:
+                results.append({"token_id": token_id, "outcome": "blocked",
+                                "reason": "runner SELL exists before first tranche completion"})
+                continue
+            if any(o.confirmed_size > o.requested_size for o in runner_orders):
+                results.append({"token_id": token_id, "outcome": "blocked",
+                                "reason": "runner SELL exceeds requested target"})
+                continue
+            buys = [o for o in processor.orders.values() if o.token_id == token_id and o.side == "BUY"]
+            if not buys:
+                continue
+            cost = (local.position_cost_basis or {}).get(token_id)
+            if not isinstance(cost, Decimal) or cost <= ZERO or shares <= ZERO:
+                continue
+            try:
+                context = await self.api.get_verified_market_context(condition_id, token_id)
+                raw = await self.api.get_order_book(token_id)
+                book = verified_book_from_api(
+                    context, raw, condition_id=condition_id, token_id=token_id,
+                    now=now, max_quote_age_seconds=self.risk.limits.max_quote_age_seconds,
+                )
+                # The stage transition above is based exclusively on a fully
+                # confirmed first-tranche order; never infer it from any SELL fill.
+                plan = plan_live_early_exit(
+                    ExitPosition("YES", shares, cost, hybrid_exit_done=done, hybrid_enabled=True), book,
+                    first_tranche_quantity=tranche_remaining,
+                )
+                if plan.intent is None:
+                    continue
+                sell = plan.intent
+                intent = OrderIntent(
+                    condition_id=condition_id, token_id=token_id, side="SELL", price=sell.price,
+                    shares=sell.size, estimated_fee=execution_fee(book.bids, sell.size, book.fee_rate, descending=True),
+                    post_only=True, ttl_seconds=min(3600, self.risk.limits.max_order_ttl_seconds),
+                    quote_age_seconds=max(0, int((now - raw.timestamp).total_seconds())),
+                    tick_size=book.tick_size, min_order_size=book.min_order_size,
+                    market_accepting_orders=True, rules_verified=True,
+                    decision_id=str(uuid4()), exit_stage=sell.stage, target_return=sell.target_return,
+                )
+                outcome = await self.service.submit(intent, local, risk_context)
+                results.append({"token_id": token_id, "outcome": "accepted" if outcome.accepted else "rejected",
+                                "decision_id": intent.decision_id, "stage": sell.stage, "reason": outcome.reason})
+            except Exception as exc:
+                results.append({"token_id": token_id, "outcome": "blocked", "reason": type(exc).__name__})
+        return results
+
     def _event_block_reason(
         self, evaluation: Any, remote: RemoteSnapshot, local: LocalSnapshot,
     ) -> str | None:
@@ -381,8 +594,22 @@ class LiveTradingRunner(LiveShadowRunner):
                 )
             except Exception as exc:
                 status["order_detail_reconciliation_error"] = type(exc).__name__
+        from .orders import OrderState
+        incomplete_terminal_sells = [
+            order for order in processor.orders.values()
+            if order.side == "SELL" and order.confirmed_size < order.requested_size
+            and order.state in {OrderState.CANCELED, OrderState.FAILED, OrderState.FILLED}
+        ]
+        if incomplete_terminal_sells and not processor.reconciliation_required:
+            processor.require_reconciliation(
+                "terminal incomplete SELL requires manual reconciliation: "
+                + ",".join(order.order_id or order.client_order_id for order in incomplete_terminal_sells)
+            )
         if processor.reconciliation_required:
             entry_block = "lifecycle reconciliation latched: " + "; ".join(processor.reconciliation_reasons)
+            status["healthy"] = False
+            status["lifecycle_reconciliation_required"] = True
+            status["lifecycle_reconciliation_reasons"] = list(processor.reconciliation_reasons)
 
         equity = remote.cash + sum((p.current_value for p in remote.positions), ZERO)
         if self.state.get("day") != today:
@@ -408,6 +635,7 @@ class LiveTradingRunner(LiveShadowRunner):
             entry_block = entry_block or "redemption evidence or account parity could not be verified"
 
         status["auto_redeem_enabled"] = self.runner_settings.auto_redeem_enabled
+        status["live_early_exit_enabled"] = self.runner_settings.live_early_exit_enabled
         status["auto_redemptions_recorded"] = []
         if self.runner_settings.auto_redeem_enabled and entry_block is None:
             try:
@@ -438,6 +666,9 @@ class LiveTradingRunner(LiveShadowRunner):
 
         local = local_snapshot(processor, baseline_cash)
         report = self.reconciler.compare(local, remote)
+        exit_block = entry_block
+        if not report.safe_to_trade:
+            exit_block = exit_block or "account reconciliation blocks exits"
         if entry_block is None and not report.safe_to_trade:
             entry_block = "account reconciliation blocked entries"
         limits = self.risk.limits
@@ -467,7 +698,9 @@ class LiveTradingRunner(LiveShadowRunner):
             "bot_position_tokens": len(local.position_tokens),
             "bot_cost_basis": sum((local.position_cost_basis or {}).values(), ZERO),
             "reconciliation": {
-                "safe_to_trade": report.safe_to_trade,
+                "safe_to_trade": report.safe_to_trade and not processor.reconciliation_required,
+                "lifecycle_reconciliation_required": processor.reconciliation_required,
+                "lifecycle_reconciliation_reasons": list(processor.reconciliation_reasons),
                 "cash_delta": report.cash_delta,
                 "unknown_positions": len(report.unknown_positions),
                 "unknown_orders": len(report.unknown_orders),
@@ -477,6 +710,29 @@ class LiveTradingRunner(LiveShadowRunner):
                 "external_positions": len(report.external_positions),
             },
         })
+
+        # Early exits are an independent, opt-in risk-reducing path. Every candidate
+        # is derived from confirmed bot BUY inventory and submitted via the gated service.
+        status["early_exits"] = []
+        status["early_exit_block_reason"] = exit_block
+        exit_accepted = False
+        if self.runner_settings.live_early_exit_enabled and exit_block is None:
+            status["early_exits"] = await self._run_early_exits(
+                processor=processor, local=local, remote=remote, risk_context=risk_context, now=now,
+            )
+            exit_accepted = any(row.get("outcome") == "accepted" for row in status["early_exits"])
+            post_exit_processor = StreamEventProcessor(self.ledger)
+            if post_exit_processor.reconciliation_required:
+                entry_block = entry_block or "early-exit submission requires lifecycle reconciliation"
+                status["healthy"] = False
+                status["early_exit_block_reason"] = entry_block
+                status["lifecycle_reconciliation_required"] = True
+                status["lifecycle_reconciliation_reasons"] = list(post_exit_processor.reconciliation_reasons)
+                status["reconciliation"]["safe_to_trade"] = False
+                status["reconciliation"]["lifecycle_reconciliation_required"] = True
+                status["reconciliation"]["lifecycle_reconciliation_reasons"] = list(
+                    post_exit_processor.reconciliation_reasons
+                )
 
         policy = self.policy
         if policy.kelly_sizing_enabled:
@@ -497,7 +753,10 @@ class LiveTradingRunner(LiveShadowRunner):
             base = {"at": now.isoformat(), "event_key": evaluation.event_key,
                     "condition_id": evaluation.condition_id, "question": evaluation.question,
                     "submitted": False}
-            if entry_block is not None:
+            if exit_accepted:
+                record = {**base, "outcome": "blocked", "stage": "account",
+                          "reason": "accepted early exit blocks entries for this cycle"}
+            elif entry_block is not None:
                 record = {**base, "outcome": "blocked", "stage": "account", "reason": entry_block}
             elif (reason := self._event_block_reason(evaluation, remote, local)) is not None:
                 record = {**base, "outcome": "skipped", "stage": "event", "reason": reason}
@@ -530,7 +789,7 @@ class LiveTradingRunner(LiveShadowRunner):
             outcomes[record["outcome"]] = outcomes.get(record["outcome"], 0) + 1
             self.store.save_state(self.state)
 
-        if outcomes.get("accepted", 0):
+        if outcomes.get("accepted", 0) or exit_accepted:
             try:
                 final_remote = await self.api.fetch_remote_snapshot()
                 final_processor = StreamEventProcessor(self.ledger)
@@ -634,10 +893,17 @@ async def _start(settings: V3Settings, runner_settings: LiveRunnerSettings):
         cash_tolerance=ZERO,
         allow_cash_inflows=False,
     )
-    # The gated factory builds the signing client and replays post-baseline fills.
+    try:
+        baseline_cash = Decimal(str(state["baseline_cash"]))
+    except (ArithmeticError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("persisted account baseline cash is missing or invalid") from exc
+    if not baseline_cash.is_finite() or baseline_cash < ZERO:
+        raise RuntimeError("persisted account baseline cash is missing or invalid")
+    # The gated factory binds the trusted runner-owned baseline for SELL replay.
     service = await LiveOrderService.create(
         api=api, settings=settings, risk_engine=risk, ledger=ledger,
         reconciler=reconciler, trade_history_after=int(state["baseline_epoch"]),
+        baseline_cash=baseline_cash,
     )
     return store, api, ledger, reconciler, service
 

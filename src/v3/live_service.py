@@ -71,6 +71,7 @@ class LiveOrderService:
         self._submit_lock = asyncio.Lock()
         # Only the asynchronous factory can unlock real service operations.
         self._factory_authorized = False
+        self._baseline_cash: Decimal | None = None
         # Account baseline (Unix seconds); trades before it predate the bot.
         self._trade_history_after: int | None = None
 
@@ -84,7 +85,12 @@ class LiveOrderService:
         ledger: EventLedger,
         reconciler: Reconciler | None = None,
         trade_history_after: int | None = None,
+        baseline_cash: Decimal | None = None,
     ) -> "LiveOrderService":
+        if baseline_cash is not None and (
+            not isinstance(baseline_cash, Decimal) or not baseline_cash.is_finite() or baseline_cash < ZERO
+        ):
+            raise ValueError("service baseline cash must be a finite nonnegative Decimal")
         errors = settings.live_client_errors()
         if errors:
             raise RuntimeError("Live order service refused: " + "; ".join(errors))
@@ -108,6 +114,7 @@ class LiveOrderService:
         executor = V3OrderExecutor(SDKExecutionAdapter(client), risk_engine, ledger, settings=settings)
         service = cls(api, executor, risk_engine, ledger, reconciler or Reconciler())
         service._trade_history_after = trade_history_after
+        service._baseline_cash = baseline_cash
         await service.recover_trade_history(
             max_items=TRADE_HISTORY_MAX_ITEMS,
             page_limit=TRADE_HISTORY_PAGE_LIMIT,
@@ -310,6 +317,56 @@ class LiveOrderService:
             }))
             return ExecutionResult(False, "account preflight failed; no order submitted")
 
+        if intent.side == "SELL":
+            if self._baseline_cash is None:
+                self._ledger.append(LedgerEvent.create("account.sell_preflight.blocked", {
+                    "reason": "trusted account baseline cash unavailable",
+                }))
+                return ExecutionResult(False, "SELL requires service-bound baseline cash")
+            try:
+                from .live_runner import local_snapshot as build_local_snapshot
+                processor = StreamEventProcessor(self._ledger)
+                trusted_local = build_local_snapshot(processor, self._baseline_cash)
+            except Exception as exc:
+                self._ledger.append(LedgerEvent.create("account.sell_preflight.failed", {
+                    "failure_type": type(exc).__name__,
+                }))
+                return ExecutionResult(False, "SELL inventory replay failed; no order submitted")
+            quantities = trusted_local.position_quantities
+            costs = trusted_local.position_cost_basis
+            quantity = quantities.get(intent.token_id) if quantities is not None else None
+            cost = costs.get(intent.token_id) if costs is not None else None
+            matches = [p for p in remote.positions if p.token_id == intent.token_id]
+            managed_conditions = {
+                event.payload.get("condition_id") for event in self._ledger.events()
+                if event.event_type == "order.accepted"
+                and event.payload.get("side") == "BUY"
+                and event.payload.get("token_id") == intent.token_id
+            }
+            active_ids = processor.active_order_ids
+            active_order_for_token = any(
+                order.token_id == intent.token_id and order.order_id in active_ids
+                for order in processor.orders.values()
+            )
+            if (
+                not isinstance(quantity, Decimal) or not quantity.is_finite() or quantity <= ZERO
+                or not isinstance(cost, Decimal) or not cost.is_finite() or cost <= ZERO
+                or not isinstance(intent.shares, Decimal) or not intent.shares.is_finite()
+                or intent.shares <= ZERO or intent.shares > quantity
+                or len(matches) != 1 or matches[0].condition_id != intent.condition_id
+                or matches[0].size != quantity
+                or managed_conditions != {intent.condition_id}
+                or intent.condition_id in self._reconciler.external_condition_ids
+                or active_order_for_token
+            ):
+                self._ledger.append(LedgerEvent.create("account.sell_preflight.blocked", {
+                    "reason": "SELL is not uniquely attributable to reconciled free bot inventory",
+                    "condition_id": intent.condition_id,
+                    "token_id": intent.token_id,
+                }))
+                return ExecutionResult(False, "SELL inventory, ownership, or open-order scope is not exact")
+            local_snapshot = trusted_local
+
         local_snapshot = replace(
             local_snapshot, order_ids=processor.active_order_ids,
         )
@@ -330,6 +387,11 @@ class LiveOrderService:
             state = self._risk_state(
                 remote, daily_pnl=context.daily_pnl, peak_equity=context.peak_equity,
             )
+            if intent.side == "SELL":
+                state = replace(
+                    state,
+                    position_quantities=dict(local_snapshot.position_quantities or {}),
+                )
         except (ArithmeticError, AttributeError, TypeError, ValueError) as exc:
             self._ledger.append(LedgerEvent.create("account.preflight.failed", {
                 "failure_type": type(exc).__name__,

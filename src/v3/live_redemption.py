@@ -81,23 +81,47 @@ def _parse(event: LedgerEvent) -> RedemptionEvidence:
 
 
 def redemption_adjustments(ledger: EventLedger, processor: StreamEventProcessor) -> tuple[dict[str, Decimal], Decimal]:
-    """Replay audit rows against confirmed managed BUY inventory, failing closed."""
+    """Replay audit rows against chronologically confirmed managed inventory."""
+    from .live_accounting import confirmed_fills
+
     remaining: dict[str, Decimal] = {}
     conditions: dict[str, set[str]] = {}
-    for order in processor.orders.values():
-        if order.confirmed_size > ZERO:
-            if order.side != 'BUY':
-                raise ValueError('redemption cannot cover a non-BUY order')
-            remaining[order.token_id] = remaining.get(order.token_id, ZERO) + order.confirmed_size
-    for event in ledger.events():
+    events = tuple(ledger.events())
+    for event in events:
         if event.event_type == 'order.accepted':
-            p = event.payload
-            if p.get('side') == 'BUY' and isinstance(p.get('token_id'), str) and isinstance(p.get('condition_id'), str):
-                conditions.setdefault(p['token_id'], set()).add(p['condition_id'])
+            payload = event.payload
+            if (payload.get('side') == 'BUY'
+                    and isinstance(payload.get('token_id'), str)
+                    and isinstance(payload.get('condition_id'), str)):
+                conditions.setdefault(payload['token_id'], set()).add(payload['condition_id'])
+
+    try:
+        fills = confirmed_fills(processor)
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        processor.require_reconciliation('confirmed fill chronology or ledger association is invalid')
+        raise ValueError('confirmed fill chronology or ledger association is invalid')
+    for fill in fills:
+        if fill.side == 'BUY':
+            remaining[fill.token_id] = remaining.get(fill.token_id, ZERO) + fill.size
+        elif fill.side == 'SELL':
+            held = remaining.get(fill.token_id, ZERO)
+            if fill.size > held or held <= ZERO:
+                processor.require_reconciliation(
+                    'chronological confirmed SELL exceeds managed inventory during redemption replay'
+                )
+                raise ValueError('confirmed SELL exceeds managed inventory')
+            quantity = held - fill.size
+            if quantity:
+                remaining[fill.token_id] = quantity
+            else:
+                remaining.pop(fill.token_id, None)
+        else:
+            raise ValueError('redemption cannot cover an invalid order side')
+
     redeemed: dict[str, Decimal] = {}
     hashes: set[str] = set()
     payout = ZERO
-    for event in ledger.events():
+    for event in events:
         if event.event_type != 'position.redeemed':
             continue
         row = _parse(event)

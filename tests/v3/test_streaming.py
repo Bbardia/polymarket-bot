@@ -37,7 +37,7 @@ def order_event(
     )
 
 
-def trade_event(*, status="CONFIRMED", fee_rate_bps: str | None = "50", trade_id="trade-1", timestamp=None):
+def trade_event(*, status="CONFIRMED", fee_rate_bps: str | None = "50", trade_id="trade-1", timestamp: str | datetime | None = "2026-08-23T10:00:00Z"):
     return SimpleNamespace(
         topic="user", type="trade",
         payload=SimpleNamespace(
@@ -57,7 +57,7 @@ def maker_trade_event(*, status="CONFIRMED"):
             id="trade-maker-1", taker_order_id="external-order", market="condition",
             asset_id="token", side="SELL", size=D("2"), price=D("0.20"),
             status=status, owner="external-wallet", fee_rate_bps=D("50"),
-            timestamp=None, match_time=None, last_update=None,
+            timestamp="2026-08-23T10:00:00Z", match_time=None, last_update=None,
             maker_orders=[SimpleNamespace(
                 order_id="order-1", owner="wallet", asset_id="token", side="BUY",
                 matched_amount=D("2"), price=D("0.20"), fee_rate_bps=D("50"),
@@ -153,6 +153,20 @@ def test_processor_books_only_confirmed_trade_and_deduplicates_it(tmp_path):
     duplicate = processor.process(trade_event(status="CONFIRMED"))
     assert duplicate.duplicate
     assert processor.orders["order-1"].confirmed_size == D("2")
+
+
+def test_managed_trade_without_venue_match_time_latches_despite_later_receipt_time(tmp_path):
+    ledger = EventLedger(tmp_path / "missing-match-time.db")
+    processor = StreamEventProcessor(ledger, managed_order_ids={"order-1"})
+    processor.process(order_event())
+    event = trade_event(timestamp=None)
+    event.payload.last_update = "2026-08-23T10:00:05Z"
+    result = processor.process(event)
+
+    assert result.requires_reconciliation
+    assert processor.reconciliation_required
+    assert processor.orders["order-1"].confirmed_size == D("0")
+    assert StreamEventProcessor(ledger, managed_order_ids={"order-1"}).reconciliation_required
 
 
 def test_processor_accepts_fee_details_that_arrive_at_confirmation(tmp_path):
@@ -761,6 +775,89 @@ def test_remote_matched_taker_without_fee_latches_before_mutation_and_restart(tm
             restored.orders["order-1"].confirmed_notional,
             restored.orders["order-1"].confirmed_fees,
             dict(restored.orders["order-1"].trades)) == before
+
+
+def test_remote_managed_post_only_sell_maker_fill_replays_with_strict_match(tmp_path):
+    from dataclasses import replace
+
+    ledger = EventLedger(tmp_path / "sell-replay.db")
+    ledger.append(LedgerEvent.create("order.accepted", {
+        "client_order_id": "client-sell", "order_id": "sell-1", "status": "live",
+        "condition_id": "condition", "token_id": "token", "side": "SELL",
+        "requested_size": "5", "post_only": True,
+    }))
+    processor = StreamEventProcessor(ledger)
+    maker = RemoteTradeMaker("sell-1", "token", "SELL", D("0.20"), D("2"), D("50"))
+    row = replace(remote_trade_row(), trade_id="sell-trade", taker_order_id="external",
+                  side="BUY", trader_side="MAKER", maker_orders=(maker,))
+    result = processor.import_remote_trade(row)
+    assert result.accepted and not result.requires_reconciliation
+    assert processor.orders["sell-1"].confirmed_size == D("2")
+    assert processor.orders["sell-1"].confirmed_fees == D("0.0016")
+    assert processor.import_remote_trade(row).duplicate
+    restored = StreamEventProcessor(ledger)
+    assert restored.orders["sell-1"].confirmed_size == D("2")
+    assert restored.orders["sell-1"].trades["sell-trade"].fee == D("0.0016")
+
+
+def test_managed_sell_cumulative_overfill_latches_without_mutation(tmp_path):
+    from dataclasses import replace
+
+    ledger = EventLedger(tmp_path / "sell-overfill.db")
+    ledger.append(LedgerEvent.create("order.accepted", {
+        "client_order_id": "client-sell", "order_id": "sell-1", "status": "live",
+        "condition_id": "condition", "token_id": "token", "side": "SELL",
+        "requested_size": "5", "post_only": True,
+    }))
+    processor = StreamEventProcessor(ledger)
+    first = replace(
+        remote_trade_row(), trade_id="sell-trade-1", taker_order_id="external-1",
+        side="BUY", size=D("3"), trader_side="MAKER",
+        maker_orders=(RemoteTradeMaker("sell-1", "token", "SELL", D("0.20"), D("3"), D("50")),),
+    )
+    assert processor.import_remote_trade(first).accepted
+    order = processor.orders["sell-1"]
+    before = (order.state, order.confirmed_size, order.confirmed_notional,
+              order.confirmed_fees, dict(order.trades))
+    second = replace(
+        remote_trade_row(), trade_id="sell-trade-2", taker_order_id="external-2",
+        side="BUY", size=D("3"), trader_side="MAKER",
+        maker_orders=(RemoteTradeMaker("sell-1", "token", "SELL", D("0.20"), D("3"), D("50")),),
+    )
+
+    result = processor.import_remote_trade(second)
+
+    assert result.requires_reconciliation
+    assert processor.reconciliation_required
+    assert (order.state, order.confirmed_size, order.confirmed_notional,
+            order.confirmed_fees, dict(order.trades)) == before
+    restored = StreamEventProcessor(ledger)
+    assert restored.reconciliation_required
+    assert restored.orders["sell-1"].confirmed_size == D("3")
+
+
+def test_direct_sell_trade_stream_requires_persisted_post_only_acceptance(tmp_path):
+    for post_only in (True, False):
+        ledger = EventLedger(tmp_path / f"direct-sell-{post_only}.db")
+        accepted = {
+            "client_order_id": "client-sell", "order_id": "sell-1", "status": "live",
+            "condition_id": "condition", "token_id": "token", "side": "SELL",
+            "requested_size": "5",
+        }
+        if post_only:
+            accepted["post_only"] = True
+        ledger.append(LedgerEvent.create("order.accepted", accepted))
+        processor = StreamEventProcessor(ledger)
+        event = trade_event(trade_id=f"direct-{post_only}")
+        event.payload.taker_order_id = "external"
+        event.payload.side = "BUY"
+        event.payload.maker_orders = [SimpleNamespace(
+            order_id="sell-1", owner="wallet", asset_id="token", side="SELL",
+            matched_amount=D("2"), price=D("0.20"), fee_rate_bps=D("0"),
+        )]
+        result = processor.process(event)
+        assert result.requires_reconciliation is (not post_only)
+        assert processor.orders["sell-1"].confirmed_size == (D("2") if post_only else D("0"))
 
 
 def test_remote_matched_maker_without_fee_latches_before_mutation_and_restart(tmp_path):

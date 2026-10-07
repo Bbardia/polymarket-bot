@@ -36,7 +36,7 @@ def _ledger(token="managed", condition="weather-1", quantity="5"):
         "id": "t1", "taker_order_id": "o1", "market": condition,
         "asset_id": token, "side": "BUY", "size": quantity,
         "price": "0.5", "status": "CONFIRMED", "owner": "wallet",
-        "fee_rate_bps": "0",
+        "fee_rate_bps": "0", "timestamp": NOW.isoformat(),
     }))
     return ledger
 
@@ -123,7 +123,7 @@ def test_zero_value_loser_sharing_condition_blocks_condition_wide_redeem():
         "id": "t2", "taker_order_id": "o2", "market": "weather-1",
         "asset_id": "managed-loser", "side": "BUY", "size": "5",
         "price": "0.5", "status": "CONFIRMED", "owner": "wallet",
-        "fee_rate_bps": "0",
+        "fee_rate_bps": "0", "timestamp": NOW.isoformat(),
     }))
     remote = RemoteSnapshot(D("95"), (
         RemotePosition("weather-1", "managed", D("5"), D("5"), D("2.5"), True),

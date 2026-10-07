@@ -64,6 +64,8 @@ class AccountRiskState:
     reconciled: bool = False
     unknown_remote_positions: int = 0
     unknown_remote_orders: int = 0
+    # Exact bot-attributable, reconciled inventory used only to authorize SELLs.
+    position_quantities: dict[str, Decimal] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,9 @@ class OrderIntent:
     market_accepting_orders: bool = False
     rules_verified: bool = False
     disputed: bool = False
+    decision_id: str | None = None
+    exit_stage: str | None = None
+    target_return: Decimal | None = None
 
     @property
     def all_in_notional(self) -> Decimal:
@@ -109,7 +114,10 @@ class RiskEngine:
         if (
             any(not isinstance(value, Decimal) for value in raw_values)
             or not isinstance(state.event_exposure, dict)
-            or any(not isinstance(value, Decimal) for value in state.event_exposure.values())
+            or not isinstance(state.position_quantities, dict)
+            or any(not isinstance(value, Decimal) for value in (
+                *state.event_exposure.values(), *state.position_quantities.values(),
+            ))
             or any(type(value) is not int for value in (
                 state.open_orders, state.open_positions,
                 state.unknown_remote_positions, state.unknown_remote_orders,
@@ -136,7 +144,9 @@ class RiskEngine:
             or state.peak_equity < ZERO or intent.price <= ZERO or intent.shares <= ZERO
             or intent.estimated_fee < ZERO or intent.tick_size <= ZERO
             or intent.min_order_size <= ZERO
-            or any(not value.is_finite() or value < ZERO for value in state.event_exposure.values())
+            or any(not value.is_finite() or value < ZERO for value in (
+                *state.event_exposure.values(), *state.position_quantities.values(),
+            ))
             or min(state.open_orders, state.open_positions, state.unknown_remote_positions,
                    state.unknown_remote_orders) < 0
         ):
@@ -167,6 +177,15 @@ class RiskEngine:
             return reject("order TTL exceeds configured limit")
         if state.open_orders >= self.limits.max_open_orders:
             return reject("maximum open orders reached")
+        if intent.side == "SELL":
+            available = state.position_quantities.get(intent.token_id, ZERO)
+            if available <= ZERO or intent.shares > available:
+                return reject("SELL quantity exceeds reconciled bot-managed inventory")
+            if notional > self.limits.max_order_notional:
+                return reject("SELL order exceeds max order notional")
+            # A verified post-only SELL can only reduce held inventory; entry
+            # exposure/cash and entry-stop thresholds do not authorize it.
+            return RiskDecision(True, "OK: reconciled risk-reducing SELL", capital_base, deployable, notional)
         if state.open_positions >= self.limits.max_positions:
             return reject("maximum positions reached")
         if state.daily_pnl <= -self.limits.daily_loss_limit:
