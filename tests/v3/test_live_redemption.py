@@ -9,7 +9,10 @@ import pytest
 
 from src.v3.ledger import EventLedger, LedgerEvent
 from src.v3.live_runner import local_snapshot
-from src.v3.live_redemption import RedemptionEvidence, record_verified_redemptions, recognize_remote_redemptions
+from src.v3.live_redemption import (
+    RedemptionEvidence, record_verified_redemptions, recognize_remote_redemptions,
+    redemption_adjustments,
+)
 from src.v3.api import UnifiedPolymarketAPI
 from src.v3.reconciliation import LocalSnapshot, Reconciler, RemotePosition, RemoteSnapshot
 from src.v3.streaming import StreamEventProcessor
@@ -28,7 +31,7 @@ def ledger_with_fill():
     ledger.append(LedgerEvent.create('user.trade', {
         'id': 't1', 'taker_order_id': 'o1', 'market': 'cond', 'asset_id': 'tok',
         'side': 'BUY', 'size': '5.26', 'price': '0.50', 'status': 'CONFIRMED',
-        'owner': 'wallet', 'fee_rate_bps': '0',
+        'owner': 'wallet', 'fee_rate_bps': '0', 'timestamp': NOW.isoformat(),
     }))
     return ledger
 
@@ -54,6 +57,35 @@ def test_redemption_requires_explicit_evidence_and_full_parity():
     assert after.cash == D('102.63') and after.position_tokens == frozenset()
     assert Reconciler().compare(after, remote).safe_to_trade
     assert record_verified_redemptions(ledger, StreamEventProcessor(ledger), D('100'), remote, (evidence(),)) == ()
+
+
+def test_redemption_adjustment_uses_remaining_holding_after_confirmed_sell():
+    ledger = ledger_with_fill()
+    ledger.append(LedgerEvent.create('order.accepted', {
+        'client_order_id': 'cs', 'order_id': 'os', 'status': 'live',
+        'condition_id': 'cond', 'token_id': 'tok', 'side': 'SELL',
+        'price': '0.60', 'requested_size': '2', 'post_only': True,
+    }))
+    ledger.append(LedgerEvent.create('user.trade', {
+        'id': 'ts', 'taker_order_id': 'external-order', 'market': 'cond', 'asset_id': 'tok',
+        'side': 'BUY', 'size': '2', 'price': '0.60', 'status': 'CONFIRMED',
+        'owner': 'wallet', 'fee_rate_bps': '0', 'timestamp': NOW.isoformat(),
+        'maker_orders': [{
+            'order_id': 'os', 'owner': 'wallet', 'asset_id': 'tok', 'side': 'SELL',
+            'matched_amount': '2', 'price': '0.60', 'fee_rate_bps': '0',
+        }],
+    }))
+    processor = StreamEventProcessor(ledger)
+
+    assert redemption_adjustments(ledger, processor) == ({}, D('0'))
+    before = local_snapshot(processor, D('100'))
+    assert before.position_quantities == {'tok': D('3.26')}
+    remote = RemoteSnapshot(D('101.83'), (), ())
+    row = evidence(quantity=D('3.26'), payout=D('3.26'))
+    assert len(record_verified_redemptions(ledger, processor, D('100'), remote, (row,))) == 1
+    after = local_snapshot(StreamEventProcessor(ledger), D('100'))
+    assert after.cash == D('101.83') and after.position_tokens == frozenset()
+    assert Reconciler().compare(after, remote).safe_to_trade
 
 
 @pytest.mark.parametrize('changes', [
@@ -103,7 +135,7 @@ def test_two_distinct_redemptions_reconcile_together_only():
     ledger.append(LedgerEvent.create('user.trade', {
         'id': 't2', 'taker_order_id': 'o2', 'market': 'cond-2', 'asset_id': 'tok-2',
         'side': 'BUY', 'size': '5.96', 'price': '0.50', 'status': 'CONFIRMED',
-        'owner': 'wallet', 'fee_rate_bps': '0',
+        'owner': 'wallet', 'fee_rate_bps': '0', 'timestamp': NOW.isoformat(),
     }))
     processor = StreamEventProcessor(ledger)
     assert local_snapshot(processor, D('100')).cash == D('94.39')

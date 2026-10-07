@@ -122,6 +122,15 @@ def _as_aware_datetime(value: Any) -> datetime | None:
     return result.astimezone(timezone.utc)
 
 
+def _venue_match_time(payload: Mapping[str, Any]) -> datetime | None:
+    """Return only an explicit venue match timestamp, never local receipt time."""
+    for key in ("timestamp", "match_time", "matchtime", "matched_at"):
+        parsed = _as_aware_datetime(payload.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def _remote_snapshot_payload(remote: RemoteSnapshot) -> dict[str, Any]:
     positions = sorted(remote.positions, key=lambda item: (item.condition_id, item.token_id))
     orders = sorted(remote.open_orders, key=lambda item: item.order_id)
@@ -1165,6 +1174,39 @@ class StreamEventProcessor:
             reason = "remote maker side conflicts with managed maker order"
             self.require_reconciliation(reason)
             return ProcessResult(False, requires_reconciliation=True, reason=reason)
+        # SELL-maker replay is deliberately limited to one uniquely persisted,
+        # post-only managed order with complete, internally consistent fill data.
+        sell_makers = [maker for maker in trade.maker_orders
+                       if maker.order_id in self.managed_order_ids
+                       and self.orders.get(maker.order_id) is not None
+                       and self.orders[maker.order_id].side == "SELL"]
+        if sell_makers:
+            maker = sell_makers[0]
+            order = self.orders[maker.order_id]
+            accepted = [event for event in self.ledger.events()
+                        if event.event_type == "order.accepted"
+                        and event.payload.get("order_id") == maker.order_id]
+            valid = (
+                len(sell_makers) == 1 and len(accepted) == 1
+                and accepted[0].payload.get("post_only") is True
+                and accepted[0].payload.get("side") == "SELL"
+                and accepted[0].payload.get("token_id") == order.token_id == maker.token_id == trade.token_id
+                and accepted[0].payload.get("condition_id") == trade.condition_id
+                and maker.side == "SELL" and trade.side == "BUY"
+                and trade.trader_side == "MAKER"
+                and trade.status == "CONFIRMED"
+                and trade.fee_rate_bps is not None and maker.fee_rate_bps is not None
+                and maker.matched_amount.is_finite() and maker.matched_amount > ZERO
+                and maker.matched_amount <= order.requested_size
+                and maker.price.is_finite() and maker.price > ZERO
+                and maker.fee_rate_bps.is_finite() and maker.fee_rate_bps >= ZERO
+                and trade.size == maker.matched_amount and trade.price == maker.price
+            )
+            if not valid:
+                reason = "managed SELL maker fill lacks unique post-only evidence or consistent confirmed fee/quantity"
+                self.require_reconciliation(reason, source_trade_id=trade.trade_id,
+                                            source_order_id=maker.order_id)
+                return ProcessResult(False, requires_reconciliation=True, reason=reason)
         if trade.trader_side == "TAKER" and trade.fee_rate_bps is None:
             reason = "remote trade fee rate is unknown"
             self.require_reconciliation(reason)
@@ -1186,6 +1228,7 @@ class StreamEventProcessor:
         payload = {
             "id": trade.trade_id,
             "taker_order_id": trade.taker_order_id,
+            "market": trade.condition_id,
             "asset_id": trade.token_id,
             "side": trade.side,
             "size": trade.size,
@@ -1318,9 +1361,7 @@ class StreamEventProcessor:
         payload = event.payload
         try:
             status = TradeStatus(str(_value(payload, "status")))
-            matched_at = _as_aware_datetime(
-                _value(payload, "timestamp", "match_time")
-            ) or _as_aware_datetime(event.occurred_at)
+            matched_at = _venue_match_time(payload)
             targets: list[tuple[OrderAggregate, Mapping[str, Any], str]] = []
             target_order_ids: set[str] = set()
 
@@ -1355,6 +1396,8 @@ class StreamEventProcessor:
                     reason="trade references unknown order",
                     event_id=event.event_id,
                 )
+            if matched_at is None:
+                raise OrderReconciliationRequired("managed trade lacks a valid venue match timestamp")
 
             parsed_targets: list[tuple[OrderAggregate, Decimal, Decimal, Decimal]] = []
             for order, target_payload, size_key in targets:
@@ -1371,6 +1414,23 @@ class StreamEventProcessor:
                 token_id = str(
                     _value(target_payload, "asset_id", "token_id", default="")
                 )
+                if order.side == "SELL":
+                    accepted = [event for event in self.ledger.events()
+                                if event.event_type == "order.accepted"
+                                and event.payload.get("order_id") == order.order_id]
+                    if (
+                        size_key != "matched_amount" or status is not TradeStatus.CONFIRMED
+                        or str(_value(target_payload, "side", default="")) != "SELL"
+                        or str(_value(payload, "side", default="")) != "BUY"
+                        or fee_rate_value is None or len(accepted) != 1
+                        or accepted[0].payload.get("post_only") is not True
+                        or accepted[0].payload.get("side") != "SELL"
+                        or accepted[0].payload.get("token_id") != order.token_id
+                        or accepted[0].payload.get("condition_id") != str(_value(payload, "market", "condition_id", default=""))
+                    ):
+                        raise OrderReconciliationRequired(
+                            "managed SELL fill lacks confirmed post-only maker evidence"
+                        )
                 if token_id and token_id != order.token_id:
                     raise ValueError("trade token does not match local order")
                 fee = taker_fee(

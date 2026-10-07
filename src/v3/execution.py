@@ -99,6 +99,12 @@ class V3OrderExecutor:
             "post_only": True,
             "effective_ttl_seconds": intent.ttl_seconds,
         }
+        if intent.decision_id is not None:
+            intent_payload.update({
+                "decision_id": intent.decision_id,
+                "exit_stage": intent.exit_stage,
+                "target_return": None if intent.target_return is None else str(intent.target_return),
+            })
         self._ledger.append(LedgerEvent.create("order.submission.started", intent_payload))
 
         response = None
@@ -179,6 +185,9 @@ class V3OrderExecutor:
                 "requested_size": str(intent.shares),
                 "post_only": True,
                 "expiration": expiration,
+                **({"decision_id": intent.decision_id, "exit_stage": intent.exit_stage,
+                    "target_return": None if intent.target_return is None else str(intent.target_return)}
+                   if intent.decision_id is not None else {}),
             },
         ))
         return ExecutionResult(True, str(response.status), order)
