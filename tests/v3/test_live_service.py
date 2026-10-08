@@ -680,6 +680,25 @@ def test_cancel_pagination_overflow_latches_executor_and_blocks_followup_submit(
     assert not blocked.accepted and blocked.reason == "kill switch latched"
 
 
+def test_submit_refuses_buy_on_external_condition(tmp_path):
+    api = FakeAPI(remote_snapshot(cash="10"))
+    executor = FakeExecutor()
+    ledger = EventLedger(tmp_path / "ext-buy.db")
+    service = _authorized_service_for_test(
+        api=api, executor=executor, risk_engine=risk_engine(), ledger=ledger,
+        reconciler=Reconciler(external_condition_ids={"condition-1"}),
+    )
+    result = asyncio.run(service.submit(
+        intent(), local_snapshot(cash="10"), LiveRiskContext(daily_pnl=D("0"), peak_equity=D("10")),
+    ))
+    assert not result.accepted
+    assert "external" in result.reason
+    assert executor.calls == [] and api.market_fetches == 0 and api.fetches == 0
+    blocked = [e.payload for e in ledger.events() if e.event_type == "account.preflight.blocked"]
+    assert blocked == [{"reason": "BUY on external condition",
+                        "condition_id": "condition-1", "token_id": "new-token"}]
+
+
 def test_sell_exit_freshness_uses_context_read_time_not_last_book_change(tmp_path):
     from dataclasses import replace
     from datetime import timedelta

@@ -14,7 +14,7 @@ from .config import V3Settings
 from .execution import ExecutionResult, V3OrderExecutor
 from .ledger import EventLedger, LedgerEvent
 from .live_early_exit import book_quote_age_seconds
-from .reconciliation import LocalSnapshot, Reconciler, RemoteSnapshot
+from .reconciliation import LocalSnapshot, Reconciler, RemoteSnapshot, _quantity_matches
 from .risk import AccountRiskState, OrderIntent, RiskEngine
 from .streaming import StreamEventProcessor
 from .sdk_execution_adapter import SDKExecutionAdapter
@@ -366,6 +366,13 @@ class LiveOrderService:
                 "unresolved_submission_count": len(unresolved),
             }))
             return ExecutionResult(False, "unresolved prior submission requires manual reconciliation")
+        if intent.side == "BUY" and intent.condition_id in self._reconciler.external_condition_ids:
+            self._ledger.append(LedgerEvent.create("account.preflight.blocked", {
+                "reason": "BUY on external condition",
+                "condition_id": intent.condition_id,
+                "token_id": intent.token_id,
+            }))
+            return ExecutionResult(False, "BUY refused: condition is held outside the bot (external)")
 
         validated_intent, market_block = await self._validated_intent(intent)
         if market_block or validated_intent is None:
@@ -415,9 +422,9 @@ class LiveOrderService:
                 not isinstance(quantity, Decimal) or not quantity.is_finite() or quantity <= ZERO
                 or not isinstance(cost, Decimal) or not cost.is_finite() or cost <= ZERO
                 or not isinstance(intent.shares, Decimal) or not intent.shares.is_finite()
-                or intent.shares <= ZERO or intent.shares > quantity
+                or intent.shares <= ZERO or intent.shares > min(matches[0].size, quantity)
                 or len(matches) != 1 or matches[0].condition_id != intent.condition_id
-                or matches[0].size != quantity
+                or not _quantity_matches(quantity, matches[0].size)
                 or managed_conditions != {intent.condition_id}
                 or intent.condition_id in self._reconciler.external_condition_ids
                 or active_order_for_token
