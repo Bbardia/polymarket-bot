@@ -1,0 +1,8 @@
+[Unit]
+Description=Polymarket V7 live health check (Resend email alerts)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/rasbardi/polymarket-bot
+ExecStart=/usr/bin/python3 /home/rasbardi/polymarket-bot/scripts/live_health_check.py --env-file /home/rasbardi/polymarket-bot/.env.alerts --live-env-file /home/rasbardi/polymarket-bot/.env.live
+TimeoutStartSec=2min

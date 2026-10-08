@@ -1,0 +1,21 @@
+[Unit]
+Description=Polymarket V7 live bot (persistent user service)
+# Never give up restarting: a long DNS/network outage must not leave the bot dead.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/rasbardi/polymarket-bot
+# Wait for DNS after boot or a network loss instead of crash-looping.
+ExecStartPre=/bin/sh -c 'until getent hosts clob.polymarket.com >/dev/null; do sleep 5; done'
+TimeoutStartSec=10min
+ExecStart=/home/rasbardi/polymarket-bot/venv/bin/python /home/rasbardi/polymarket-bot/run_v3.py live-run --env-file /home/rasbardi/polymarket-bot/.env.live --secrets-file /home/rasbardi/polymarket-bot/.env
+Restart=on-failure
+RestartSec=30s
+# Persistent logs without sudo (the user journal is volatile on this Pi).
+# Rotated daily with copytruncate by polymarket-logrotate.timer.
+StandardOutput=append:/home/rasbardi/polymarket-bot/logs/live/live.log
+StandardError=append:/home/rasbardi/polymarket-bot/logs/live/live.log
+
+[Install]
+WantedBy=default.target

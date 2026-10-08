@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily backup of the live V7 ledger
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

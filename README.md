@@ -285,6 +285,17 @@ fills, fee-aware shadow metrics, public-only paper-worker safety, durable paper
 state, broadened discovery, weather parsing/forecast caching, directional
 settlement/Brier metrics, and non-live entrypoint safety.
 
+## Live operations (alerts, logs, backups)
+
+See the Operations section of `docs/live-readiness-status.md`. Install with
+`scripts/install_live_ops.sh` (never restarts the live unit).
+
+**Ledger backups are pairs.** `data/backups/live-v7/YYYYMMDD/` holds
+`ledger.sqlite` (sqlite backup-API snapshot) and `live_state.json` taken right
+after it. The ledger's reconciliation resolutions are validated against the
+baselines and IDs in `live_state.json`, so restore both files from the same
+day, together, with `polymarket-v7-live` stopped. Never mix days.
+
 ## Live certification still required
 
 Before any live command is added, V3 still needs:

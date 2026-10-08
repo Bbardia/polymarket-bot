@@ -1,0 +1,6 @@
+[Unit]
+Description=Rotate Polymarket bot logs (user logrotate, no sudo)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/logrotate --state /home/rasbardi/polymarket-bot/logs/.logrotate.state /home/rasbardi/polymarket-bot/deploy/logrotate/polymarket-live.conf

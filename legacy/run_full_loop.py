@@ -28,8 +28,12 @@ from legacy.forecast_scanner import ForecastScanner
 from legacy.edge_math import dynamic_min_edge, executable_buy_price
 
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
-LOG_DIR.mkdir(exist_ok=True)
-logger.add(LOG_DIR / "loop_v2_{time}.log", rotation="1 day", retention="7 days", level="DEBUG")
+
+
+def _configure_file_logging() -> None:
+    """Add the rotating file sink; called from main() so importing has no side effects."""
+    LOG_DIR.mkdir(exist_ok=True)
+    logger.add(LOG_DIR / "loop_v2_{time}.log", rotation="1 day", retention="7 days", level="DEBUG")
 
 TRADES_FILE = Path(__file__).resolve().parent.parent / "data" / "loop_v2_trades.jsonl"
 
@@ -1463,6 +1467,8 @@ def main():
             "retired CLOB V1/USDC.e assumptions. Use the V3 validation and paper "
             "research tools; no V3 start command is available yet."
         )
+
+    _configure_file_logging()
 
     dry_run = True
     mode = "LIVE" if args.live else "DRY RUN"
