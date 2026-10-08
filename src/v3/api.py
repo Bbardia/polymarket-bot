@@ -25,6 +25,8 @@ from .reconciliation import (
 
 PUSD_BASE_UNITS = Decimal("1000000")
 ACTIVITY_PAGE_SIZE_CAP = 500
+# SDK default is 20; the data-api positions cap is 500 per request.
+POSITIONS_PAGE_SIZE = 500
 
 
 
@@ -164,7 +166,7 @@ class UnifiedPolymarketAPI:
         positions: list[RemotePosition] = []
         position_tokens: set[str] = set()
         position_pages = position_rows = 0
-        async for page in client.list_positions(size_threshold=0):
+        async for page in client.list_positions(size_threshold=0, page_size=POSITIONS_PAGE_SIZE):
             position_pages += 1
             if position_pages > page_limit:
                 raise RuntimeError("position reconciliation page limit exceeded")
