@@ -483,12 +483,13 @@ class LiveOrderService:
                 "imported_count": 0, "lifecycle_clear": False,
                 "read_error": self._trade_history_read_error,
             }
-        self._trade_history_read_error = None
         imported = 0
         for trade in trades:
             result = processor.import_remote_trade(trade)
             if result.accepted and not result.duplicate and not result.requires_reconciliation:
                 imported += 1
+        # Only a fully imported read clears the per-read submit block.
+        self._trade_history_read_error = None
         # This reports only processor-latch state, not whole-account trade readiness.
         processor = StreamEventProcessor(self._ledger)
         return {"imported_count": imported, "lifecycle_clear": not processor.reconciliation_required}

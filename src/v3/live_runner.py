@@ -25,11 +25,15 @@ import signal
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
+from math import isfinite
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-from polymarket.errors import RateLimitError, TransportError
+from polymarket.errors import (
+    RateLimitError, RequestRejectedError, TransportError, UnexpectedResponseError,
+)
+from polymarket.errors import TimeoutError as SDKTimeoutError
 
 from .api import UnifiedPolymarketAPI
 from .config import V3Settings, _env_bool
@@ -55,10 +59,40 @@ ZERO = Decimal("0")
 ONE = Decimal("1")
 TRADE_HISTORY_MAX_ITEMS = 10_000
 TRADE_HISTORY_PAGE_LIMIT = 100
+# Cycle-level account snapshot only; the submit preflight never sleeps on retries.
+SNAPSHOT_READ_ATTEMPTS = 3
+SNAPSHOT_RETRY_BASE_DELAY_SECONDS = 2.0
+SNAPSHOT_RETRY_MAX_DELAY_SECONDS = 10.0
+_sleep = asyncio.sleep
 
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _transient_snapshot_error(exc: BaseException) -> bool:
+    """SDK read failures that end a cycle softly; content errors still raise."""
+    if isinstance(exc, RequestRejectedError):
+        return isinstance(exc.status, int) and exc.status >= 500
+    return isinstance(exc, (RateLimitError, UnexpectedResponseError, SDKTimeoutError, TransportError))
+
+
+async def fetch_cycle_snapshot(api: Any) -> RemoteSnapshot:
+    """Bounded retry of the cycle's read-only snapshot on 429 and 503 rejections."""
+    for attempt in range(SNAPSHOT_READ_ATTEMPTS):
+        try:
+            return await api.fetch_remote_snapshot()
+        except (RateLimitError, RequestRejectedError) as exc:
+            retryable = isinstance(exc, RateLimitError) or exc.status == 503
+            if not retryable or attempt + 1 >= SNAPSHOT_READ_ATTEMPTS:
+                raise
+            # Only RequestRejectedError carries a server Retry-After hint.
+            delay = getattr(exc, "retry_after", None)
+            if (isinstance(delay, bool) or not isinstance(delay, (int, float))
+                    or not isfinite(delay) or delay < 0):
+                delay = SNAPSHOT_RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
+            await _sleep(min(float(delay), SNAPSHOT_RETRY_MAX_DELAY_SECONDS))
+    raise AssertionError("unreachable")
 
 
 @dataclass(frozen=True)
@@ -122,9 +156,7 @@ def local_snapshot(processor: StreamEventProcessor, baseline_cash: Decimal) -> L
             fills = confirmed_fills(processor)
         except (ArithmeticError, KeyError, TypeError, ValueError):
             reason = "confirmed fill chronology or ledger association is invalid"
-            # One durable latch per condition: resolvers require a single unresolved latch.
-            if reason not in processor.reconciliation_reasons:
-                processor.require_reconciliation(reason)
+            processor.require_reconciliation_once(reason)
             raise ValueError(reason)
         for fill in fills:
             size, notional, fees = fill.size, fill.notional, fill.fee
@@ -140,9 +172,9 @@ def local_snapshot(processor: StreamEventProcessor, baseline_cash: Decimal) -> L
             elif fill.side == "SELL":
                 held = quantities.get(token, ZERO)
                 if size > held or held <= ZERO or fees > notional:
-                    reason = "chronological confirmed SELL exceeds managed inventory or has invalid proceeds"
-                    if reason not in processor.reconciliation_reasons:
-                        processor.require_reconciliation(reason)
+                    processor.require_reconciliation_once(
+                        "chronological confirmed SELL exceeds managed inventory or has invalid proceeds"
+                    )
                     raise ValueError("confirmed SELL exceeds managed inventory or has invalid proceeds")
                 basis = costs[token]
                 allocated = basis * size / held
@@ -551,6 +583,37 @@ class LiveTradingRunner(LiveShadowRunner):
             return "bot already holds a position in this event"
         return None
 
+    def _soft_failure(self, status: dict[str, Any], reason: str, *, advance_cycle: bool) -> dict[str, Any]:
+        """End a cycle before any account action, with a fully blocked status."""
+        if advance_cycle:
+            self.state["cycles"] = int(self.state.get("cycles", 0)) + 1
+            self.store.save_state(self.state)
+        status.update({
+            "healthy": False,
+            "cycle": self.state.get("cycles", 0),
+            "entry_block_reason": reason,
+            "weather_markets_evaluated": 0,
+            "weather_forecast_status": "not_started",
+            "weather_errors": 0,
+            "v7_candidates": 0,
+            "outcomes_this_cycle": {},
+            "limits": asdict(self.risk.limits),
+            "reconciliation": {
+                "safe_to_trade": False,
+                "invalid_snapshot": True,
+                "cash_delta": ZERO,
+                "unknown_positions": 0,
+                "unknown_orders": 0,
+                "missing_positions": 0,
+                "missing_orders": 0,
+                "position_mismatches": 0,
+                "external_positions": 0,
+            },
+            "cycle_finished_at": _utc_now().isoformat(),
+        })
+        self.store.write_status(status)
+        return status
+
     async def run_cycle(self, *, now: datetime | None = None) -> dict[str, Any]:
         now = now or _utc_now()
         today = now.date().isoformat()
@@ -579,66 +642,38 @@ class LiveTradingRunner(LiveShadowRunner):
                 if not day_start_equity.is_finite() or day_start_equity <= ZERO:
                     raise ValueError("persisted day-start equity is invalid")
         except (ArithmeticError, KeyError, TypeError, ValueError):
-            status.update({
-                "healthy": False,
-                "cycle": self.state.get("cycles", 0),
-                "entry_block_reason": "persisted risk baseline invalid",
-                "weather_markets_evaluated": 0,
-                "weather_forecast_status": "not_started",
-                "weather_errors": 0,
-                "v7_candidates": 0,
-                "outcomes_this_cycle": {},
-                "limits": asdict(self.risk.limits),
-                "reconciliation": {
-                    "safe_to_trade": False,
-                    "invalid_snapshot": True,
-                    "cash_delta": ZERO,
-                    "unknown_positions": 0,
-                    "unknown_orders": 0,
-                    "missing_positions": 0,
-                    "missing_orders": 0,
-                    "position_mismatches": 0,
-                    "external_positions": 0,
-                },
-                "cycle_finished_at": _utc_now().isoformat(),
-            })
-            self.store.write_status(status)
-            return status
+            return self._soft_failure(status, "persisted risk baseline invalid", advance_cycle=False)
 
         recovery = await self.service.recover_trade_history(
             max_items=TRADE_HISTORY_MAX_ITEMS, page_limit=TRADE_HISTORY_PAGE_LIMIT,
         )
         status["trade_history"] = recovery
-        if recovery.get("read_error"):
+        history_read_error = recovery.get("read_error")
+        if history_read_error:
             # A failed read imports nothing and is retried next cycle; it blocks
             # entries and exits for this cycle only, never as a durable latch.
-            entry_block = str(recovery["read_error"])
+            entry_block = str(history_read_error)
             status["healthy"] = False
         try:
-            remote = await self.api.fetch_remote_snapshot()
-        except (RateLimitError, TransportError, TimeoutError) as exc:
-            status.update({
-                "healthy": False,
-                "cycle": self.state.get("cycles", 0),
-                "entry_block_reason": "remote account snapshot unavailable",
-                "remote_snapshot_error": type(exc).__name__,
-                "weather_markets_evaluated": 0,
-                "weather_forecast_status": "not_started",
-                "weather_errors": 0,
-                "v7_candidates": 0,
-                "outcomes_this_cycle": {},
-                "limits": asdict(self.risk.limits),
-                "cycle_finished_at": _utc_now().isoformat(),
-            })
-            self.store.write_status(status)
-            return status
+            remote = await fetch_cycle_snapshot(self.api)
+        except Exception as exc:
+            if not _transient_snapshot_error(exc):
+                raise
+            status["remote_snapshot_error"] = type(exc).__name__
+            return self._soft_failure(status, "remote account snapshot unavailable", advance_cycle=True)
         processor = StreamEventProcessor(self.ledger)
-        status["orders_marked_expired"] = record_expired_orders(
-            processor, self.ledger, remote, now,
-            grace_seconds=self.runner_settings.expiry_grace_seconds,
-        )
+        status["orders_marked_expired"] = []
         status["orders_marked_terminal_canceled"] = []
-        if processor.active_order_ids - {order.order_id for order in remote.open_orders}:
+        if history_read_error:
+            # Without a current fill import, an absent order may have filled;
+            # never mark it expired or canceled this cycle.
+            status["lifecycle_marking_skipped"] = str(history_read_error)
+        else:
+            status["orders_marked_expired"] = record_expired_orders(
+                processor, self.ledger, remote, now,
+                grace_seconds=self.runner_settings.expiry_grace_seconds,
+            )
+        if not history_read_error and processor.active_order_ids - {order.order_id for order in remote.open_orders}:
             try:
                 history = await self.api.fetch_complete_account_trade_history(
                     after=int(self.state["baseline_epoch"]),
@@ -681,10 +716,11 @@ class LiveTradingRunner(LiveShadowRunner):
         from .live_redemption import recognize_remote_redemptions
         status["redemptions_recorded"] = []
         try:
-            status["redemptions_recorded"] = list(await recognize_remote_redemptions(
-                self.ledger, processor, baseline_cash, remote, self.api,
-                baseline_epoch=baseline_epoch, now=now, reconciler=self.reconciler,
-            ))
+            if not history_read_error:
+                status["redemptions_recorded"] = list(await recognize_remote_redemptions(
+                    self.ledger, processor, baseline_cash, remote, self.api,
+                    baseline_epoch=baseline_epoch, now=now, reconciler=self.reconciler,
+                ))
         except Exception as exc:
             status["redemption_reconciliation_error"] = type(exc).__name__
             status["healthy"] = False

@@ -7,18 +7,15 @@ full V3 live gate. This module exposes no automatic account mutation.
 
 from __future__ import annotations
 
-import asyncio
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from math import isfinite
 from typing import Any
 
 import polymarket
 from polymarket import AsyncPublicClient, AsyncSecureClient, BuilderApiKey
-from polymarket.errors import RateLimitError
 
 from .config import V3Settings
 from .reconciliation import (
@@ -30,10 +27,6 @@ PUSD_BASE_UNITS = Decimal("1000000")
 ACTIVITY_PAGE_SIZE_CAP = 500
 # SDK default is 20; the data-api positions cap is 500 per request.
 POSITIONS_PAGE_SIZE = 500
-SNAPSHOT_RATE_LIMIT_ATTEMPTS = 3
-SNAPSHOT_RATE_LIMIT_BASE_DELAY_SECONDS = 2.0
-SNAPSHOT_RATE_LIMIT_MAX_DELAY_SECONDS = 10.0
-_sleep = asyncio.sleep
 
 
 
@@ -158,29 +151,11 @@ class UnifiedPolymarketAPI:
     async def fetch_remote_snapshot(
         self, *, max_items: int = 2_000, page_limit: int = 100,
     ) -> RemoteSnapshot:
-        """Read pUSD, positions, and open orders; never mutates the account.
-
-        A rate-limited read is retried from scratch a bounded number of times;
-        each attempt rebuilds the whole snapshot, so no partial page is reused.
-        """
+        """Read pUSD, positions, and open orders; never mutates the account."""
         if type(max_items) is not int or max_items <= 0:
             raise ValueError("max_items must be a positive integer")
         if type(page_limit) is not int or page_limit <= 0:
             raise ValueError("page_limit must be a positive integer")
-        for attempt in range(SNAPSHOT_RATE_LIMIT_ATTEMPTS):
-            try:
-                return await self._read_remote_snapshot(max_items=max_items, page_limit=page_limit)
-            except RateLimitError as exc:
-                if attempt + 1 >= SNAPSHOT_RATE_LIMIT_ATTEMPTS:
-                    raise
-                delay = getattr(exc, "retry_after", None)
-                if (isinstance(delay, bool) or not isinstance(delay, (int, float))
-                        or not isfinite(delay) or delay < 0):
-                    delay = SNAPSHOT_RATE_LIMIT_BASE_DELAY_SECONDS * (2 ** attempt)
-                await _sleep(min(float(delay), SNAPSHOT_RATE_LIMIT_MAX_DELAY_SECONDS))
-        raise AssertionError("unreachable")
-
-    async def _read_remote_snapshot(self, *, max_items: int, page_limit: int) -> RemoteSnapshot:
         client = self._authenticated_client()
         balance = await client.get_balance_allowance(asset_type="COLLATERAL")
 

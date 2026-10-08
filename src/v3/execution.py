@@ -78,10 +78,6 @@ class V3OrderExecutor:
                 "reason": decision.reason,
             }))
             return ExecutionResult(False, decision.reason)
-        # Same comparison as RiskEngine (age == max allows), evaluated before any
-        # durable submission record so a stale quote never strands a submission.
-        if intent.quote_age_seconds > self._risk.limits.max_quote_age_seconds:
-            return ExecutionResult(False, "quote is stale")
 
         client_order_id = str(uuid.uuid4())
         order = OrderAggregate.new(
@@ -111,7 +107,8 @@ class V3OrderExecutor:
             })
         self._ledger.append(LedgerEvent.create("order.submission.started", intent_payload))
 
-        response = None
+        # RiskEngine.evaluate above is the single staleness gate for attempt one
+        # (age == max allowed); elapsed time only counts once a retry backs off.
         for attempt in range(3):
             now = self._clock()
             if attempt:
@@ -163,10 +160,6 @@ class V3OrderExecutor:
             }))
             await self._sleep(2 ** attempt)
 
-        if response is None:
-            reason = "submission aborted before a venue response"
-            self._local_abort(client_order_id, reason, attempts=0)
-            return ExecutionResult(False, reason, order)
         if not bool(getattr(response, "ok", False)):
             code = str(getattr(response, "code", "unknown"))
             message = str(getattr(response, "message", "order rejected"))

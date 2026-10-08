@@ -601,7 +601,9 @@ class StreamEventProcessor:
             if event.event_type in {"order.submission.started", "order.submission.attempted"}:
                 identity = f"client:{client_id}" if valid_id else f"event:{event.event_id}"
                 pending[identity] = client_id if valid_id else event.event_id  # type: ignore[assignment]
-            elif valid_id and not latched and self._valid_submission_terminal(event):
+            elif valid_id and (not latched or self._is_local_abort(event)) and self._valid_submission_terminal(event):
+                # A local abort provably sent nothing that can rest at the venue,
+                # so it closes its own submission even after an earlier latch.
                 pending.pop(f"client:{client_id}", None)
         if not pending:
             return
@@ -620,6 +622,10 @@ class StreamEventProcessor:
         self._record_result(ProcessResult(
             False, requires_reconciliation=True, reason=reason, event_id=latch_id,
         ))
+
+    @staticmethod
+    def _is_local_abort(event: LedgerEvent) -> bool:
+        return event.event_type == "order.rejected" and event.payload.get("code") == "local_abort"
 
     @staticmethod
     def _valid_submission_terminal(event: LedgerEvent) -> bool:
@@ -1122,6 +1128,15 @@ class StreamEventProcessor:
             reason=reason,
             event_id=event.event_id,
         ))
+
+    def require_reconciliation_once(self, reason: str) -> None:
+        """Persist an unscoped latch unless the same reason is already unresolved.
+
+        Resolution validators require exactly one unresolved latch, so a
+        condition re-detected every cycle must not append a fresh latch each time.
+        """
+        if reason not in self.reconciliation_reasons:
+            self.require_reconciliation(reason)
 
     def process(self, event: Any) -> ProcessResult:
         normalized = normalize_stream_event(event)
