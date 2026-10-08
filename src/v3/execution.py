@@ -78,6 +78,10 @@ class V3OrderExecutor:
                 "reason": decision.reason,
             }))
             return ExecutionResult(False, decision.reason)
+        # Same comparison as RiskEngine (age == max allows), evaluated before any
+        # durable submission record so a stale quote never strands a submission.
+        if intent.quote_age_seconds > self._risk.limits.max_quote_age_seconds:
+            return ExecutionResult(False, "quote is stale")
 
         client_order_id = str(uuid.uuid4())
         order = OrderAggregate.new(
@@ -109,13 +113,20 @@ class V3OrderExecutor:
 
         response = None
         for attempt in range(3):
-            if self._killed:
-                return ExecutionResult(False, "kill switch latched")
-            if not self._risk.evaluate(intent, state).allowed:
-                return ExecutionResult(False, "risk rejected retry")
             now = self._clock()
-            if intent.quote_age_seconds + max(0, now-started_at) > self._risk.limits.max_quote_age_seconds:
-                return ExecutionResult(False, "quote became stale during retry")
+            if attempt:
+                # Every prior attempt returned a retryable venue rejection, so no
+                # order rests at the venue; a local abort is a terminal outcome.
+                abort = None
+                if self._killed:
+                    abort = "kill switch latched"
+                elif not self._risk.evaluate(intent, state).allowed:
+                    abort = "risk rejected retry"
+                elif intent.quote_age_seconds + max(0, now - started_at) > self._risk.limits.max_quote_age_seconds:
+                    abort = "quote became stale during retry"
+                if abort is not None:
+                    self._local_abort(client_order_id, abort, attempts=attempt)
+                    return ExecutionResult(False, abort, order)
             expiration = int(now) + 60 + intent.ttl_seconds
             self._ledger.append(LedgerEvent.create("order.submission.attempted", {
                 **intent_payload, "attempt": attempt + 1, "expiration": expiration,
@@ -153,7 +164,9 @@ class V3OrderExecutor:
             await self._sleep(2 ** attempt)
 
         if response is None:
-            return ExecutionResult(False, "submission aborted before a venue response", order)
+            reason = "submission aborted before a venue response"
+            self._local_abort(client_order_id, reason, attempts=0)
+            return ExecutionResult(False, reason, order)
         if not bool(getattr(response, "ok", False)):
             code = str(getattr(response, "code", "unknown"))
             message = str(getattr(response, "message", "order rejected"))
@@ -191,6 +204,13 @@ class V3OrderExecutor:
             },
         ))
         return ExecutionResult(True, str(response.status), order)
+
+    def _local_abort(self, client_order_id: str, reason: str, *, attempts: int) -> None:
+        """Terminally close a started submission that provably reached no resting venue order."""
+        self._ledger.append(LedgerEvent.create("order.rejected", {
+            "client_order_id": client_order_id, "code": "local_abort", "message": reason,
+            "venue_attempts": attempts,
+        }))
 
     async def kill_switch(self) -> dict:
         """Latch entry stop before requesting cancellation; response is not proof of zero orders."""

@@ -75,6 +75,9 @@ class LiveOrderService:
         self._baseline_cash: Decimal | None = None
         # Account baseline (Unix seconds); trades before it predate the bot.
         self._trade_history_after: int | None = None
+        # In-memory, per-read gate: a failed history read blocks submits until
+        # the next successful read, without writing a durable latch.
+        self._trade_history_read_error: str | None = None
 
     @classmethod
     async def create(
@@ -336,6 +339,11 @@ class LiveOrderService:
                 "reason": "lifecycle reconciliation required",
             }))
             return ExecutionResult(False, "lifecycle reconciliation required; no order submitted")
+        if self._trade_history_read_error is not None:
+            self._ledger.append(LedgerEvent.create("account.preflight.blocked", {
+                "reason": "latest trade history read failed",
+            }))
+            return ExecutionResult(False, "latest trade history read failed; no order submitted")
         unresolved = self._unresolved_submissions()
         if unresolved:
             self._ledger.append(LedgerEvent.create("account.preflight.blocked", {
@@ -447,6 +455,9 @@ class LiveOrderService:
 
         Only trades at or after the factory's account baseline are replayed;
         any later trade not attributable to a managed order still latches.
+        A failed or cancelled read imports nothing, so it is reported as a
+        per-cycle ``read_error`` (callers must block entries and exits for that
+        cycle) rather than persisted as a durable content-inconsistency latch.
         """
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be a finite positive number")
@@ -461,16 +472,18 @@ class LiveOrderService:
                 )
             )
             trades = await asyncio.wait_for(fetch, timeout=timeout_seconds)
-        except asyncio.CancelledError:
-            processor.require_reconciliation(
-                "trade history read cancelled: CancelledError"
-            )
-            raise
-        except Exception as exc:
-            processor.require_reconciliation(
-                f"trade history read failed: {type(exc).__name__}"
-            )
-            return {"imported_count": 0, "lifecycle_clear": False}
+        except (Exception, asyncio.CancelledError) as exc:
+            self._trade_history_read_error = f"trade history read failed: {type(exc).__name__}"
+            self._ledger.append(LedgerEvent.create("account.trade_history.read_failed", {
+                "failure_type": type(exc).__name__,
+            }))
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return {
+                "imported_count": 0, "lifecycle_clear": False,
+                "read_error": self._trade_history_read_error,
+            }
+        self._trade_history_read_error = None
         imported = 0
         for trade in trades:
             result = processor.import_remote_trade(trade)

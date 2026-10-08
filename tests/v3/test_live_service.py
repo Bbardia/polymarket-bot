@@ -253,7 +253,16 @@ def test_create_requires_live_limits_and_matching_risk_engine_before_secure_clie
     result = asyncio.run(service.submit(
         intent(), local_snapshot(), LiveRiskContext(daily_pnl=D("0"), peak_equity=D("10")),
     ))
-    assert not result.accepted and "lifecycle reconciliation" in result.reason
+    assert not result.accepted and "trade history read failed" in result.reason
+    from src.v3.streaming import StreamEventProcessor
+    # A transient read failure is a per-read block, never a durable latch.
+    assert not StreamEventProcessor(ledger).reconciliation_required
+    api.trade_error = None
+    assert asyncio.run(service.recover_trade_history(max_items=10, page_limit=1))["lifecycle_clear"]
+    result = asyncio.run(service.submit(
+        intent(), local_snapshot(), LiveRiskContext(daily_pnl=D("0"), peak_equity=D("10")),
+    ))
+    assert result.accepted
 
     missing = V3Settings(
         live_enabled=True, paper_trading=False,
@@ -537,7 +546,7 @@ def test_trade_history_import_replays_confirmed_trade_and_persists_latch(tmp_pat
     assert processor.orders["managed-1"].confirmed_size == D("2")
 
 
-def test_trade_history_timeout_latches_reconciliation(tmp_path):
+def test_trade_history_timeout_blocks_per_read_without_durable_latch(tmp_path):
     class HangingTradeAPI(FakeAPI):
         async def fetch_account_trades(self, *, max_items, page_limit):
             self.trade_fetches.append((max_items, page_limit))
@@ -551,15 +560,23 @@ def test_trade_history_timeout_latches_reconciliation(tmp_path):
     result = asyncio.run(service.recover_trade_history(
         max_items=10, page_limit=2, timeout_seconds=0.01,
     ))
-    assert result == {"imported_count": 0, "lifecycle_clear": False}
+    assert result == {"imported_count": 0, "lifecycle_clear": False,
+                      "read_error": "trade history read failed: TimeoutError"}
     assert api.trade_fetches == [(10, 2)]
-    assert any(e.event_type == "stream.reconciliation_required" for e in ledger.events())
+    assert not any(e.event_type == "stream.reconciliation_required" for e in ledger.events())
+    assert [e.payload for e in ledger.events() if e.event_type == "account.trade_history.read_failed"] == [
+        {"failure_type": "TimeoutError"},
+    ]
     restarted = EventLedger(ledger_path)
     from src.v3.streaming import StreamEventProcessor
-    assert StreamEventProcessor(restarted).reconciliation_required
+    assert not StreamEventProcessor(restarted).reconciliation_required
+    blocked = asyncio.run(service.submit(
+        intent(), local_snapshot(), LiveRiskContext(daily_pnl=D("0"), peak_equity=D("10")),
+    ))
+    assert not blocked.accepted and "trade history read failed" in blocked.reason
 
 
-def test_trade_history_cancellation_latches_before_propagating(tmp_path):
+def test_trade_history_cancellation_propagates_without_durable_latch(tmp_path):
     class HangingTradeAPI(FakeAPI):
         async def fetch_account_trades(self, *, max_items, page_limit):
             self.trade_fetches.append((max_items, page_limit))
@@ -580,11 +597,14 @@ def test_trade_history_cancellation_latches_before_propagating(tmp_path):
     service = _authorized_service_for_test(api, FakeExecutor(), risk_engine(), ledger, Reconciler())
     asyncio.run(run_cancelled_fetch(service, api))
 
-    events = ledger.events()
-    latch = next(e for e in events if e.event_type == "stream.reconciliation_required")
-    assert latch.payload["reason"] == "trade history read cancelled: CancelledError"
+    events = tuple(ledger.events())
+    assert not any(e.event_type == "stream.reconciliation_required" for e in events)
+    assert [e.payload for e in events if e.event_type == "account.trade_history.read_failed"] == [
+        {"failure_type": "CancelledError"},
+    ]
     from src.v3.streaming import StreamEventProcessor
-    assert StreamEventProcessor(EventLedger(ledger_path)).reconciliation_required
+    assert not StreamEventProcessor(EventLedger(ledger_path)).reconciliation_required
+    assert service._trade_history_read_error == "trade history read failed: CancelledError"
 
 
 @pytest.mark.parametrize("timeout_seconds", [0, -1, float("nan"), float("inf")])
@@ -605,7 +625,9 @@ def test_trade_history_failures_unknown_trades_latch_across_restart_and_block_su
     service = _authorized_service_for_test(api, FakeExecutor(), risk_engine(), ledger, Reconciler())
     failed = asyncio.run(service.recover_trade_history(max_items=10, page_limit=2))
     assert failed["lifecycle_clear"] is False
-    assert any(e.event_type == "stream.reconciliation_required" for e in ledger.events())
+    assert failed["read_error"] == "trade history read failed: RuntimeError"
+    # Read failures are transient; only content inconsistencies latch durably.
+    assert not any(e.event_type == "stream.reconciliation_required" for e in ledger.events())
 
     restarted_ledger = EventLedger(ledger_path)
     api.trade_error = None

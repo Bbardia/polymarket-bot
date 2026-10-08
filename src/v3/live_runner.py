@@ -29,6 +29,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
+from polymarket.errors import RateLimitError, TransportError
+
 from .api import UnifiedPolymarketAPI
 from .config import V3Settings, _env_bool
 from .ledger import EventLedger
@@ -119,8 +121,11 @@ def local_snapshot(processor: StreamEventProcessor, baseline_cash: Decimal) -> L
         try:
             fills = confirmed_fills(processor)
         except (ArithmeticError, KeyError, TypeError, ValueError):
-            processor.require_reconciliation("confirmed fill chronology or ledger association is invalid")
-            raise ValueError("confirmed fill chronology or ledger association is invalid")
+            reason = "confirmed fill chronology or ledger association is invalid"
+            # One durable latch per condition: resolvers require a single unresolved latch.
+            if reason not in processor.reconciliation_reasons:
+                processor.require_reconciliation(reason)
+            raise ValueError(reason)
         for fill in fills:
             size, notional, fees = fill.size, fill.notional, fill.fee
             token = fill.token_id
@@ -135,9 +140,9 @@ def local_snapshot(processor: StreamEventProcessor, baseline_cash: Decimal) -> L
             elif fill.side == "SELL":
                 held = quantities.get(token, ZERO)
                 if size > held or held <= ZERO or fees > notional:
-                    processor.require_reconciliation(
-                        "chronological confirmed SELL exceeds managed inventory or has invalid proceeds"
-                    )
+                    reason = "chronological confirmed SELL exceeds managed inventory or has invalid proceeds"
+                    if reason not in processor.reconciliation_reasons:
+                        processor.require_reconciliation(reason)
                     raise ValueError("confirmed SELL exceeds managed inventory or has invalid proceeds")
                 basis = costs[token]
                 allocated = basis * size / held
@@ -604,7 +609,29 @@ class LiveTradingRunner(LiveShadowRunner):
             max_items=TRADE_HISTORY_MAX_ITEMS, page_limit=TRADE_HISTORY_PAGE_LIMIT,
         )
         status["trade_history"] = recovery
-        remote = await self.api.fetch_remote_snapshot()
+        if recovery.get("read_error"):
+            # A failed read imports nothing and is retried next cycle; it blocks
+            # entries and exits for this cycle only, never as a durable latch.
+            entry_block = str(recovery["read_error"])
+            status["healthy"] = False
+        try:
+            remote = await self.api.fetch_remote_snapshot()
+        except (RateLimitError, TransportError, TimeoutError) as exc:
+            status.update({
+                "healthy": False,
+                "cycle": self.state.get("cycles", 0),
+                "entry_block_reason": "remote account snapshot unavailable",
+                "remote_snapshot_error": type(exc).__name__,
+                "weather_markets_evaluated": 0,
+                "weather_forecast_status": "not_started",
+                "weather_errors": 0,
+                "v7_candidates": 0,
+                "outcomes_this_cycle": {},
+                "limits": asdict(self.risk.limits),
+                "cycle_finished_at": _utc_now().isoformat(),
+            })
+            self.store.write_status(status)
+            return status
         processor = StreamEventProcessor(self.ledger)
         status["orders_marked_expired"] = record_expired_orders(
             processor, self.ledger, remote, now,
