@@ -570,3 +570,33 @@ def test_market_context_unknown_condition_still_fails_generically():
     with pytest.raises(RuntimeError, match="exactly one market") as raised:
         asyncio.run(api.get_verified_market_context("condition-1", "token-1"))
     assert not isinstance(raised.value, MarketClosedError)
+
+
+@pytest.mark.parametrize("lookup", ["fetch_market_is_neg_risk", "fetch_resolved_winner", "_market_is_closed"])
+def test_closed_market_lookups_share_page_limit_and_malformed_page_guards(lookup):
+    class Endless:
+        def list_markets(self, **kwargs):
+            assert kwargs == {"condition_ids": ["condition-1"], "closed": True, "page_size": 20}
+
+            async def pages():
+                for _ in range(10):
+                    yield SimpleNamespace(items=[])
+            return pages()
+
+    class Malformed:
+        def list_markets(self, **kwargs):
+            async def pages():
+                yield SimpleNamespace(items="not-a-list")
+            return pages()
+
+    class Oversized:
+        def list_markets(self, **kwargs):
+            async def pages():
+                yield SimpleNamespace(items=[SimpleNamespace(condition_id="x")] * 21)
+            return pages()
+
+    for client, message in ((Endless(), "page limit"), (Malformed(), "malformed"), (Oversized(), "page size")):
+        api = UnifiedPolymarketAPI(settings=V3Settings())
+        api.public_client = client
+        with pytest.raises(RuntimeError, match=message):
+            asyncio.run(getattr(api, lookup)("condition-1"))

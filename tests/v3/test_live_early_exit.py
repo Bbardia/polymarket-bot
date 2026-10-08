@@ -305,3 +305,26 @@ def test_api_verified_book_measures_age_from_read_time_not_last_book_change():
     with pytest.raises(ValueError, match="invalid"):
         verified_book_from_api(naive, raw, condition_id="cond", token_id="tok",
                                now=quiet_now, max_quote_age_seconds=30)
+
+
+def test_shared_book_freshness_rule_bounds_last_change_age_separately():
+    from datetime import timedelta
+    from src.v3.live_early_exit import MAX_BOOK_LAST_CHANGE_AGE_SECONDS, book_quote_age_seconds
+
+    now = datetime(2026, 10, 7, 12, tzinfo=timezone.utc)
+    limit = timedelta(seconds=MAX_BOOK_LAST_CHANGE_AGE_SECONDS)
+    assert MAX_BOOK_LAST_CHANGE_AGE_SECONDS == 7200
+    assert book_quote_age_seconds(book_timestamp=now - limit, fetched_at=now - timedelta(seconds=3),
+                                  now=now, max_quote_age_seconds=30) == 3
+    with pytest.raises(ValueError, match="stale"):
+        book_quote_age_seconds(book_timestamp=now - limit - timedelta(seconds=1), fetched_at=now,
+                               now=now, max_quote_age_seconds=30)
+    # Without a read time the last-change age is the quote age (BUY entry rule).
+    with pytest.raises(ValueError, match="stale"):
+        book_quote_age_seconds(book_timestamp=now - timedelta(seconds=31), fetched_at=None,
+                               now=now, max_quote_age_seconds=30)
+    context, raw, at = _verified_api_pair()
+    old = SimpleNamespace(**{**vars(context), "fetched_at": at + limit + timedelta(seconds=1)})
+    with pytest.raises(ValueError, match="stale"):
+        verified_book_from_api(old, raw, condition_id="cond", token_id="tok",
+                               now=at + limit + timedelta(seconds=2), max_quote_age_seconds=30)

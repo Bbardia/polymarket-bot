@@ -13,6 +13,7 @@ from typing import Any
 from .config import V3Settings
 from .execution import ExecutionResult, V3OrderExecutor
 from .ledger import EventLedger, LedgerEvent
+from .live_early_exit import book_quote_age_seconds
 from .reconciliation import LocalSnapshot, Reconciler, RemoteSnapshot
 from .risk import AccountRiskState, OrderIntent, RiskEngine
 from .streaming import StreamEventProcessor
@@ -288,18 +289,22 @@ class LiveOrderService:
                 timestamp = context.book_timestamp
                 if timestamp is None or timestamp.tzinfo is None:
                     raise ValueError("book timestamp missing or timezone-naive")
-                checked_at = datetime.now(timezone.utc)
+                # Exits use the shared read-time freshness rule; BUY entries keep
+                # the stricter last-change age (no read time is passed).
+                fetched_at = None
                 if intent.side == "SELL":
-                    # The book timestamp is its last change, not its read time:
-                    # a quiet book read just now is current. Exits measure age
-                    # from the context's own read and reject future-dated books.
                     fetched_at = getattr(context, "fetched_at", None)
                     if not isinstance(fetched_at, datetime) or fetched_at.tzinfo is None:
                         raise ValueError("book read time missing or timezone-naive")
-                    age = (checked_at - fetched_at).total_seconds()
-                else:
-                    age = (checked_at - timestamp).total_seconds()
-                if age < 0 or age > self._risk.limits.max_quote_age_seconds or timestamp > checked_at:
+                try:
+                    age: float | None = book_quote_age_seconds(
+                        book_timestamp=timestamp, fetched_at=fetched_at,
+                        now=datetime.now(timezone.utc),
+                        max_quote_age_seconds=self._risk.limits.max_quote_age_seconds,
+                    )
+                except ValueError:
+                    age = None
+                if age is None:
                     reason = "order-book quote is stale"
                 elif not context.book_hash:
                     reason = "order-book hash is missing"

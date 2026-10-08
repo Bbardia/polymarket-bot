@@ -29,6 +29,8 @@ from src.v3.streaming import StreamEventProcessor
 
 D = Decimal
 NOW = datetime(2026, 10, 3, 14, 0, tzinfo=timezone.utc)
+# Cancellations old enough to have passed the early-exit finality fence.
+PAST_CANCEL = NOW - timedelta(hours=1)
 
 
 def _accept(ledger, order_id, *, token="tok", expiration=None, size="10"):
@@ -692,7 +694,7 @@ def test_canceled_partial_first_tranche_then_filled_retry_advances_to_runner(tmp
     _seed_managed_sell(runner.ledger, quantity="3", requested="15", order_id="first-tranche")
     StreamEventProcessor(runner.ledger).process(SimpleNamespace(topic="user", type="order", payload={
         "id": "first-tranche", "type": "CANCELLATION", "status": "canceled",
-        "reason": "gtd_expired", "timestamp": NOW.isoformat(),
+        "reason": "gtd_expired", "timestamp": PAST_CANCEL.isoformat(),
     }))
     _seed_managed_sell(runner.ledger, quantity="12", requested="12", decision="retry",
                        order_id="tranche-retry")
@@ -725,7 +727,7 @@ def test_canceled_zero_fill_closes_cleanly_for_a_fresh_exit_decision(tmp_path, m
     }))
     StreamEventProcessor(runner.ledger).process(SimpleNamespace(topic="user", type="order", payload={
         "id": "zero-sell", "type": "CANCELLATION", "status": "canceled",
-        "reason": "user_canceled", "timestamp": NOW.isoformat(),
+        "reason": "user_canceled", "timestamp": PAST_CANCEL.isoformat(),
     }))
     processor = StreamEventProcessor(runner.ledger)
     service = _ExitService(runner.ledger)
@@ -743,40 +745,38 @@ def test_canceled_zero_fill_closes_cleanly_for_a_fresh_exit_decision(tmp_path, m
     assert intent.exit_stage == "full" and intent.shares == D("10")
 
 
-def test_zero_fill_sell_with_unconfirmed_trade_row_waits_without_latching(tmp_path, monkeypatch):
+@pytest.mark.parametrize("trade_status", ["MATCHED", "MINED", "RETRYING", "FAILED"])
+def test_pending_sell_rows_wait_and_failed_rows_are_ignored(tmp_path, monkeypatch, trade_status):
+    from src.v3.orders import TradeRecord, TradeStatus
+
     api = _EarlyExitAPI(positions=(RemotePosition("cond", "tok-exit", D("10"), D("8"), D("5")),))
     runner, _ = _runner(tmp_path, monkeypatch, api=api)
     _seed_managed_position(runner.ledger)
-    runner.ledger.append(LedgerEvent.create("order.accepted", {
-        "client_order_id": "sell-client", "decision_id": "sell-decision",
-        "exit_stage": "full", "target_return": "0.28", "order_id": "late-sell",
-        "status": "live", "condition_id": "cond", "token_id": "tok-exit", "side": "SELL",
-        "price": "0.8", "requested_size": "10", "post_only": True,
-    }))
-    processor = StreamEventProcessor(runner.ledger)
-    result = processor.process(SimpleNamespace(topic="user", type="trade", payload={
-        "id": "late-trade", "taker_order_id": "external", "market": "cond",
-        "asset_id": "tok-exit", "side": "BUY", "size": "10", "price": "0.8",
-        "status": "MATCHED", "fee_rate_bps": None, "timestamp": NOW.isoformat(),
-        "maker_orders": [{"order_id": "late-sell", "asset_id": "tok-exit", "side": "SELL",
-                          "matched_amount": "10", "price": "0.8", "fee_rate_bps": None}],
-    }))
-    assert result.accepted and not result.requires_reconciliation
-    processor.process(SimpleNamespace(topic="user", type="order", payload={
+    _sell_accept(runner.ledger, order_id="late-sell")
+    StreamEventProcessor(runner.ledger).process(SimpleNamespace(topic="user", type="order", payload={
         "id": "late-sell", "type": "CANCELLATION", "status": "canceled",
-        "reason": "gtd_expired", "timestamp": (NOW + timedelta(seconds=5)).isoformat(),
+        "reason": "gtd_expired", "timestamp": PAST_CANCEL.isoformat(),
     }))
     processor = StreamEventProcessor(runner.ledger)
+    # Legacy/stream state: an unconfirmed row known for the canceled SELL.
+    processor.orders["late-sell"].trades["late-trade"] = TradeRecord(
+        "late-trade", D("10"), D("0.80"), D("0"), TradeStatus(trade_status),
+    )
     service = _ExitService(runner.ledger)
     runner.service = service
     result = asyncio.run(runner._run_early_exits(
         processor=processor, local=local_snapshot(processor, D("100")), remote=api.remote,
         risk_context=SimpleNamespace(), now=NOW,
     ))
-    assert result == [{"token_id": "tok-exit", "outcome": "blocked",
-                       "reason": "SELL fill awaiting confirmation"}]
     assert not processor.reconciliation_required
-    assert service.submitted == []
+    if trade_status == "FAILED":
+        # A failed match never executed: the SELL closed unfilled.
+        assert result[0]["outcome"] == "accepted", result
+        assert service.submitted[0][0].shares == D("10")
+    else:
+        assert result == [{"token_id": "tok-exit", "outcome": "blocked",
+                           "reason": "SELL fill awaiting confirmation"}]
+        assert service.submitted == []
 
 
 def test_sell_still_open_on_venue_is_never_treated_as_closed(tmp_path, monkeypatch):
@@ -791,7 +791,7 @@ def test_sell_still_open_on_venue_is_never_treated_as_closed(tmp_path, monkeypat
     }))
     StreamEventProcessor(runner.ledger).process(SimpleNamespace(topic="user", type="order", payload={
         "id": "open-sell", "type": "CANCELLATION", "status": "canceled",
-        "reason": "user_canceled", "timestamp": NOW.isoformat(),
+        "reason": "user_canceled", "timestamp": PAST_CANCEL.isoformat(),
     }))
     api.remote = RemoteSnapshot(api.remote.cash, api.remote.positions,
                                 (RemoteOrder("open-sell", "cond", "tok-exit", D("8")),))
@@ -854,7 +854,7 @@ def test_partial_cancel_does_not_latch_cycle_and_exits_remainder(tmp_path, monke
     _seed_managed_sell(runner.ledger, quantity="3", requested="8")
     StreamEventProcessor(runner.ledger).process(SimpleNamespace(topic="user", type="order", payload={
         "id": "prior-sell", "type": "CANCELLATION", "status": "canceled",
-        "reason": "gtd_expired", "timestamp": NOW.isoformat(),
+        "reason": "gtd_expired", "timestamp": PAST_CANCEL.isoformat(),
     }))
     runner.runner_settings = replace(runner.runner_settings, live_early_exit_enabled=True)
     service = _ExitService(runner.ledger, api)
@@ -880,7 +880,7 @@ def test_canceled_partial_first_tranche_offers_unfilled_remainder(tmp_path, monk
     _seed_managed_sell(ledger=runner.ledger, quantity="3", requested="15")
     StreamEventProcessor(runner.ledger).process(SimpleNamespace(topic="user", type="order", payload={
         "id": "prior-sell", "type": "CANCELLATION", "status": "canceled",
-        "reason": "gtd_expired", "timestamp": NOW.isoformat(),
+        "reason": "gtd_expired", "timestamp": PAST_CANCEL.isoformat(),
     }))
     processor = StreamEventProcessor(runner.ledger)
     service = _ExitService(runner.ledger)
@@ -928,7 +928,7 @@ def test_confirmed_sell_fills_above_requested_size_latch(tmp_path, monkeypatch):
     processor = StreamEventProcessor(runner.ledger)
     processor.process(SimpleNamespace(topic="user", type="order", payload={
         "id": "prior-sell", "type": "CANCELLATION", "status": "canceled",
-        "reason": "gtd_expired", "timestamp": NOW.isoformat(),
+        "reason": "gtd_expired", "timestamp": PAST_CANCEL.isoformat(),
     }))
     processor = StreamEventProcessor(runner.ledger)
     local = local_snapshot(processor, D("100"))
@@ -979,7 +979,7 @@ def test_canceled_partial_runner_replans_remaining_runner(tmp_path, monkeypatch)
     processor = StreamEventProcessor(runner.ledger)
     processor.process(SimpleNamespace(topic="user", type="order", payload={
         "id": "runner-sell", "type": "CANCELLATION", "status": "canceled",
-        "reason": "gtd_expired", "timestamp": NOW.isoformat(),
+        "reason": "gtd_expired", "timestamp": PAST_CANCEL.isoformat(),
     }))
     api.account_order_details["prior-sell"] = _account_sell_detail(
         "prior-sell", "30", requested="30",
@@ -1003,9 +1003,10 @@ def test_canceled_partial_runner_replans_remaining_runner(tmp_path, monkeypatch)
 class _EarlyExitAPI(_API):
     def __init__(self, positions=(), orders=()):
         super().__init__(cash="95", positions=positions, orders=orders)
-        self.book_time = NOW
+        # A quiet book (last changed 30 minutes ago) that is read fresh.
+        self.book_time = datetime.now(timezone.utc) - timedelta(minutes=30)
         self.raw_book = SimpleNamespace(
-            condition_id="cond", token_id="tok-exit", timestamp=NOW, hash="book-exit",
+            condition_id="cond", token_id="tok-exit", timestamp=self.book_time, hash="book-exit",
             bids=(SimpleNamespace(price=D("0.80"), size=D("20")),),
         )
 
@@ -1733,19 +1734,29 @@ def _sell_trade(*, status, maker_fee, trade_fee, order_id="exit-sell", size="10"
 
 
 @pytest.mark.parametrize("status", ["MATCHED", "MINED"])
-def test_unconfirmed_sell_maker_fill_is_recorded_without_latch(tmp_path, status):
+def test_unconfirmed_sell_maker_fill_is_deferred_without_latch(tmp_path, status):
     ledger = EventLedger(tmp_path / "ledger.sqlite")
     _seed_managed_position(ledger)
     _sell_accept(ledger)
     processor = StreamEventProcessor(ledger)
+    events_before = len(tuple(ledger.events()))
 
     result = processor.import_remote_trade(_sell_trade(status=status, maker_fee=D("0"), trade_fee=D("0")))
 
+    assert not result.accepted and not result.requires_reconciliation
+    assert len(tuple(ledger.events())) == events_before  # nothing recorded
+    # The streamed lifecycle row is likewise ignored for the SELL leg.
+    streamed = processor.process(SimpleNamespace(topic="user", type="trade", payload={
+        "id": "streamed", "taker_order_id": "external", "market": "cond", "asset_id": "tok-exit",
+        "side": "BUY", "size": "10", "price": "0.80", "status": status, "fee_rate_bps": None,
+        "timestamp": NOW.isoformat(),
+        "maker_orders": [{"order_id": "exit-sell", "asset_id": "tok-exit", "side": "SELL",
+                          "matched_amount": "10", "price": "0.80"}],
+    }))
+    assert streamed.accepted and not streamed.requires_reconciliation
     replay = StreamEventProcessor(ledger)
-    assert result.accepted and not result.requires_reconciliation
     assert not replay.reconciliation_required
-    order = replay.orders["exit-sell"]
-    assert order.confirmed_size == D("0") and order.trades[f"trade-exit-sell"].status.value == status
+    assert replay.orders["exit-sell"].trades == {}
     # The later confirmation is then accounted normally.
     confirmed = replay.import_remote_trade(_sell_trade(status="CONFIRMED", maker_fee=D("0"), trade_fee=D("0")))
     assert confirmed.accepted and not confirmed.requires_reconciliation
@@ -1753,6 +1764,51 @@ def test_unconfirmed_sell_maker_fill_is_recorded_without_latch(tmp_path, status)
     assert not final.reconciliation_required
     assert final.orders["exit-sell"].confirmed_size == D("10")
     assert local_snapshot(final, D("100")).position_quantities == {}
+
+
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+def test_maker_leg_without_maker_fee_is_never_charged_the_taker_fee(tmp_path, side):
+    ledger = EventLedger(tmp_path / "ledger.sqlite")
+    _seed_managed_position(ledger)
+    if side == "SELL":
+        _sell_accept(ledger, order_id="maker")
+    else:
+        ledger.append(LedgerEvent.create("order.accepted", {
+            "client_order_id": "client-maker", "order_id": "maker", "status": "live",
+            "condition_id": "cond", "token_id": "tok-exit", "side": "BUY", "price": "0.80",
+            "requested_size": "10", "post_only": True,
+        }))
+    processor = StreamEventProcessor(ledger)
+    result = processor.process(SimpleNamespace(topic="user", type="trade", payload={
+        "id": "fee-trade", "taker_order_id": "external", "market": "cond", "asset_id": "tok-exit",
+        "side": "BUY" if side == "SELL" else "SELL", "size": "10", "price": "0.80",
+        "status": "CONFIRMED", "fee_rate_bps": "200", "timestamp": NOW.isoformat(),
+        "maker_orders": [{"order_id": "maker", "asset_id": "tok-exit", "side": side,
+                          "matched_amount": "10", "price": "0.80"}],
+    }))
+    assert result.accepted and not result.requires_reconciliation
+    replay = StreamEventProcessor(ledger)
+    assert replay.orders["maker"].confirmed_size == D("10")
+    assert replay.orders["maker"].confirmed_fees == D("0")
+
+
+def test_non_post_only_maker_leg_without_maker_fee_stays_unknown(tmp_path):
+    ledger = EventLedger(tmp_path / "ledger.sqlite")
+    ledger.append(LedgerEvent.create("order.accepted", {
+        "client_order_id": "client-maker", "order_id": "maker", "status": "live",
+        "condition_id": "cond", "token_id": "tok-exit", "side": "BUY", "price": "0.80",
+        "requested_size": "10", "post_only": False,
+    }))
+    processor = StreamEventProcessor(ledger)
+    result = processor.process(SimpleNamespace(topic="user", type="trade", payload={
+        "id": "fee-trade", "taker_order_id": "external", "market": "cond", "asset_id": "tok-exit",
+        "side": "SELL", "size": "10", "price": "0.80", "status": "CONFIRMED",
+        "fee_rate_bps": "200", "timestamp": NOW.isoformat(),
+        "maker_orders": [{"order_id": "maker", "asset_id": "tok-exit", "side": "BUY",
+                          "matched_amount": "10", "price": "0.80"}],
+    }))
+    assert result.requires_reconciliation
+    assert processor.orders["maker"].confirmed_size == D("0")
 
 
 def test_confirmed_sell_maker_without_maker_fee_uses_explicit_zero_trade_fee(tmp_path):
@@ -1812,7 +1868,7 @@ def test_sell_maker_without_post_only_acceptance_still_latches(tmp_path):
     }))
     processor = StreamEventProcessor(ledger)
 
-    result = processor.import_remote_trade(_sell_trade(status="MATCHED", maker_fee=D("0"), trade_fee=D("0")))
+    result = processor.import_remote_trade(_sell_trade(status="CONFIRMED", maker_fee=D("0"), trade_fee=D("0")))
 
     assert result.requires_reconciliation and processor.reconciliation_required
 
@@ -1974,3 +2030,185 @@ def test_auto_redeem_skips_are_reported_in_status(tmp_path, monkeypatch):
         "condition_id": "c", "token_id": "t", "reason": "skipped: neg-risk redemption unsupported",
     }]
     assert "auto_redemption_error" not in status
+
+
+# --- review follow-ups: finality fence, caps, auto-redeem exit blocking -------
+
+def _canceled_sell(runner, *, filled, canceled_at, requested="8", expiration=None, stage="first_tranche"):
+    payload = {
+        "client_order_id": "fence-client", "decision_id": "fence-decision", "exit_stage": stage,
+        "target_return": "0.28", "order_id": "fence-sell", "status": "live",
+        "condition_id": "cond", "token_id": "tok-exit", "side": "SELL", "price": "0.80",
+        "requested_size": requested, "post_only": True,
+    }
+    if expiration is not None:
+        payload["expiration"] = int(expiration.timestamp())
+    runner.ledger.append(LedgerEvent.create("order.accepted", payload))
+    if filled != "0":
+        runner.ledger.append(LedgerEvent.create("user.trade", {
+            "id": "fence-trade", "taker_order_id": "external", "market": "cond",
+            "asset_id": "tok-exit", "side": "BUY", "size": filled, "price": "0.80",
+            "status": "CONFIRMED", "fee_rate_bps": "0", "timestamp": (NOW + timedelta(seconds=1)).isoformat(),
+            "maker_orders": [{"order_id": "fence-sell", "asset_id": "tok-exit", "side": "SELL",
+                              "matched_amount": filled, "price": "0.80", "fee_rate_bps": "0"}],
+        }))
+    cancel = {"id": "fence-sell", "type": "CANCELLATION", "status": "canceled", "reason": "user_canceled"}
+    if canceled_at is not None:
+        cancel["timestamp"] = canceled_at.isoformat()
+    StreamEventProcessor(runner.ledger).process(SimpleNamespace(topic="user", type="order", payload=cancel))
+
+
+def _exit_once(runner, api, processor=None):
+    processor = processor or StreamEventProcessor(runner.ledger)
+    runner.service = _ExitService(runner.ledger)
+    result = asyncio.run(runner._run_early_exits(
+        processor=processor, local=local_snapshot(processor, D("100")), remote=api.remote,
+        risk_context=SimpleNamespace(), now=NOW,
+    ))
+    return result, processor
+
+
+@pytest.mark.parametrize("filled,held", [("0", "10"), ("3", "7")])
+def test_recently_canceled_sell_waits_out_the_finality_fence(tmp_path, monkeypatch, filled, held):
+    api = _EarlyExitAPI(positions=(RemotePosition("cond", "tok-exit", D(held), D("5"), D("3")),))
+    runner, _ = _runner(tmp_path, monkeypatch, api=api)
+    _seed_managed_position(runner.ledger)
+    _canceled_sell(runner, filled=filled, canceled_at=NOW - timedelta(seconds=599))
+
+    result, processor = _exit_once(runner, api)
+
+    assert result == [{"token_id": "tok-exit", "outcome": "blocked",
+                       "reason": "terminal SELL inside finality fence; late fills may still import"}]
+    assert not processor.reconciliation_required and runner.service.submitted == []
+
+
+def test_expiry_bounds_the_fence_when_cancellation_is_later(tmp_path, monkeypatch):
+    api = _EarlyExitAPI(positions=(RemotePosition("cond", "tok-exit", D("10"), D("8"), D("5")),))
+    runner, _ = _runner(tmp_path, monkeypatch, api=api)
+    _seed_managed_position(runner.ledger)
+    # Recorded canceled just now, but the GTD order could not match after it expired an hour ago.
+    _canceled_sell(runner, filled="0", canceled_at=NOW, expiration=NOW - timedelta(hours=1))
+
+    result, _ = _exit_once(runner, api)
+
+    assert result[0]["outcome"] == "accepted", result
+
+
+def test_terminal_sell_without_any_time_bound_is_reported_not_replanned(tmp_path, monkeypatch):
+    api = _EarlyExitAPI(positions=(RemotePosition("cond", "tok-exit", D("10"), D("8"), D("5")),))
+    runner, _ = _runner(tmp_path, monkeypatch, api=api)
+    _seed_managed_position(runner.ledger)
+    _canceled_sell(runner, filled="0", canceled_at=None)
+
+    result, processor = _exit_once(runner, api)
+
+    assert result == [{"token_id": "tok-exit", "outcome": "blocked",
+                       "reason": "terminal SELL has no cancellation or expiry time; finality unprovable"}]
+    assert not processor.reconciliation_required
+
+
+def test_failed_partial_first_tranche_continues_with_its_remainder(tmp_path, monkeypatch):
+    from src.v3.orders import OrderState
+
+    api = _EarlyExitAPI(positions=(RemotePosition("cond", "tok-exit", D("17"), D("13.6"), D("8.5")),))
+    runner, _ = _runner(tmp_path, monkeypatch, api=api)
+    _seed_managed_position(runner.ledger, shares="20")
+    _canceled_sell(runner, filled="3", requested="15", canceled_at=PAST_CANCEL)
+    processor = StreamEventProcessor(runner.ledger)
+    processor.orders["fence-sell"].state = OrderState.FAILED
+
+    result, _ = _exit_once(runner, api, processor)
+
+    assert result[0]["outcome"] == "accepted", result
+    intent = runner.service.submitted[0][0]
+    assert intent.exit_stage == "first_tranche" and intent.shares == D("12")
+
+
+def test_replacement_size_is_capped_at_shares_still_held_on_venue(tmp_path, monkeypatch):
+    # Venue holds 8 (an unconfirmed SELL match took 2); local confirmed shows 10.
+    api = _EarlyExitAPI(positions=(RemotePosition("cond", "tok-exit", D("8"), D("6.4"), D("4")),))
+    runner, _ = _runner(tmp_path, monkeypatch, api=api)
+    _seed_managed_position(runner.ledger)
+
+    result, _ = _exit_once(runner, api)
+
+    assert result[0]["outcome"] == "accepted", result
+    assert runner.service.submitted[0][0].shares == D("8")
+
+
+def _redeem_cycle(tmp_path, monkeypatch, behaviour):
+    from dataclasses import replace
+    from src.v3 import live_auto_redeem
+
+    api = _EarlyExitAPI(positions=(RemotePosition("cond", "tok-exit", D("10"), D("8"), D("5")),))
+    state = {
+        "baseline_at": NOW.isoformat(), "baseline_epoch": int(NOW.timestamp()),
+        "baseline_cash": "100", "baseline_equity": "100",
+        "external_condition_ids": ["cond-old"], "peak_equity": "104",
+        "day": NOW.date().isoformat(), "day_start_equity": "104", "event_orders": {},
+    }
+    runner, _ = _runner(tmp_path, monkeypatch, api=api, state=state)
+    _seed_managed_position(runner.ledger)
+    runner.runner_settings = replace(
+        runner.runner_settings, live_early_exit_enabled=True, auto_redeem_enabled=True,
+    )
+
+    async def redeem(**kwargs):
+        return await behaviour(runner.ledger, kwargs)
+
+    monkeypatch.setattr(live_auto_redeem, "auto_redeem_one_managed_winner", redeem)
+    service = _ExitService(runner.ledger, api)
+    runner.service = service
+    return asyncio.run(runner.run_cycle(now=NOW)), service
+
+
+def test_pending_auto_redemption_blocks_exits(tmp_path, monkeypatch):
+    async def pending(ledger, kwargs):
+        return kwargs["remote"], (), "auto-redemption submission needs manual reconciliation"
+
+    status, service = _redeem_cycle(tmp_path, monkeypatch, pending)
+    assert status["early_exit_block_reason"] == "auto-redemption submission needs manual reconciliation"
+    assert service.submitted == []
+
+
+def test_auto_redemption_failure_after_submission_blocks_exits(tmp_path, monkeypatch):
+    async def failed_after_submit(ledger, kwargs):
+        ledger.append(LedgerEvent.create("auto_redemption.submission_started", {
+            "condition_id": "cond-r", "token_id": "tok-r", "quantity": "5", "at": NOW.isoformat(),
+        }))
+        raise RuntimeError("redemption transaction hash is missing or changed")
+
+    status, service = _redeem_cycle(tmp_path, monkeypatch, failed_after_submit)
+    assert status["auto_redemption_error"] == "RuntimeError"
+    assert status["early_exit_block_reason"] == "auto-redemption submission requires reconciliation"
+    assert service.submitted == []
+
+
+def test_exit_and_cycle_share_one_inconsistent_sell_latch(tmp_path, monkeypatch):
+    from src.v3.live_runner import _latch_inconsistent_sells
+
+    expected = "inconsistent SELL fill state requires manual reconciliation: prior-sell"
+    reasons = []
+    for path, via_exit in ((tmp_path / "exit", True), (tmp_path / "cycle", False)):
+        api = _EarlyExitAPI(positions=(RemotePosition("cond", "tok-exit", D("7"), D("5.6"), D("3.5")),))
+        runner, _ = _runner(path, monkeypatch, api=api)
+        _seed_managed_position(runner.ledger)
+        _seed_managed_sell(runner.ledger, quantity="3", requested="8")
+        StreamEventProcessor(runner.ledger).process(SimpleNamespace(topic="user", type="order", payload={
+            "id": "prior-sell", "type": "CANCELLATION", "status": "canceled",
+            "reason": "gtd_expired", "timestamp": PAST_CANCEL.isoformat(),
+        }))
+        processor = StreamEventProcessor(runner.ledger)
+        local = local_snapshot(processor, D("100"))
+        processor.orders["prior-sell"].confirmed_size = D("9")
+        if via_exit:
+            runner.service = _ExitService(runner.ledger)
+            result = asyncio.run(runner._run_early_exits(
+                processor=processor, local=local, remote=api.remote,
+                risk_context=SimpleNamespace(), now=NOW,
+            ))
+            assert result[0]["outcome"] == "manual_review"
+        else:
+            _latch_inconsistent_sells(processor)
+        reasons.append(list(processor.reconciliation_reasons))
+    assert reasons == [[expected], [expected]]

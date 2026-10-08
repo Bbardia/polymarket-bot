@@ -1663,6 +1663,12 @@ class StreamEventProcessor:
             reason=f"appended full-history account reconciliation for {len(target_ids)} legacy fee latches",
         )
 
+    def _accepted_post_only(self, order_id: str | None) -> bool:
+        accepted = [event for event in self.ledger.events()
+                    if event.event_type == "order.accepted"
+                    and event.payload.get("order_id") == order_id]
+        return len(accepted) == 1 and accepted[0].payload.get("post_only") is True
+
     def import_remote_trade(self, trade: RemoteTrade) -> ProcessResult:
         """Replay one validated history row through the normal user-trade path.
 
@@ -1713,15 +1719,18 @@ class StreamEventProcessor:
             return ProcessResult(False, requires_reconciliation=True, reason=reason)
         # SELL-maker replay is deliberately limited to one uniquely persisted,
         # post-only managed order with complete, internally consistent fill data.
-        # Like BUY makers, a not-yet-confirmed row is recorded without inventory
-        # effect, and the maker fee may come from an explicit zero trade fee;
-        # an unknown fee on a confirmed row takes the common latch below. The
-        # trade's top-level side/token/size/price describe the taker and may
-        # legitimately differ (complementary or multi-maker matches).
+        # A not-yet-confirmed SELL row is skipped without a latch and without
+        # recording; the CONFIRMED row is imported later. The maker fee may come
+        # from an explicit zero trade fee; an unknown fee on a confirmed row
+        # takes the common latch below. The trade's top-level side/token/size/
+        # price describe the taker and may legitimately differ (complementary
+        # or multi-maker matches).
         sell_makers = [maker for maker in trade.maker_orders
                        if maker.order_id in self.managed_order_ids
                        and self.orders.get(maker.order_id) is not None
                        and self.orders[maker.order_id].side == "SELL"]
+        if sell_makers and trade.status != "CONFIRMED":
+            return ProcessResult(False, reason="unconfirmed managed SELL fill deferred until CONFIRMED")
         if sell_makers:
             maker = sell_makers[0]
             order = self.orders[maker.order_id]
@@ -1941,13 +1950,22 @@ class StreamEventProcessor:
 
             parsed_targets: list[tuple[OrderAggregate, Decimal, Decimal, Decimal]] = []
             for order, target_payload, size_key in targets:
+                if order.side == "SELL" and status is not TradeStatus.CONFIRMED:
+                    # Managed SELL fills are only ever recorded once CONFIRMED;
+                    # earlier lifecycle rows are skipped without a latch.
+                    continue
                 size = Decimal(str(_value(target_payload, size_key)))
                 price = Decimal(str(_value(target_payload, "price")))
-                fee_rate_value = _value(
-                    target_payload,
-                    "fee_rate_bps",
-                    default=_value(payload, "fee_rate_bps"),
-                )
+                if size_key == "matched_amount":
+                    # The trade's top-level fee rate is the taker's. Never charge
+                    # it to our maker leg: a post-only maker with no reported
+                    # maker rate pays no fee; any other maker leg stays unknown.
+                    fee_rate_value = (
+                        target_payload["fee_rate_bps"] if "fee_rate_bps" in target_payload
+                        else "0" if self._accepted_post_only(order.order_id) else None
+                    )
+                else:
+                    fee_rate_value = _value(payload, "fee_rate_bps")
                 if status is TradeStatus.CONFIRMED and fee_rate_value is None:
                     raise ValueError("confirmed trade fee rate is unknown")
                 fee_rate_bps = Decimal(str(fee_rate_value or "0"))
@@ -1955,8 +1973,6 @@ class StreamEventProcessor:
                     _value(target_payload, "asset_id", "token_id", default="")
                 )
                 if order.side == "SELL":
-                    # Confirmed rows without a fee already failed above; earlier
-                    # statuses are recorded without inventory effect, as for BUYs.
                     accepted = [event for event in self.ledger.events()
                                 if event.event_type == "order.accepted"
                                 and event.payload.get("order_id") == order.order_id]

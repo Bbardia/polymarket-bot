@@ -23,7 +23,7 @@ import json
 import os
 import signal
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -225,6 +225,19 @@ def _sell_is_inconsistent(order: Any) -> bool:
     )
 
 
+def _latch_inconsistent_sells(processor: StreamEventProcessor) -> None:
+    """Latch once for every managed SELL with contradictory fill state."""
+    inconsistent = [
+        order for order in processor.orders.values()
+        if order.side == "SELL" and _sell_is_inconsistent(order)
+    ]
+    if inconsistent and not processor.reconciliation_required:
+        processor.require_reconciliation(
+            "inconsistent SELL fill state requires manual reconciliation: "
+            + ",".join(order.order_id or order.client_order_id for order in inconsistent)
+        )
+
+
 def _sellable_position_tokens(local: LocalSnapshot) -> frozenset[str]:
     """Held tokens excluding sub-step dust that no venue order could ever sell.
 
@@ -424,7 +437,10 @@ class LiveTradingRunner(LiveShadowRunner):
             if event.event_type == "order.accepted" and event.payload.get("side") == "BUY":
                 accepted_buys.setdefault(event.payload.get("token_id"), set()).add(event.payload.get("condition_id"))
         open_remote_ids = {order.order_id for order in remote.open_orders}
-        terminal = {OrderState.CANCELED, OrderState.FILLED, OrderState.FAILED}
+        expirations = accepted_expirations(self.ledger)
+        finality_fence = timedelta(seconds=self.runner_settings.expiry_grace_seconds)
+        pending_statuses = {TradeStatus.MATCHED, TradeStatus.MATCHED_NOT_BROADCASTED,
+                            TradeStatus.MINED, TradeStatus.RETRYING}
         for token_id, shares in (local.position_quantities or {}).items():
             if is_dust(shares):
                 # Sub-step leftovers can never be sold; they are not exit candidates.
@@ -449,26 +465,49 @@ class LiveTradingRunner(LiveShadowRunner):
                 results.append({"token_id": token_id, "outcome": "blocked",
                                 "reason": "managed SELL is still open on the venue"})
                 continue
-            if any(t.status is not TradeStatus.CONFIRMED for o in all_sells for t in o.trades.values()):
-                # A matched/mined fill may still confirm; wait for finality.
+            # FAILED trade rows never executed and are ignored; any other
+            # unconfirmed row may still confirm.
+            pending_quantity = sum((t.size for o in all_sells for t in o.trades.values()
+                                    if t.status in pending_statuses), ZERO)
+            if pending_quantity > ZERO:
                 results.append({"token_id": token_id, "outcome": "blocked",
                                 "reason": "SELL fill awaiting confirmation"})
                 continue
-            inconsistent = [o for o in all_sells if _sell_is_inconsistent(o)]
-            if inconsistent:
-                if not processor.reconciliation_required:
-                    processor.require_reconciliation(
-                        "inconsistent early-exit SELL requires manual reconciliation: "
-                        + ",".join(o.order_id for o in inconsistent)
-                    )
+            if any(_sell_is_inconsistent(o) for o in all_sells):
+                _latch_inconsistent_sells(processor)
                 results.append({"token_id": token_id, "outcome": "manual_review",
                                 "reason": "SELL confirmed fills contradict requested size or state"})
                 continue
-            # A terminal SELL with no trade rows at all, absent from the venue's
-            # open orders, closed cleanly unfilled (e.g. an expired post-only
-            # quote): it has no inventory effect and a fresh decision is made.
-            sells = [o for o in all_sells
-                     if not (o.state in terminal and o.confirmed_size == ZERO and not o.trades)]
+            # Finality fence (invariant): a terminal SELL with fewer confirmed
+            # fills than requested is final only once no fill matched while it
+            # was live can still surface. A match is impossible after the
+            # earlier of its cancellation and its GTD expiry; the venue's
+            # confirmation and our history import lag that by less than the
+            # expiry grace. Until then the token waits (no latch), so a late
+            # pre-cancel match can never oversell a replacement SELL.
+            unfenced = []
+            for order in all_sells:
+                if order.state is OrderState.FILLED:
+                    continue
+                bounds = [order.canceled_at] if order.canceled_at is not None else []
+                if order.order_id in expirations:
+                    bounds.append(datetime.fromtimestamp(expirations[order.order_id], tz=timezone.utc))
+                if not bounds or now < min(bounds) + finality_fence:
+                    unfenced.append(order)
+            if unfenced:
+                known = all(o.canceled_at is not None or o.order_id in expirations for o in unfenced)
+                results.append({"token_id": token_id, "outcome": "blocked", "reason": (
+                    "terminal SELL inside finality fence; late fills may still import" if known
+                    else "terminal SELL has no cancellation or expiry time; finality unprovable"
+                )})
+                continue
+            # A fenced terminal SELL with no confirmed fill closed cleanly
+            # unfilled (e.g. an expired post-only quote): it has no inventory
+            # effect and a fresh exit decision is made.
+            sells = [o for o in all_sells if not (
+                o.confirmed_size == ZERO
+                and all(t.status is TradeStatus.FAILED for t in o.trades.values())
+            )]
             accepted_sells = {}
             for event in self.ledger.events():
                 if event.event_type == "order.accepted" and event.payload.get("side") == "SELL" \
@@ -493,8 +532,8 @@ class LiveTradingRunner(LiveShadowRunner):
                 results.append({"token_id": token_id, "outcome": "blocked",
                                 "reason": "duplicate durable early-exit decision IDs"})
                 continue
-            # Every remaining SELL is terminal, final and fill-consistent: filled
-            # exactly, or canceled/expired with verified partial fills.
+            # Every remaining SELL is terminal, fenced and fill-consistent: filled
+            # exactly, or canceled/expired/failed with final partial fills.
             first_tranche_orders = [o for o in sells
                                     if sell_metadata[o.order_id].get("exit_stage") == "first_tranche"]
             runner_orders = [o for o in sells if sell_metadata[o.order_id].get("exit_stage") == "runner"]
@@ -512,9 +551,7 @@ class LiveTradingRunner(LiveShadowRunner):
                 target = first_tranche_orders[0].requested_size
                 confirmed = sum((o.confirmed_size for o in first_tranche_orders), ZERO)
                 if (not isinstance(target, Decimal) or not target.is_finite() or target <= ZERO
-                        or confirmed > target
-                        or any(o.state is not OrderState.CANCELED
-                               for o in first_tranche_orders if o.confirmed_size < o.requested_size)):
+                        or confirmed > target):
                     results.append({"token_id": token_id, "outcome": "blocked",
                                     "reason": "first-tranche target/state inconsistent"})
                     continue
@@ -524,7 +561,8 @@ class LiveTradingRunner(LiveShadowRunner):
                         results.append({"token_id": token_id, "outcome": "blocked",
                                         "reason": "runner SELL exists before first tranche completion"})
                         continue
-                    # Verified partial first tranche: offer only its unfilled rest.
+                    # Final partial first tranche (canceled, expired or failed):
+                    # offer only its unfilled rest.
                     tranche_remaining = target - confirmed
             elif runner_orders and hybrid_enabled:
                 results.append({"token_id": token_id, "outcome": "blocked",
@@ -536,6 +574,14 @@ class LiveTradingRunner(LiveShadowRunner):
             cost = (local.position_cost_basis or {}).get(token_id)
             if not isinstance(cost, Decimal) or cost <= ZERO or shares <= ZERO:
                 continue
+            # Never offer more than is confirmed held, still held on the venue,
+            # and not already committed to an unconfirmed SELL fill.
+            sellable = min(shares, matching[0].size) - pending_quantity
+            if sellable <= ZERO or is_dust(sellable):
+                continue
+            sellable_cost = cost if sellable == shares else cost * sellable / shares
+            if tranche_remaining is not None:
+                tranche_remaining = min(tranche_remaining, sellable)
             try:
                 try:
                     context = await self.api.get_verified_market_context(condition_id, token_id)
@@ -556,7 +602,8 @@ class LiveTradingRunner(LiveShadowRunner):
                 # The stage transition above is based exclusively on a fully
                 # confirmed first-tranche order; never infer it from any SELL fill.
                 plan = plan_live_early_exit(
-                    ExitPosition("YES", shares, cost, hybrid_exit_done=done, hybrid_enabled=hybrid_enabled),
+                    ExitPosition("YES", sellable, sellable_cost, hybrid_exit_done=done,
+                                 hybrid_enabled=hybrid_enabled),
                     book, first_tranche_quantity=tranche_remaining,
                 )
                 if plan.intent is None:
@@ -677,15 +724,7 @@ class LiveTradingRunner(LiveShadowRunner):
         # An expired or canceled post-only SELL with zero or partial confirmed
         # fills is a normal outcome handled by the early-exit planner. Only an
         # internally inconsistent SELL aggregate requires manual reconciliation.
-        inconsistent_sells = [
-            order for order in processor.orders.values()
-            if order.side == "SELL" and _sell_is_inconsistent(order)
-        ]
-        if inconsistent_sells and not processor.reconciliation_required:
-            processor.require_reconciliation(
-                "inconsistent SELL fill state requires manual reconciliation: "
-                + ",".join(order.order_id or order.client_order_id for order in inconsistent_sells)
-            )
+        _latch_inconsistent_sells(processor)
         if processor.reconciliation_required:
             entry_block = "lifecycle reconciliation latched: " + "; ".join(processor.reconciliation_reasons)
             status["healthy"] = False
@@ -718,9 +757,12 @@ class LiveTradingRunner(LiveShadowRunner):
         status["auto_redeem_enabled"] = self.runner_settings.auto_redeem_enabled
         status["live_early_exit_enabled"] = self.runner_settings.live_early_exit_enabled
         status["auto_redemptions_recorded"] = []
-        # Auto-redemption failures block entries but never risk-reducing exits:
-        # exits re-check full account reconciliation against fresh state.
+        # A pre-submission auto-redemption failure (lookup, skip or missing
+        # relay credentials) blocks entries but not risk-reducing exits, which
+        # re-check full account reconciliation. A pending/in-flight redemption,
+        # or any failure after the submission boundary, blocks exits too.
         pre_redeem_block = entry_block
+        redeem_exit_block: str | None = None
         if self.runner_settings.auto_redeem_enabled and entry_block is None:
             redeem_skips: list[dict[str, str]] = []
             status["auto_redemption_skipped"] = redeem_skips
@@ -739,6 +781,7 @@ class LiveTradingRunner(LiveShadowRunner):
                     status["healthy"] = False
                     status["auto_redemption_pending_reconciliation"] = True
                     entry_block = pending_reason
+                    redeem_exit_block = pending_reason
                 if auto_records:
                     processor = StreamEventProcessor(self.ledger)
                     equity = remote.cash + sum((p.current_value for p in remote.positions), ZERO)
@@ -749,10 +792,17 @@ class LiveTradingRunner(LiveShadowRunner):
                 status["healthy"] = False
                 status["auto_redemption_error"] = type(exc).__name__
                 entry_block = entry_block or "auto-redemption submission requires reconciliation"
+                from .live_auto_redeem import pending_auto_redemption_tokens
+                try:
+                    submitted = bool(pending_auto_redemption_tokens(self.ledger))
+                except Exception:
+                    submitted = True
+                if submitted:
+                    redeem_exit_block = "auto-redemption submission requires reconciliation"
 
         local = local_snapshot(processor, baseline_cash)
         report = self.reconciler.compare(local, remote)
-        exit_block = pre_redeem_block
+        exit_block = pre_redeem_block or redeem_exit_block
         if not report.safe_to_trade:
             exit_block = exit_block or "account reconciliation blocks exits"
         if entry_block is None and not report.safe_to_trade:

@@ -63,6 +63,49 @@ class PlanResult:
     reason: str | None
 
 
+# A quiet book read just now is current, but a book unchanged for longer than
+# this is not trusted for an exit quote even when freshly read.
+MAX_BOOK_LAST_CHANGE_AGE_SECONDS = 2 * 60 * 60
+
+
+def _aware(value: Any) -> bool:
+    return isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() is not None
+
+
+def book_quote_age_seconds(
+    *,
+    book_timestamp: Any,
+    fetched_at: Any,
+    now: datetime,
+    max_quote_age_seconds: int,
+) -> float:
+    """Return the quote age in seconds, or raise ValueError if stale or future-dated.
+
+    The CLOB book ``timestamp`` is the time of the last book change, not of the
+    read. With a read time (``fetched_at``) the quote age is measured from the
+    read, and the last change is separately bounded by
+    ``MAX_BOOK_LAST_CHANGE_AGE_SECONDS``. Without one, the stricter last-change
+    age is the quote age. A book changed after ``now`` is always rejected.
+    """
+    if (
+        not _aware(book_timestamp) or not _aware(now)
+        or (fetched_at is not None and not _aware(fetched_at))
+        or type(max_quote_age_seconds) is not int or max_quote_age_seconds <= 0
+    ):
+        raise ValueError("book freshness timestamps are missing or timezone-naive")
+    now_utc = now.astimezone(timezone.utc)
+    change_age = (now_utc - book_timestamp.astimezone(timezone.utc)).total_seconds()
+    if fetched_at is None:
+        age = change_age
+    else:
+        age = (now_utc - fetched_at.astimezone(timezone.utc)).total_seconds()
+        if change_age > MAX_BOOK_LAST_CHANGE_AGE_SECONDS:
+            raise ValueError("order book is future-dated or stale")
+    if age < 0 or change_age < 0 or age > max_quote_age_seconds:
+        raise ValueError("order book is future-dated or stale")
+    return age
+
+
 def verified_book_from_api(
     context: Any,
     raw_book: Any,
@@ -78,11 +121,7 @@ def verified_book_from_api(
     by the context hash/timestamp; unknown fee curves or market rules fail closed.
     Polymarket order docs specify two share-size decimals for all listed ticks.
 
-    The CLOB book ``timestamp`` is the time of the last book change, not of the
-    read: a quiet book is still current when fetched. When the context records
-    its own read time (``fetched_at``), quote age is measured from that read;
-    the book's last change must never postdate ``now``. Without a read time,
-    the stricter last-change age applies.
+    Freshness follows :func:`book_quote_age_seconds`.
     """
     timestamp = getattr(raw_book, "timestamp", None)
     context_timestamp = getattr(context, "book_timestamp", None)
@@ -101,11 +140,11 @@ def verified_book_from_api(
         or type(max_quote_age_seconds) is not int or max_quote_age_seconds <= 0
     ):
         raise ValueError("verified book identity or timestamp inputs are invalid")
-    now_utc, timestamp_utc = now.astimezone(timezone.utc), timestamp.astimezone(timezone.utc)
-    observed_utc = timestamp_utc if fetched_at is None else fetched_at.astimezone(timezone.utc)
-    age = (now_utc - observed_utc).total_seconds()
-    if age < 0 or age > max_quote_age_seconds or timestamp_utc > now_utc:
-        raise ValueError("order book is future-dated or stale")
+    book_quote_age_seconds(
+        book_timestamp=timestamp, fetched_at=fetched_at, now=now,
+        max_quote_age_seconds=max_quote_age_seconds,
+    )
+    timestamp_utc = timestamp.astimezone(timezone.utc)
     context_hash = getattr(context, "book_hash", None)
     raw_hash = getattr(raw_book, "hash", None)
     if (

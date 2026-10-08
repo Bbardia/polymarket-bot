@@ -664,12 +664,14 @@ def test_sell_exit_freshness_uses_context_read_time_not_last_book_change(tmp_pat
 
     now = datetime.now(timezone.utc)
     sell = replace(intent(), side="SELL", decision_id="exit-1", exit_stage="full")
-    quiet = {"book_timestamp": now - timedelta(hours=2)}
+    quiet = {"book_timestamp": now - timedelta(minutes=90)}
     cases = (
         ({**quiet, "fetched_at": now}, None),
         ({**quiet, "fetched_at": now - timedelta(hours=1)}, "order-book quote is stale"),
         (quiet, "market context is incomplete"),
         ({"book_timestamp": now + timedelta(minutes=5), "fetched_at": now}, "order-book quote is stale"),
+        # A freshly read book unchanged beyond the separate last-change bound.
+        ({"book_timestamp": now - timedelta(hours=2, seconds=1), "fetched_at": now}, "order-book quote is stale"),
     )
     for index, (update, expected) in enumerate(cases):
         api = FakeAPI(remote_snapshot())
