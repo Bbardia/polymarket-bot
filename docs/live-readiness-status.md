@@ -5,6 +5,7 @@ User switched to bypass permissions and authorized real-money trading. `run_v3.p
 - Baseline 2026-10-03T13:23:44Z: 237.128775 pUSD cash, 126 pre-bot positions recorded as external, 0 open orders. First cycles: reconciliation safe, no entry block, 0 V7 candidates, no orders yet.
 - Limits: $100 capital (deployable $75 after 25% reserve), $2 per order, $10 daily loss, $10 drawdown from peak equity, 5 open orders, 15 bot positions, 3 new orders per cycle, 4 orders per event per day, 900 s GTD, post-only BUY only, hold to resolution.
 - Operator rules: do not trade, cancel or redeem manually on this account while the bot runs (unknown positions, orders or unexplained cash outflows block entries); deposits are fine. The transient unit does not survive a reboot.
+- 2026-10-08: live early exits enabled (`V3_LIVE_EARLY_EXIT_ENABLED=true` in `.env.live`). Bot-managed positions may now be closed early with post-only SELLs using the paper hybrid policy (28% target, $0.10 min profit, 75% first tranche, 50% runner target), instead of holding every position to resolution. Disable by setting the flag to false and restarting. Duplicate-import latches are cleared offline with `run_v3.py live-resolve-duplicate-batch` (worker stopped and disabled).
 - Stop: `systemctl --user stop polymarket-v7-live`. Emergency: also run `live-kill`, which cancels every open order on the account and permanently latches this ledger.
 
 ---
