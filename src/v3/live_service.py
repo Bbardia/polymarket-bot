@@ -13,6 +13,7 @@ from typing import Any
 from .config import V3Settings
 from .execution import ExecutionResult, V3OrderExecutor
 from .ledger import EventLedger, LedgerEvent
+from .live_early_exit import book_quote_age_seconds
 from .reconciliation import LocalSnapshot, Reconciler, RemoteSnapshot
 from .risk import AccountRiskState, OrderIntent, RiskEngine
 from .streaming import StreamEventProcessor
@@ -291,8 +292,22 @@ class LiveOrderService:
                 timestamp = context.book_timestamp
                 if timestamp is None or timestamp.tzinfo is None:
                     raise ValueError("book timestamp missing or timezone-naive")
-                age = (datetime.now(timezone.utc) - timestamp).total_seconds()
-                if age < 0 or age > self._risk.limits.max_quote_age_seconds:
+                # Exits use the shared read-time freshness rule; BUY entries keep
+                # the stricter last-change age (no read time is passed).
+                fetched_at = None
+                if intent.side == "SELL":
+                    fetched_at = getattr(context, "fetched_at", None)
+                    if not isinstance(fetched_at, datetime) or fetched_at.tzinfo is None:
+                        raise ValueError("book read time missing or timezone-naive")
+                try:
+                    age: float | None = book_quote_age_seconds(
+                        book_timestamp=timestamp, fetched_at=fetched_at,
+                        now=datetime.now(timezone.utc),
+                        max_quote_age_seconds=self._risk.limits.max_quote_age_seconds,
+                    )
+                except ValueError:
+                    age = None
+                if age is None:
                     reason = "order-book quote is stale"
                 elif not context.book_hash:
                     reason = "order-book hash is missing"

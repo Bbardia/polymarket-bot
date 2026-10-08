@@ -2031,6 +2031,11 @@ class PaperWorker:
                     )
                     for level in book.bids
                 )
+                # Live/paper parity gap: live exits (live_early_exit.py) round
+                # shares down to 0.01, enforce the venue minimum order size, and
+                # fall back to one whole-position "full" SELL when the 75% tranche
+                # or its runner would fall below that minimum. Paper exits model
+                # none of this, so paper can book exits live cannot place.
                 hybrid = self.settings.hybrid_exit_enabled
                 partial_exit = hybrid and not bool(position.get("hybrid_exit_done", False))
                 exit_shares = (

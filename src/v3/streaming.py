@@ -1678,6 +1678,12 @@ class StreamEventProcessor:
             reason=f"appended full-history account reconciliation for {len(target_ids)} legacy fee latches",
         )
 
+    def _accepted_post_only(self, order_id: str | None) -> bool:
+        accepted = [event for event in self.ledger.events()
+                    if event.event_type == "order.accepted"
+                    and event.payload.get("order_id") == order_id]
+        return len(accepted) == 1 and accepted[0].payload.get("post_only") is True
+
     def import_remote_trade(self, trade: RemoteTrade) -> ProcessResult:
         """Replay one validated history row through the normal user-trade path.
 
@@ -1728,13 +1734,22 @@ class StreamEventProcessor:
             return ProcessResult(False, requires_reconciliation=True, reason=reason)
         # SELL-maker replay is deliberately limited to one uniquely persisted,
         # post-only managed order with complete, internally consistent fill data.
+        # A not-yet-confirmed SELL row is skipped without a latch and without
+        # recording; the CONFIRMED row is imported later. The maker fee may come
+        # from an explicit zero trade fee; an unknown fee on a confirmed row
+        # takes the common latch below. The trade's top-level side/token/size/
+        # price describe the taker and may legitimately differ (complementary
+        # or multi-maker matches).
         sell_makers = [maker for maker in trade.maker_orders
                        if maker.order_id in self.managed_order_ids
                        and self.orders.get(maker.order_id) is not None
                        and self.orders[maker.order_id].side == "SELL"]
+        if sell_makers and trade.status != "CONFIRMED":
+            return ProcessResult(False, reason="unconfirmed managed SELL fill deferred until CONFIRMED")
         if sell_makers:
             maker = sell_makers[0]
             order = self.orders[maker.order_id]
+            maker_fee = next(row["fee_rate_bps"] for row in maker_rows if row["order_id"] == maker.order_id)
             accepted = [event for event in self.ledger.events()
                         if event.event_type == "order.accepted"
                         and event.payload.get("order_id") == maker.order_id]
@@ -1742,17 +1757,14 @@ class StreamEventProcessor:
                 len(sell_makers) == 1 and len(accepted) == 1
                 and accepted[0].payload.get("post_only") is True
                 and accepted[0].payload.get("side") == "SELL"
-                and accepted[0].payload.get("token_id") == order.token_id == maker.token_id == trade.token_id
+                and accepted[0].payload.get("token_id") == order.token_id == maker.token_id
                 and accepted[0].payload.get("condition_id") == trade.condition_id
-                and maker.side == "SELL" and trade.side == "BUY"
+                and maker.side == "SELL"
                 and trade.trader_side == "MAKER"
-                and trade.status == "CONFIRMED"
-                and trade.fee_rate_bps is not None and maker.fee_rate_bps is not None
                 and maker.matched_amount.is_finite() and maker.matched_amount > ZERO
                 and maker.matched_amount <= order.requested_size
-                and maker.price.is_finite() and maker.price > ZERO
-                and maker.fee_rate_bps.is_finite() and maker.fee_rate_bps >= ZERO
-                and trade.size == maker.matched_amount and trade.price == maker.price
+                and maker.price.is_finite() and ZERO < maker.price < Decimal("1")
+                and (maker_fee is None or (maker_fee.is_finite() and maker_fee >= ZERO))
             )
             if not valid:
                 reason = "managed SELL maker fill lacks unique post-only evidence or consistent confirmed fee/quantity"
@@ -1953,13 +1965,22 @@ class StreamEventProcessor:
 
             parsed_targets: list[tuple[OrderAggregate, Decimal, Decimal, Decimal]] = []
             for order, target_payload, size_key in targets:
+                if order.side == "SELL" and status is not TradeStatus.CONFIRMED:
+                    # Managed SELL fills are only ever recorded once CONFIRMED;
+                    # earlier lifecycle rows are skipped without a latch.
+                    continue
                 size = Decimal(str(_value(target_payload, size_key)))
                 price = Decimal(str(_value(target_payload, "price")))
-                fee_rate_value = _value(
-                    target_payload,
-                    "fee_rate_bps",
-                    default=_value(payload, "fee_rate_bps"),
-                )
+                if size_key == "matched_amount":
+                    # The trade's top-level fee rate is the taker's. Never charge
+                    # it to our maker leg: a post-only maker with no reported
+                    # maker rate pays no fee; any other maker leg stays unknown.
+                    fee_rate_value = (
+                        target_payload["fee_rate_bps"] if "fee_rate_bps" in target_payload
+                        else "0" if self._accepted_post_only(order.order_id) else None
+                    )
+                else:
+                    fee_rate_value = _value(payload, "fee_rate_bps")
                 if status is TradeStatus.CONFIRMED and fee_rate_value is None:
                     raise ValueError("confirmed trade fee rate is unknown")
                 fee_rate_bps = Decimal(str(fee_rate_value or "0"))
@@ -1971,10 +1992,9 @@ class StreamEventProcessor:
                                 if event.event_type == "order.accepted"
                                 and event.payload.get("order_id") == order.order_id]
                     if (
-                        size_key != "matched_amount" or status is not TradeStatus.CONFIRMED
+                        size_key != "matched_amount"
                         or str(_value(target_payload, "side", default="")) != "SELL"
-                        or str(_value(payload, "side", default="")) != "BUY"
-                        or fee_rate_value is None or len(accepted) != 1
+                        or len(accepted) != 1
                         or accepted[0].payload.get("post_only") is not True
                         or accepted[0].payload.get("side") != "SELL"
                         or accepted[0].payload.get("token_id") != order.token_id
