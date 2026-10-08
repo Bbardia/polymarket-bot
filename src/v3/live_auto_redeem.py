@@ -129,8 +129,23 @@ async def auto_redeem_one_managed_winner(
     external_condition_ids: frozenset[str],
     baseline_epoch: int,
     now: datetime,
+    skipped: list[dict[str, str]] | None = None,
 ) -> tuple[RemoteSnapshot, tuple[str, ...], str | None]:
-    """Submit at most one strictly verified winning holding; never retry ambiguously."""
+    """Submit at most one strictly verified winning holding; never retry ambiguously.
+
+    Read-only per-candidate metadata lookups that fail, and neg-risk markets
+    (whose redemption path is unsupported), skip that candidate; each skip is
+    appended to ``skipped`` for status reporting. Nothing is submitted for a
+    skipped candidate, and errors after the submission boundary still raise.
+    """
+    def skip(candidate: ManagedRedemptionCandidate, reason: str) -> None:
+        if skipped is not None:
+            skipped.append({
+                "condition_id": candidate.condition_id,
+                "token_id": candidate.token_id,
+                "reason": reason,
+            })
+
     candidates = managed_winning_candidates(
         ledger, processor, baseline_cash, remote, reconciler, external_condition_ids,
     )
@@ -146,10 +161,24 @@ async def auto_redeem_one_managed_winner(
         )):
             raise RuntimeError("auto-redemption requires complete Builder relay credentials")
     for candidate in candidates:
-        if await api.fetch_market_is_neg_risk(candidate.condition_id) is not False:
+        try:
+            neg_risk = await api.fetch_market_is_neg_risk(candidate.condition_id)
+        except Exception as exc:
+            skip(candidate, f"skipped: market metadata lookup failed: {type(exc).__name__}")
             continue
-        winner = await api.fetch_resolved_winner(candidate.condition_id)
+        if neg_risk is True:
+            skip(candidate, "skipped: neg-risk redemption unsupported")
+            continue
+        if neg_risk is not False:
+            skip(candidate, "skipped: market neg-risk flag unknown")
+            continue
+        try:
+            winner = await api.fetch_resolved_winner(candidate.condition_id)
+        except Exception as exc:
+            skip(candidate, f"skipped: resolution lookup failed: {type(exc).__name__}")
+            continue
         if winner != candidate.token_id:
+            skip(candidate, "skipped: resolved winner is a different token")
             continue
         # Persist before crossing the submission boundary. If submission times
         # out, this durable intent prevents a second transaction on restart.

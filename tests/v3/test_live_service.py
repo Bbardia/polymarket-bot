@@ -656,3 +656,45 @@ def test_cancel_pagination_overflow_latches_executor_and_blocks_followup_submit(
         intent(), AccountRiskState(equity=D("0"), cash=D("0"), total_exposure=D("0")),
     ))
     assert not blocked.accepted and blocked.reason == "kill switch latched"
+
+
+def test_sell_exit_freshness_uses_context_read_time_not_last_book_change(tmp_path):
+    from dataclasses import replace
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    sell = replace(intent(), side="SELL", decision_id="exit-1", exit_stage="full")
+    quiet = {"book_timestamp": now - timedelta(minutes=90)}
+    cases = (
+        ({**quiet, "fetched_at": now}, None),
+        ({**quiet, "fetched_at": now - timedelta(hours=1)}, "order-book quote is stale"),
+        (quiet, "market context is incomplete"),
+        ({"book_timestamp": now + timedelta(minutes=5), "fetched_at": now}, "order-book quote is stale"),
+        # A freshly read book unchanged beyond the separate last-change bound.
+        ({"book_timestamp": now - timedelta(hours=2, seconds=1), "fetched_at": now}, "order-book quote is stale"),
+    )
+    for index, (update, expected) in enumerate(cases):
+        api = FakeAPI(remote_snapshot())
+        api.market_context = SimpleNamespace(**{**vars(api.market_context), **update})
+        service = _authorized_service_for_test(
+            api, FakeExecutor(), risk_engine(), EventLedger(tmp_path / f"sell-{index}.db"), Reconciler(),
+        )
+        validated, reason = asyncio.run(service._validated_intent(sell))
+        assert reason == expected
+        if expected is None:
+            assert validated is not None and validated.quote_age_seconds <= 5
+
+
+def test_buy_entry_freshness_still_uses_last_book_change(tmp_path):
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    api = FakeAPI(remote_snapshot())
+    api.market_context = SimpleNamespace(**{
+        **vars(api.market_context), "book_timestamp": now - timedelta(hours=2), "fetched_at": now,
+    })
+    service = _authorized_service_for_test(
+        api, FakeExecutor(), risk_engine(), EventLedger(tmp_path / "buy.db"), Reconciler(),
+    )
+    validated, reason = asyncio.run(service._validated_intent(intent()))
+    assert validated is None and reason == "order-book quote is stale"
