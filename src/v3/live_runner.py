@@ -18,6 +18,7 @@ new entries.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -26,7 +27,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 from .api import UnifiedPolymarketAPI
 from .config import V3Settings, _env_bool
@@ -73,8 +74,9 @@ class LiveRunnerSettings:
             raise ValueError("auto-redeem setting must be boolean")
         if type(self.live_early_exit_enabled) is not bool:
             raise ValueError("live early-exit setting must be boolean")
-        if not self.cost_tolerance.is_finite() or self.cost_tolerance < ZERO:
-            raise ValueError("cost tolerance must be finite and nonnegative")
+        if (not self.cost_tolerance.is_finite() or self.cost_tolerance < ZERO
+                or self.cost_tolerance > Decimal("0.01")):
+            raise ValueError("cost tolerance must be finite, nonnegative and at most 0.01")
         if self.expiry_grace_seconds < 60:
             raise ValueError("expiry grace must be at least 60 seconds")
 
@@ -365,10 +367,31 @@ class LiveTradingRunner(LiveShadowRunner):
         self.reconciler = reconciler
         self.runner_settings = runner_settings
 
+    async def resolve_corrected_duplicate_trade_latch(self, trade_id: str):
+        """Fetch authenticated account state, then attempt the narrow replay-latch resolution."""
+        if not isinstance(trade_id, str) or not trade_id:
+            raise ValueError("confirmed trade ID is required")
+        if not isinstance(self.store, LiveStore):
+            raise ValueError("live session store is required")
+        ledger_path = self.ledger.path.resolve()
+        state_path = self.store.state_path.resolve()
+        if (ledger_path != self.store.ledger_path.resolve()
+                or state_path != (ledger_path.parent / "live_state.json").resolve()):
+            raise ValueError("live ledger and persisted session state paths do not match")
+        from .streaming import _corrected_duplicate_resolution_reconciler
+        persisted_state = self.store.load_state()
+        resolver = _corrected_duplicate_resolution_reconciler(persisted_state)
+        remote = await self.api.fetch_remote_snapshot()
+        fetched_at = _utc_now()
+        processor = StreamEventProcessor(self.ledger)
+        return processor._resolve_corrected_duplicate_trade_latch(
+            remote=remote, reconciler=resolver, trade_id=trade_id,
+            account_snapshot_fetched_at=fetched_at,
+        )
+
     async def _run_early_exits(self, *, processor, local, remote, risk_context, now):
         from uuid import uuid4
         from .live_early_exit import ExitPosition, plan_live_early_exit, verified_book_from_api
-        from .math import execution_fee
 
         results = []
         accepted_buys = {}
@@ -488,9 +511,14 @@ class LiveTradingRunner(LiveShadowRunner):
                 if plan.intent is None:
                     continue
                 sell = plan.intent
+                # The planner already stress-tests bid-depth taker fees. A verified
+                # taker-only schedule charges a resting post-only maker zero fee;
+                # never pass the taker estimate as the submitted maker fee.
+                if book.fee_rate > ZERO and getattr(context, "taker_only", None) is not True:
+                    raise ValueError("positive-fee SELL lacks verified taker-only maker fee")
                 intent = OrderIntent(
                     condition_id=condition_id, token_id=token_id, side="SELL", price=sell.price,
-                    shares=sell.size, estimated_fee=execution_fee(book.bids, sell.size, book.fee_rate, descending=True),
+                    shares=sell.size, estimated_fee=ZERO,
                     post_only=True, ttl_seconds=min(3600, self.risk.limits.max_order_ttl_seconds),
                     quote_age_seconds=max(0, int((now - raw.timestamp).total_seconds())),
                     tick_size=book.tick_size, min_order_size=book.min_order_size,
@@ -906,6 +934,93 @@ async def _start(settings: V3Settings, runner_settings: LiveRunnerSettings):
         baseline_cash=baseline_cash,
     )
     return store, api, ledger, reconciler, service
+
+
+async def resolve_live_duplicate_batch(
+    settings: V3Settings, runner_settings: LiveRunnerSettings, *,
+    assert_worker_stopped: Callable[[], None],
+) -> dict[str, Any]:
+    """Resolve only an audited import-batch latch, without constructing an order client."""
+    errors = settings.live_client_errors()
+    if errors:
+        raise RuntimeError("Live resolution refused: " + "; ".join(errors))
+    assert_worker_stopped()
+    store = LiveStore(runner_settings.shadow.data_dir)
+    if not store.state_path.is_file() or not store.ledger_path.is_file():
+        raise ValueError("persisted live ledger and session baseline are required")
+    state_digest = hashlib.sha256(store.state_path.read_bytes()).digest()
+    state = store.load_state()
+    epoch = state.get("baseline_epoch")
+    if type(epoch) is not int or epoch < 0:
+        raise ValueError("persisted trade-history baseline is invalid")
+    ledger = EventLedger(store.ledger_path)
+    processor = StreamEventProcessor(ledger)
+    from .live_accounting import confirmed_fills
+    from .streaming import _corrected_duplicate_resolution_reconciler, _venue_match_time
+    fills = confirmed_fills(processor)
+    local_ids = {fill.trade_id for fill in fills}
+    if len(local_ids) != len(fills) or not local_ids:
+        raise ValueError("managed confirmed fills are not unique")
+    policy = _corrected_duplicate_resolution_reconciler(state)
+    if policy.cost_tolerance != runner_settings.cost_tolerance:
+        raise ValueError("runner reconciliation policy differs from persisted strict policy")
+    api = UnifiedPolymarketAPI(settings=settings)
+    await api.initialize_account_client()  # read-only; never initialize_secure_client
+    try:
+        history = await api.fetch_complete_account_trade_history(
+            after=epoch, max_items=TRADE_HISTORY_MAX_ITEMS, page_limit=TRADE_HISTORY_PAGE_LIMIT,
+        )
+        flows = await api.fetch_complete_account_cash_flow_history(after=epoch, max_items=10_000)
+        remote = await api.fetch_remote_snapshot()
+        fetched_at = _utc_now()
+    finally:
+        await api._authenticated_client().close()
+    if (history.after != epoch or flows.after != epoch or flows.flows
+            or {row.trade_id for row in history.trades} != local_ids
+            or remote.open_orders):
+        raise ValueError("complete account trade/flow history or open orders do not match managed baseline")
+    events = tuple(ledger.events())
+    for trade in history.trades:
+        original = next((row for row in events if row.event_type == "user.trade"
+                         and row.payload.get("id") == trade.trade_id
+                         and row.payload.get("status") == "CONFIRMED"), None)
+        if original is None or trade.status != "CONFIRMED":
+            raise ValueError("authenticated trade history does not match confirmed ledger")
+        if trade.matched_at != _venue_match_time(original.payload):
+            raise ValueError("authenticated venue match time differs from ledger")
+        fill = next(fill for fill in fills if fill.trade_id == trade.trade_id)
+        makers = [maker for maker in trade.maker_orders if maker.order_id == fill.order_id]
+        if (trade.condition_id not in {row.payload.get("condition_id") for row in ledger.events()
+                                        if row.event_type == "order.accepted" and row.payload.get("order_id") == fill.order_id}
+                or len(makers) != 1 or makers[0].token_id != fill.token_id
+                or makers[0].side != fill.side or makers[0].matched_amount != fill.size
+                or makers[0].price != fill.price):
+            raise ValueError("authenticated managed maker fill differs from ledger")
+    baseline_cash = Decimal(str(state["baseline_cash"]))
+    before = local_snapshot(processor, baseline_cash)
+    report = policy.compare(before, remote)
+    if not report.safe_to_trade or report.cash_delta != ZERO:
+        raise ValueError("fresh authenticated account snapshot does not reconcile")
+    assert_worker_stopped()
+    if hashlib.sha256(store.state_path.read_bytes()).digest() != state_digest:
+        raise ValueError("persisted live state changed during audited resolution")
+    result = processor.resolve_corrected_duplicate_batch_latch(
+        remote=remote, reconciler=policy, account_snapshot_fetched_at=fetched_at,
+        history_proof={
+            "after": history.after, "trade_ids": sorted(row.trade_id for row in history.trades),
+            "trade_max_items": history.max_items, "trade_page_limit": history.page_limit,
+            "trade_fetched_at": history.fetched_at.isoformat(),
+            "flow_after": flows.after, "flow_count": len(flows.flows),
+            "flow_max_items": flows.max_items, "flow_page_size": flows.page_size,
+            "flow_fetched_at": flows.fetched_at.isoformat(),
+        },
+    )
+    replayed = StreamEventProcessor(ledger)
+    if (not result.accepted or replayed.reconciliation_required
+            or local_snapshot(replayed, baseline_cash) != before):
+        raise RuntimeError("batch resolution did not replay without accounting drift; worker must remain stopped")
+    return {"resolved": True, "managed_fills": len(fills), "cash_delta": str(report.cash_delta),
+            "cash_flows": len(flows.flows), "lifecycle_clear": True}
 
 
 async def run_live(settings: V3Settings, runner_settings: LiveRunnerSettings, *, cycles: int = 0) -> None:

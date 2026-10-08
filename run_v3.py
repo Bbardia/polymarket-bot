@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 from src.v3.api import UnifiedPolymarketAPI
 from src.v3.config import V3Settings
-from src.v3.live_runner import LiveRunnerSettings, kill_live, run_live
+from src.v3.live_runner import LiveRunnerSettings, kill_live, resolve_live_duplicate_batch, run_live
 from src.v3.live_shadow import LiveShadowSettings, run_live_shadow
 from src.v3.paper import PaperSettings, paper_status, run_paper
 from src.v3.simulation import (
@@ -216,6 +216,31 @@ def live_kill(*, env_file: Path, secrets_file: Path) -> int:
     return 0
 
 
+def live_resolve_duplicate_batch(*, env_file: Path, secrets_file: Path) -> int:
+    """Read authenticated histories/snapshot; append only an exact audited latch proof."""
+    import subprocess
+    unit = "polymarket-v7-live.service"
+    def assert_worker_stopped() -> None:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", unit,
+             "-p", "ActiveState", "-p", "UnitFileState", "-p", "WorkingDirectory"],
+            capture_output=True, text=True, check=True,
+        )
+        properties = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        if (properties.get("ActiveState") != "inactive"
+                or properties.get("UnitFileState") != "disabled"
+                or Path(properties.get("WorkingDirectory", "/")).resolve() != ROOT.resolve()):
+            raise RuntimeError("live resolver requires the exact deployed worker inactive and disabled")
+    assert_worker_stopped()
+    load_live_environment(env_file, secrets_file)
+    result = asyncio.run(resolve_live_duplicate_batch(
+        V3Settings.from_env(), LiveRunnerSettings.from_env(ROOT),
+        assert_worker_stopped=assert_worker_stopped,
+    ))
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
 def live_status(*, env_file: Path) -> int:
     if env_file.is_file():
         load_dotenv(env_file, override=False)
@@ -270,6 +295,7 @@ def main() -> int:
         ("live-run", "REAL MONEY: run the gated V7 weather maker runner."),
         ("live-kill", "REAL MONEY: latch the kill switch and cancel all open account orders."),
         ("live-status", "Show the last live-runner status without network access."),
+        ("live-resolve-duplicate-batch", "Audit authenticated history and resolve one exact duplicate-import latch; no orders."),
     ):
         live_parser = subparsers.add_parser(name, help=help_text)
         live_parser.add_argument("--env-file", type=Path, default=ROOT / ".env.live")
@@ -299,6 +325,8 @@ def main() -> int:
                             cycles=args.cycles, interval=args.interval)
         if args.command == "live-kill":
             return live_kill(env_file=args.env_file, secrets_file=args.secrets_file)
+        if args.command == "live-resolve-duplicate-batch":
+            return live_resolve_duplicate_batch(env_file=args.env_file, secrets_file=args.secrets_file)
         if args.command == "live-status":
             return live_status(env_file=args.env_file)
         return paper_run(cycles=args.cycles, interval=args.interval)

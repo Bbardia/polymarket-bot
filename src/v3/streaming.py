@@ -9,7 +9,7 @@ import json
 from types import SimpleNamespace
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Protocol, cast
@@ -24,6 +24,21 @@ from .reconciliation import (
 )
 
 ZERO = Decimal("0")
+CORRECTED_DUPLICATE_COST_TOLERANCE = Decimal("0.01")
+
+
+def _corrected_duplicate_resolution_reconciler(state: Mapping[str, Any]) -> Reconciler:
+    external_ids = state.get("external_condition_ids")
+    if (not isinstance(external_ids, list)
+            or any(not isinstance(item, str) or not item for item in external_ids)
+            or len(set(external_ids)) != len(external_ids)):
+        raise ValueError("persisted external-condition baseline is invalid")
+    return Reconciler(
+        external_condition_ids=external_ids,
+        cash_tolerance=ZERO,
+        cost_tolerance=CORRECTED_DUPLICATE_COST_TOLERANCE,
+        allow_cash_inflows=False,
+    )
 
 
 class StreamState(str, Enum):
@@ -159,10 +174,338 @@ def _remote_snapshot_payload(remote: RemoteSnapshot) -> dict[str, Any]:
     }
 
 
+def _local_snapshot_payload(local: LocalSnapshot) -> dict[str, Any]:
+    return {
+        "cash": str(local.cash),
+        "position_tokens": sorted(local.position_tokens),
+        "order_ids": sorted(local.order_ids),
+        "position_quantities": None if local.position_quantities is None else {
+            token: str(value) for token, value in sorted(local.position_quantities.items())
+        },
+        "position_cost_basis": None if local.position_cost_basis is None else {
+            token: str(value) for token, value in sorted(local.position_cost_basis.items())
+        },
+    }
+
+
+def _local_snapshot_sha256(local: LocalSnapshot) -> str:
+    return hashlib.sha256(_stable_json(_local_snapshot_payload(local)).encode("utf-8")).hexdigest()
+
+
 def remote_snapshot_sha256(remote: RemoteSnapshot) -> str:
     """Fingerprint the exact authenticated account snapshot used for recovery."""
     return hashlib.sha256(_stable_json(_remote_snapshot_payload(remote)).encode("utf-8")).hexdigest()
 
+
+
+def _duplicate_chronology_groups(
+    prior: tuple[LedgerEvent, ...], latch_index: int,
+) -> list[dict[str, Any]]:
+    """Derive every duplicate confirmed trade group before the exact latch."""
+    groups: dict[str, list[tuple[int, LedgerEvent]]] = {}
+    for index, row in enumerate(prior):
+        if row.event_type == "user.trade" and row.payload.get("status") == "CONFIRMED":
+            trade_id = row.payload.get("id")
+            if not isinstance(trade_id, str) or not trade_id:
+                raise ValueError("confirmed trade lacks stable ID")
+            groups.setdefault(trade_id, []).append((index, row))
+    result = []
+    for trade_id, rows in groups.items():
+        if len(rows) < 2:
+            continue
+        if len(rows) != 2:
+            raise ValueError("duplicate import must contain exactly one original and one later copy")
+        if rows[-1][0] >= latch_index:
+            raise ValueError("duplicate follows chronology latch")
+        canonical = dict(rows[0][1].payload)
+        market = canonical.pop("market", None)
+        for _, row in rows:
+            payload = dict(row.payload)
+            row_market = payload.pop("market", None)
+            if (payload != canonical or _venue_match_time(row.payload) is None
+                    or (market is not None and row_market is not None and market != row_market)):
+                raise ValueError("duplicate rows conflict or lack venue match time")
+            market = market or row_market
+        makers = rows[0][1].payload.get("maker_orders")
+        if not isinstance(market, str) or not market or not isinstance(makers, (list, tuple)) or not makers:
+            raise ValueError("duplicate market or maker association is missing")
+        managed = []
+        for maker in makers:
+            if not isinstance(maker, Mapping):
+                raise ValueError("malformed maker association")
+            order_id = maker.get("order_id", maker.get("id"))
+            if not isinstance(order_id, str) or not order_id:
+                raise ValueError("maker has no order ID")
+            accepted = [(i, row) for i, row in enumerate(prior) if row.event_type == "order.accepted"
+                        and row.payload.get("order_id") == order_id]
+            if accepted:
+                if (len(accepted) != 1 or accepted[0][0] >= rows[0][0]
+                        or accepted[0][1].payload.get("condition_id") != market
+                        or accepted[0][1].payload.get("token_id") != maker.get("asset_id")
+                        or accepted[0][1].payload.get("side") != maker.get("side")
+                        or maker.get("side") not in ("BUY", "SELL")):
+                    raise ValueError("managed maker identity or chronology conflicts")
+                managed.append(order_id)
+        taker = rows[0][1].payload.get("taker_order_id")
+        if (len(managed) != 1 or len(set(managed)) != 1
+                or any(row.event_type == "order.accepted" and row.payload.get("order_id") == taker
+                       for row in prior)):
+            raise ValueError("duplicate has ambiguous managed order maker or managed taker")
+        result.append({"trade_id": trade_id, "duplicate_event_ids": [row.event_id for _, row in rows],
+                       "first_ledger_index": rows[0][0], "condition_id": market,
+                       "managed_order_id": managed[0]})
+    if not result:
+        raise ValueError("no duplicate confirmed trade groups precede latch")
+    # One unscoped latch may be attributed to this import only when the later
+    # copies form the entire immediate event suffix before that latch. Older,
+    # unrelated duplicate rows cannot be used as evidence for this batch.
+    reimport_ids = [group["duplicate_event_ids"][-1] for group in result]
+    suffix = prior[latch_index - len(result):latch_index]
+    if (len(suffix) != len(result) or [row.event_id for row in suffix] != reimport_ids
+            or any(row.event_type != "user.trade" for row in suffix)):
+        raise ValueError("duplicate reimport batch is not immediately before latch")
+    return result
+
+
+def _valid_batch_history_proof(
+    proof: Any, groups: list[dict[str, Any]], persisted_state: Mapping[str, Any],
+    snapshot_at: datetime, resolved_at: datetime,
+) -> bool:
+    """Bind the trusted caller's exhausted histories to the exact batch and baseline."""
+    if not isinstance(proof, Mapping) or set(proof) != {
+        "after", "trade_ids", "trade_max_items", "trade_page_limit", "trade_fetched_at",
+        "flow_after", "flow_count", "flow_max_items", "flow_page_size", "flow_fetched_at",
+    }:
+        return False
+    if (type(persisted_state.get("baseline_epoch")) is not int
+            or type(proof["after"]) is not int or proof["after"] != persisted_state["baseline_epoch"]
+            or type(proof["flow_after"]) is not int or proof["flow_after"] != proof["after"]
+            or type(proof["flow_count"]) is not int or proof["flow_count"] != 0
+            or not isinstance(proof["trade_ids"], list)
+            or proof["trade_ids"] != sorted(group["trade_id"] for group in groups)):
+        return False
+    for field in ("trade_max_items", "trade_page_limit", "flow_max_items", "flow_page_size"):
+        if type(proof[field]) is not int or proof[field] <= 0:
+            return False
+    if len(proof["trade_ids"]) >= proof["trade_max_items"]:
+        return False
+    try:
+        trade_at = datetime.fromisoformat(proof["trade_fetched_at"])
+        flow_at = datetime.fromisoformat(proof["flow_fetched_at"])
+        if any(at.tzinfo is None or at.utcoffset() is None for at in (trade_at, flow_at)):
+            return False
+        return all(timedelta(0) <= resolved_at - at <= timedelta(seconds=120)
+                   and at <= snapshot_at for at in (trade_at, flow_at))
+    except (TypeError, ValueError):
+        return False
+
+
+def _validated_duplicate_batch_replay_resolution(
+    event: LedgerEvent, events: tuple[LedgerEvent, ...], resolved: set[str], ledger: EventLedger,
+) -> frozenset[str]:
+    evidence = event.payload.get("evidence")
+    ids = event.payload.get("resolved_event_ids")
+    if not isinstance(evidence, Mapping) or type(evidence.get("version")) is not int or evidence["version"] != 1 or not isinstance(ids, list) or len(ids) != 1:
+        return frozenset()
+    index = next((i for i, row in enumerate(events) if row.event_id == event.event_id), -1)
+    if index < 0:
+        return frozenset()
+    prior = events[:index]
+    blockers = [row for row in prior if row.event_type == "stream.reconciliation_required" and row.event_id not in resolved]
+    if (len(blockers) != 1 or ids != [blockers[0].event_id]
+            or blockers[0].payload.get("reason") != "confirmed fill chronology or ledger association is invalid"):
+        return frozenset()
+    latch_index = next(i for i, row in enumerate(prior) if row.event_id == ids[0])
+    try:
+        if evidence.get("groups") != _duplicate_chronology_groups(prior, latch_index):
+            return frozenset()
+        state = json.loads((ledger.path.parent / "live_state.json").read_text(encoding="utf-8"))
+        if not isinstance(state, Mapping) or not _valid_batch_history_proof(
+            evidence.get("history_proof"), evidence["groups"], state,
+            datetime.fromisoformat(evidence["account_snapshot_fetched_at"]),
+            datetime.fromisoformat(event.occurred_at),
+        ):
+            return frozenset()
+        # Reuse the existing snapshot, persisted-policy and pre-resolution local
+        # replay checks, but bind them to each group rather than one chosen ID.
+        for group in evidence["groups"]:
+            single = LedgerEvent(event.event_id, event.event_type, event.occurred_at, {
+                "resolved_event_ids": ids, "evidence": {**evidence,
+                    "trade_id": group["trade_id"], "duplicate_event_ids": group["duplicate_event_ids"],
+                    "duplicate_rows": len(group["duplicate_event_ids"])} })
+            if _validated_duplicate_replay_resolution(single, events, resolved, ledger, batch_group=group) != frozenset(ids):
+                return frozenset()
+        from .live_accounting import confirmed_fills
+        replay_ledger = EventLedger(":memory:")
+        for row in prior:
+            replay_ledger.append(row)
+        replay_ledger.path = ledger.path
+        fills = confirmed_fills(StreamEventProcessor(replay_ledger))
+        if any(len([fill for fill in fills if fill.trade_id == group["trade_id"]]) != 1
+               or next(fill.ledger_index for fill in fills if fill.trade_id == group["trade_id"]) != group["first_ledger_index"]
+               or next(fill.order_id for fill in fills if fill.trade_id == group["trade_id"]) != group["managed_order_id"]
+               for group in evidence["groups"]):
+            return frozenset()
+    except (ArithmeticError, KeyError, OSError, TypeError, ValueError):
+        return frozenset()
+    return frozenset(ids)
+
+
+def _validated_duplicate_replay_resolution(
+    event: LedgerEvent, events: tuple[LedgerEvent, ...], resolved: set[str], ledger: EventLedger,
+    *, batch_group: Mapping[str, Any] | None = None,
+) -> frozenset[str]:
+    """Validate a durable resolution for identical duplicate confirmed trades."""
+    payload = event.payload
+    evidence = payload.get("evidence")
+    ids = payload.get("resolved_event_ids")
+    if (not isinstance(evidence, Mapping) or not isinstance(ids, list) or len(ids) != 1
+            or any(not isinstance(item, str) or not item for item in ids)):
+        return frozenset()
+    idx = next((i for i, row in enumerate(events) if row.event_id == event.event_id), -1)
+    if idx < 0:
+        return frozenset()
+    prior = events[:idx]
+    target = next((row for row in prior if row.event_id == ids[0]), None)
+    if target is None or target.event_type != "stream.reconciliation_required" or target.payload.get("reason") != "confirmed fill chronology or ledger association is invalid":
+        return frozenset()
+    target_index = next(i for i, row in enumerate(prior) if row.event_id == target.event_id)
+    try:
+        # A one-trade proof is never sufficient for an unscoped multi-trade import latch.
+        eligible_groups = _duplicate_chronology_groups(prior, target_index)
+    except (TypeError, ValueError):
+        return frozenset()
+    if batch_group is None and len(eligible_groups) != 1:
+        return frozenset()
+    unresolved = [row for row in prior if row.event_type == "stream.reconciliation_required" and row.event_id not in resolved]
+    if unresolved != [target]:
+        return frozenset()
+    trade_id = evidence.get("trade_id")
+    if not isinstance(trade_id, str) or not trade_id:
+        return frozenset()
+    trades = [row for row in prior if row.event_type == "user.trade"
+              and row.payload.get("id") == trade_id and row.payload.get("status") == "CONFIRMED"]
+    duplicate_ids = evidence.get("duplicate_event_ids")
+    if (type(evidence.get("duplicate_rows")) is not int or evidence["duplicate_rows"] != len(trades)
+            or len(trades) < 2 or not isinstance(duplicate_ids, list)
+            or duplicate_ids != [row.event_id for row in trades]):
+        return frozenset()
+    if max(i for i, row in enumerate(prior) if row.event_id in set(duplicate_ids)) >= target_index:
+        return frozenset()
+    canonical = dict(trades[0].payload)
+    canonical_market = canonical.pop("market", None)
+    if _venue_match_time(trades[0].payload) is None:
+        return frozenset()
+    for row in trades[1:]:
+        duplicate = dict(row.payload)
+        duplicate_market = duplicate.pop("market", None)
+        if (duplicate != canonical or _venue_match_time(row.payload) is None
+                or (canonical_market is not None and duplicate_market is not None and canonical_market != duplicate_market)):
+            return frozenset()
+        canonical_market = canonical_market or duplicate_market
+    if not isinstance(canonical_market, str) or not canonical_market:
+        return frozenset()
+    makers = trades[0].payload.get("maker_orders")
+    if not isinstance(makers, (list, tuple)):
+        return frozenset()
+    if batch_group is not None:
+        if (batch_group.get("condition_id") != canonical_market
+                or batch_group.get("first_ledger_index") != next(i for i, row in enumerate(prior) if row.event_id == trades[0].event_id)
+                or batch_group.get("managed_order_id") not in [maker.get("order_id", maker.get("id")) for maker in makers if isinstance(maker, Mapping)]):
+            return frozenset()
+    else:
+        if len(makers) != 1 or not isinstance(makers[0], Mapping):
+            return frozenset()
+        maker = makers[0]
+        order_id = maker.get("order_id", maker.get("id"))
+        if not isinstance(order_id, str):
+            return frozenset()
+        accepted = [row for row in prior if row.event_type == "order.accepted" and row.payload.get("order_id") == order_id]
+        trade_index = next(i for i, row in enumerate(prior) if row.event_id == trades[0].event_id)
+        accepted_index = next((i for i, row in enumerate(prior) if row.event_id in {item.event_id for item in accepted}), -1)
+        taker_id = trades[0].payload.get("taker_order_id")
+        if (len(accepted) != 1 or accepted_index < 0 or accepted_index >= trade_index
+                or accepted[0].payload.get("condition_id") != canonical_market
+                or accepted[0].payload.get("token_id") != maker.get("asset_id")
+                or accepted[0].payload.get("side") != maker.get("side")
+                or trades[0].payload.get("asset_id") != maker.get("asset_id")
+                or trades[0].payload.get("side") == maker.get("side")
+                or any(row.event_type == "order.accepted" and row.payload.get("order_id") == taker_id for row in prior)):
+            return frozenset()
+    snapshot = evidence.get("account_snapshot")
+    digest = evidence.get("account_snapshot_sha256")
+    fetched_raw = evidence.get("account_snapshot_fetched_at")
+    if not isinstance(fetched_raw, str) or not isinstance(event.occurred_at, str):
+        return frozenset()
+    try:
+        if not isinstance(snapshot, Mapping) or set(snapshot) != {"cash", "positions", "open_orders"}:
+            return frozenset()
+        if snapshot.get("open_orders") != [] or not isinstance(snapshot.get("positions"), list):
+            return frozenset()
+        cash = Decimal(str(snapshot["cash"]))
+        if not cash.is_finite() or cash < ZERO:
+            return frozenset()
+        positions = []
+        for raw in snapshot["positions"]:
+            if not isinstance(raw, Mapping) or set(raw) != {"condition_id", "token_id", "size", "current_value", "initial_value", "redeemable"}:
+                return frozenset()
+            size = Decimal(str(raw["size"]))
+            current = Decimal(str(raw["current_value"]))
+            initial = None if raw["initial_value"] is None else Decimal(str(raw["initial_value"]))
+            if (not isinstance(raw["condition_id"], str) or not raw["condition_id"]
+                    or not isinstance(raw["token_id"], str) or not raw["token_id"]
+                    or not size.is_finite() or size < ZERO or not current.is_finite() or current < ZERO
+                    or (initial is not None and (not initial.is_finite() or initial < ZERO))
+                    or type(raw["redeemable"]) is not bool):
+                return frozenset()
+            positions.append(RemotePosition(raw["condition_id"], raw["token_id"], size, current, initial, raw["redeemable"]))
+        if not isinstance(digest, str) or remote_snapshot_sha256(RemoteSnapshot(cash, tuple(positions), ())) != digest:
+            return frozenset()
+        snapshot_at = datetime.fromisoformat(fetched_raw)
+        resolved_at = datetime.fromisoformat(event.occurred_at)
+        # This is durable historical resolution evidence: snapshot freshness is
+        # measured at resolution time. Every live cycle independently fetches
+        # and reconciles a fresh account snapshot before it may submit orders.
+        if (snapshot_at.tzinfo is None or snapshot_at.utcoffset() is None or resolved_at.tzinfo is None
+                or resolved_at.utcoffset() is None or not timedelta(0) <= resolved_at - snapshot_at <= timedelta(seconds=120)):
+            return frozenset()
+        cash_delta = Decimal(str(evidence.get("cash_delta")))
+        if not cash_delta.is_finite() or cash_delta != ZERO or evidence.get("account_reconciliation_safe") is not True:
+            return frozenset()
+        baseline_cash = Decimal(str(evidence.get("baseline_cash")))
+        persisted_state = json.loads((ledger.path.parent / "live_state.json").read_text(encoding="utf-8"))
+        if not isinstance(persisted_state, Mapping):
+            return frozenset()
+        expected_reconciler = _corrected_duplicate_resolution_reconciler(persisted_state)
+        if (Decimal(str(persisted_state.get("baseline_cash"))) != baseline_cash
+                or not baseline_cash.is_finite() or baseline_cash < ZERO):
+            return frozenset()
+        cash_tolerance = Decimal(str(evidence.get("cash_tolerance")))
+        cost_tolerance = Decimal(str(evidence.get("cost_tolerance")))
+        external_ids = evidence.get("external_condition_ids")
+        allow_cash_inflows = evidence.get("allow_cash_inflows")
+        local_digest = evidence.get("local_snapshot_sha256")
+        if (cash_tolerance != expected_reconciler.cash_tolerance
+                or cost_tolerance != expected_reconciler.cost_tolerance
+                or external_ids != sorted(expected_reconciler.external_condition_ids)
+                or allow_cash_inflows is not expected_reconciler.allow_cash_inflows
+                or not isinstance(local_digest, str) or len(local_digest) != 64):
+            return frozenset()
+        replay_ledger = EventLedger(":memory:")
+        for prior_event in prior:
+            replay_ledger.append(prior_event)
+        replay_ledger.path = ledger.path
+        replay_processor = StreamEventProcessor(replay_ledger)
+        from .live_runner import local_snapshot
+        replay_local = local_snapshot(replay_processor, baseline_cash)
+        if _local_snapshot_sha256(replay_local) != local_digest:
+            return frozenset()
+        replay_report = expected_reconciler.compare(replay_local, RemoteSnapshot(cash, tuple(positions), ()))
+        if not replay_report.safe_to_trade or replay_report.cash_delta != ZERO:
+            return frozenset()
+    except (ArithmeticError, KeyError, OSError, TypeError, ValueError):
+        return frozenset()
+    return frozenset({target.event_id})
 
 
 def normalize_stream_event(event: Any) -> NormalizedStreamEvent:
@@ -482,9 +825,24 @@ class StreamEventProcessor:
             row for row in events
             if row.event_type == "user.trade" and row.payload.get("id") == trade_id
         ]
-        if len(persisted_trades) != 1:
+        if not persisted_trades:
             return frozenset()
         persisted = persisted_trades[0]
+        canonical = dict(persisted.payload)
+        canonical_market = canonical.pop("market", None)
+        for duplicate in persisted_trades[1:]:
+            duplicate_payload = dict(duplicate.payload)
+            duplicate_market = duplicate_payload.pop("market", None)
+            if (
+                duplicate_payload != canonical
+                or (canonical_market is not None and duplicate_market is not None
+                    and canonical_market != duplicate_market)
+            ):
+                return frozenset()
+            if canonical_market is None and duplicate_market is not None:
+                canonical_market = duplicate_market
+        if canonical_market not in (None, evidence.get("condition_id")):
+            return frozenset()
         persisted_makers = persisted.payload.get("maker_orders")
         matching_makers = [
             row for row in persisted_makers
@@ -559,6 +917,12 @@ class StreamEventProcessor:
             ids = payload.get("resolved_event_ids")
             if payload.get("resolution") == "verified_legacy_fee_history_reconciliation":
                 resolved.update(self._validated_legacy_fee_resolution(event, events, by_id))
+                continue
+            if payload.get("resolution") == "corrected_duplicate_trade_replay":
+                resolved.update(_validated_duplicate_replay_resolution(event, events, resolved, self.ledger))
+                continue
+            if payload.get("resolution") == "corrected_duplicate_batch_replay_v1":
+                resolved.update(_validated_duplicate_batch_replay_resolution(event, events, resolved, self.ledger))
                 continue
             if (
                 payload.get("resolution") != "verified_zero_fee_managed_maker"
@@ -934,6 +1298,179 @@ class StreamEventProcessor:
             accepted=True,
             reason=f"appended audited resolution for {len(resolved_ids)} fee-only latch events",
         )
+
+    def resolve_corrected_duplicate_batch_latch(
+        self, *, remote: RemoteSnapshot, reconciler: Reconciler,
+        account_snapshot_fetched_at: datetime, history_proof: Mapping[str, Any],
+    ) -> ProcessResult:
+        """Append a v1 all-groups proof; caller must supply an authenticated account read."""
+        if not isinstance(remote, RemoteSnapshot) or remote.open_orders:
+            raise ValueError("fresh full account snapshot without open orders is required")
+        try:
+            state = json.loads((self.ledger.path.parent / "live_state.json").read_text(encoding="utf-8"))
+            baseline = Decimal(str(state["baseline_cash"]))
+            expected = _corrected_duplicate_resolution_reconciler(state)
+        except (OSError, KeyError, TypeError, ValueError, ArithmeticError) as exc:
+            raise ValueError("persisted session baseline is unavailable") from exc
+        if (not baseline.is_finite() or baseline < ZERO or not isinstance(reconciler, Reconciler)
+                or reconciler.external_condition_ids != expected.external_condition_ids
+                or reconciler.cash_tolerance != expected.cash_tolerance
+                or reconciler.cost_tolerance != expected.cost_tolerance
+                or reconciler.allow_cash_inflows != expected.allow_cash_inflows):
+            raise ValueError("resolver policy differs from persisted strict policy")
+        if (not isinstance(account_snapshot_fetched_at, datetime)
+                or account_snapshot_fetched_at.tzinfo is None
+                or account_snapshot_fetched_at.utcoffset() is None):
+            raise ValueError("timestamped account snapshot is required")
+        fetched_at = account_snapshot_fetched_at.astimezone(timezone.utc)
+        if not timedelta(0) <= datetime.now(timezone.utc) - fetched_at <= timedelta(seconds=120):
+            raise ValueError("account snapshot is stale")
+        events = tuple(self.ledger.events())
+        blockers = [row for row in events if row.event_type == "stream.reconciliation_required"
+                    and row.event_id not in self._resolved_reconciliation_event_ids]
+        if (len(blockers) != 1 or blockers[0].payload.get("reason") !=
+                "confirmed fill chronology or ledger association is invalid"):
+            raise ValueError("exactly one chronology latch is required")
+        latch_index = next(i for i, row in enumerate(events) if row.event_id == blockers[0].event_id)
+        groups = _duplicate_chronology_groups(events, latch_index)
+        if not _valid_batch_history_proof(history_proof, groups, state, fetched_at, datetime.now(timezone.utc)):
+            raise ValueError("complete trade/cash-flow history proof is missing or stale")
+        from .live_accounting import confirmed_fills
+        fills = confirmed_fills(self)
+        if any(len(matches := [fill for fill in fills if fill.trade_id == group["trade_id"]]) != 1
+               or matches[0].ledger_index != group["first_ledger_index"]
+               or matches[0].order_id != group["managed_order_id"] for group in groups):
+            raise ValueError("duplicate groups do not have exact first-row managed fills")
+        from .live_runner import local_snapshot
+        local = local_snapshot(self, baseline)
+        report = expected.compare(local, remote)
+        if not report.safe_to_trade or report.cash_delta != ZERO:
+            raise ValueError("account reconciliation is unsafe or cash differs")
+        candidate = LedgerEvent.create("stream.reconciliation_resolved", {
+            "resolution": "corrected_duplicate_batch_replay_v1",
+            "resolved_event_ids": [blockers[0].event_id],
+            "evidence": {"version": 1, "groups": groups, "history_proof": dict(history_proof),
+                         "account_reconciliation_safe": True,
+                         "cash_delta": str(report.cash_delta),
+                         "account_snapshot": _remote_snapshot_payload(remote),
+                         "account_snapshot_sha256": remote_snapshot_sha256(remote),
+                         "account_snapshot_fetched_at": fetched_at.isoformat(),
+                         "baseline_cash": str(baseline),
+                         "local_snapshot_sha256": _local_snapshot_sha256(local),
+                         "cash_tolerance": str(expected.cash_tolerance),
+                         "cost_tolerance": str(expected.cost_tolerance),
+                         "allow_cash_inflows": expected.allow_cash_inflows,
+                         "external_condition_ids": sorted(expected.external_condition_ids)},
+        })
+        if _validated_duplicate_batch_replay_resolution(candidate, events + (candidate,),
+                set(self._resolved_reconciliation_event_ids), self.ledger) != frozenset({blockers[0].event_id}):
+            raise ValueError("candidate batch proof failed durable replay validation")
+        self.ledger.append_if_unchanged(candidate, event_count=len(events), last_event_id=events[-1].event_id)
+        return ProcessResult(True, reason="appended audited duplicate-batch chronology resolution")
+
+    def _resolve_corrected_duplicate_trade_latch(
+        self, *, remote: RemoteSnapshot, reconciler: Reconciler,
+        trade_id: str, account_snapshot_fetched_at: datetime,
+    ) -> ProcessResult:
+        """Resolve a chronology latch using fresh account evidence and a ledger-rebuilt local snapshot."""
+        if not isinstance(remote, RemoteSnapshot):
+            raise ValueError("fresh account snapshot is required")
+        try:
+            state = json.loads((self.ledger.path.parent / "live_state.json").read_text(encoding="utf-8"))
+            if not isinstance(state, Mapping):
+                raise ValueError("persisted live state must be an object")
+            baseline_cash = Decimal(str(state["baseline_cash"]))
+            expected_reconciler = _corrected_duplicate_resolution_reconciler(state)
+        except (OSError, KeyError, TypeError, ValueError, ArithmeticError) as exc:
+            raise ValueError("persisted session reconciliation baseline is unavailable or invalid") from exc
+        if not baseline_cash.is_finite() or baseline_cash < ZERO:
+            raise ValueError("persisted session cash baseline must be finite and non-negative")
+        if (not isinstance(reconciler, Reconciler)
+                or reconciler.external_condition_ids != expected_reconciler.external_condition_ids
+                or reconciler.cash_tolerance != expected_reconciler.cash_tolerance
+                or reconciler.cost_tolerance != expected_reconciler.cost_tolerance
+                or reconciler.allow_cash_inflows != expected_reconciler.allow_cash_inflows):
+            raise ValueError("resolver reconciliation policy must match the persisted fail-closed policy")
+        reconciler = expected_reconciler
+        if (not isinstance(account_snapshot_fetched_at, datetime) or account_snapshot_fetched_at.tzinfo is None
+                or account_snapshot_fetched_at.utcoffset() is None):
+            raise ValueError("timestamped fresh account snapshot is required")
+        fetched_at = account_snapshot_fetched_at.astimezone(timezone.utc)
+        age = (datetime.now(timezone.utc) - fetched_at).total_seconds()
+        if age < 0 or age > 120:
+            raise ValueError("account snapshot is not fresh")
+        if remote.open_orders:
+            raise ValueError("account snapshot has open orders")
+        from .live_runner import local_snapshot
+        local = local_snapshot(self, baseline_cash)
+        report = reconciler.compare(local, remote)
+        if not report.safe_to_trade or report.cash_delta != ZERO:
+            raise ValueError("account reconciliation is unsafe or cash does not match exactly")
+        events = tuple(self.ledger.events())
+        latches = [e for e in events if e.event_type == "stream.reconciliation_required" and e.event_id not in self._resolved_reconciliation_event_ids]
+        if len(latches) != 1 or latches[0].payload.get("reason") != "confirmed fill chronology or ledger association is invalid":
+            raise ValueError("only the single corrected duplicate-replay chronology latch is eligible")
+        trade_rows = [e for e in events if e.event_type == "user.trade" and e.payload.get("id") == trade_id and e.payload.get("status") == "CONFIRMED"]
+        if len(trade_rows) < 2:
+            raise ValueError("confirmed duplicate trade rows are required")
+        latch_index = next(i for i, e in enumerate(events) if e.event_id == latches[0].event_id)
+        groups = _duplicate_chronology_groups(events, latch_index)
+        if len(groups) != 1 or groups[0]["trade_id"] != trade_id:
+            raise ValueError("single-trade resolution cannot clear a batch chronology latch")
+        if max(i for i, e in enumerate(events) if e.event_id in {row.event_id for row in trade_rows}) >= latch_index:
+            raise ValueError("duplicate trade rows must precede the chronology latch")
+        canonical = dict(trade_rows[0].payload)
+        market = canonical.pop("market", None)
+        for row in trade_rows[1:]:
+            duplicate = dict(row.payload)
+            duplicate_market = duplicate.pop("market", None)
+            if canonical != duplicate or (market is not None and duplicate_market is not None and market != duplicate_market):
+                raise ValueError("duplicate trade rows conflict")
+            market = market or duplicate_market
+        makers = trade_rows[0].payload.get("maker_orders")
+        if not isinstance(makers, (list, tuple)) or len(makers) != 1 or not isinstance(makers[0], Mapping):
+            raise ValueError("duplicate trade must have exactly one explicit maker association")
+        maker = makers[0]
+        order_id = maker.get("order_id", maker.get("id"))
+        if not isinstance(order_id, str) or order_id not in self.orders:
+            raise ValueError("duplicate trade maker must bind to one managed order")
+        taker_id = trade_rows[0].payload.get("taker_order_id")
+        if isinstance(taker_id, str) and taker_id in self.orders:
+            raise ValueError("taker-side managed trades are not eligible for this resolution")
+        accepted = [e for e in events if e.event_type == "order.accepted" and e.payload.get("order_id") == order_id]
+        accepted_index = next((i for i, event in enumerate(events) if accepted and event.event_id == accepted[0].event_id), -1)
+        first_trade_index = min(i for i, event in enumerate(events) if event.event_id in {row.event_id for row in trade_rows})
+        if (len(accepted) != 1 or accepted_index < 0 or accepted_index >= first_trade_index
+                or accepted[0].payload.get("condition_id") != market
+                or accepted[0].payload.get("token_id") != maker.get("asset_id")
+                or accepted[0].payload.get("side") != maker.get("side")
+                or trade_rows[0].payload.get("asset_id") != maker.get("asset_id")
+                or trade_rows[0].payload.get("side") == maker.get("side")):
+            raise ValueError("duplicate trade identity does not match its unique managed maker order")
+        if any(_venue_match_time(row.payload) is None for row in trade_rows):
+            raise ValueError("duplicate trade rows require explicit venue match time")
+        from .live_accounting import confirmed_fills
+        fills = confirmed_fills(self)
+        if len([fill for fill in fills if fill.trade_id == trade_id]) != 1:
+            raise ValueError("corrected trade replay is not uniquely accounted")
+        snapshot = _remote_snapshot_payload(remote)
+        digest = remote_snapshot_sha256(remote)
+        self.ledger.append(LedgerEvent.create("stream.reconciliation_resolved", {
+            "resolution": "corrected_duplicate_trade_replay", "resolved_event_ids": [latches[0].event_id],
+            "evidence": {"trade_id": trade_id, "duplicate_rows": len(trade_rows),
+                         "duplicate_event_ids": [row.event_id for row in trade_rows],
+                         "account_reconciliation_safe": True, "cash_delta": str(report.cash_delta),
+                         "account_snapshot": snapshot,
+                         "account_snapshot_sha256": digest,
+                         "account_snapshot_fetched_at": fetched_at.isoformat(),
+                         "baseline_cash": str(baseline_cash),
+                         "local_snapshot_sha256": _local_snapshot_sha256(local),
+                         "cash_tolerance": str(reconciler.cash_tolerance),
+                         "cost_tolerance": str(reconciler.cost_tolerance),
+                         "allow_cash_inflows": reconciler.allow_cash_inflows,
+                         "external_condition_ids": sorted(reconciler.external_condition_ids)},
+        }))
+        return ProcessResult(True, reason="appended audited duplicate-replay chronology resolution")
 
     def resolve_legacy_fee_latches_after_reconciliation(
         self,

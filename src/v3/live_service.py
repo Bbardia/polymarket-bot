@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -110,9 +111,48 @@ class LiveOrderService:
         if mismatches:
             raise ValueError("risk engine limits do not match live settings: " + ", ".join(mismatches))
 
+        resolver = reconciler or Reconciler(
+            cash_tolerance=ZERO, cost_tolerance=Decimal("0.01"), allow_cash_inflows=False,
+        )
+        if (type(resolver) is not Reconciler or resolver.cash_tolerance != ZERO
+                or not isinstance(resolver.cost_tolerance, Decimal)
+                or not resolver.cost_tolerance.is_finite() or resolver.cost_tolerance < ZERO
+                or resolver.cost_tolerance > Decimal("0.01")
+                or resolver.allow_cash_inflows is not False):
+            raise ValueError("live service requires strict cash reconciliation and cost tolerance at most 0.01")
+        expected_external_ids = frozenset()
+        persisted_state: dict[str, Any] | None = None
+        if not ledger._in_memory:
+            try:
+                persisted = json.loads((ledger.path.parent / "live_state.json").read_text(encoding="utf-8"))
+                if not isinstance(persisted, dict):
+                    raise ValueError("persisted live state is invalid")
+                persisted_state = persisted
+                raw_external_ids = persisted.get("external_condition_ids")
+                if (not isinstance(raw_external_ids, list)
+                        or any(not isinstance(item, str) or not item for item in raw_external_ids)
+                        or len(set(raw_external_ids)) != len(raw_external_ids)):
+                    raise ValueError("persisted external condition IDs are invalid")
+                expected_external_ids = frozenset(raw_external_ids)
+            except (OSError, TypeError, ValueError) as exc:
+                raise ValueError("live service requires a valid persisted account baseline") from exc
+        if resolver.external_condition_ids != expected_external_ids:
+            raise ValueError("reconciler external positions must match the persisted account baseline")
+        if persisted_state is not None:
+            try:
+                stored_baseline = Decimal(str(persisted_state["baseline_cash"]))
+                stored_epoch = persisted_state["baseline_epoch"]
+            except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+                raise ValueError("persisted cash/time baseline is invalid") from exc
+            if (not stored_baseline.is_finite() or stored_baseline < ZERO
+                    or type(stored_epoch) is not int or stored_epoch < 0
+                    or type(trade_history_after) is not int or trade_history_after != stored_epoch
+                    or baseline_cash != stored_baseline):
+                raise ValueError("service cash/history baselines must match persisted live state")
+
         client = await api.initialize_secure_client()
         executor = V3OrderExecutor(SDKExecutionAdapter(client), risk_engine, ledger, settings=settings)
-        service = cls(api, executor, risk_engine, ledger, reconciler or Reconciler())
+        service = cls(api, executor, risk_engine, ledger, resolver)
         service._trade_history_after = trade_history_after
         service._baseline_cash = baseline_cash
         await service.recover_trade_history(
