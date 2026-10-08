@@ -32,7 +32,7 @@ from typing import Any, Callable
 from .api import UnifiedPolymarketAPI
 from .config import V3Settings, _env_bool
 from .ledger import EventLedger
-from .live_service import LiveOrderService, LiveRiskContext
+from .live_service import LiveOrderService, LiveRiskContext, bot_equity
 from .live_shadow import (
     LiveShadowRunner,
     LiveShadowSettings,
@@ -338,15 +338,15 @@ def baseline_from(remote: RemoteSnapshot, now: datetime, configured_external: fr
             "account has open orders at baseline; cancel them or let them expire before the first live start"
         )
     equity = remote.cash + sum((p.current_value for p in remote.positions), ZERO)
+    external = {p.condition_id for p in remote.positions} | set(configured_external)
     return {
         "baseline_at": now.isoformat(),
         "baseline_epoch": int(now.timestamp()),
         "baseline_cash": str(remote.cash),
         "baseline_equity": str(equity),
-        "external_condition_ids": sorted(
-            {p.condition_id for p in remote.positions} | set(configured_external)
-        ),
-        "peak_equity": str(equity),
+        "external_condition_ids": sorted(external),
+        # Risk peak tracks bot equity only; every baseline position is external.
+        "peak_equity": str(bot_equity(remote, frozenset(external))),
         "event_orders": {},
     }
 
@@ -640,7 +640,7 @@ class LiveTradingRunner(LiveShadowRunner):
             status["lifecycle_reconciliation_required"] = True
             status["lifecycle_reconciliation_reasons"] = list(processor.reconciliation_reasons)
 
-        equity = remote.cash + sum((p.current_value for p in remote.positions), ZERO)
+        equity = bot_equity(remote, self.reconciler.external_condition_ids)
         if self.state.get("day") != today:
             self.state["day"] = today
             self.state["day_start_equity"] = str(equity)
@@ -684,7 +684,7 @@ class LiveTradingRunner(LiveShadowRunner):
                     entry_block = pending_reason
                 if auto_records:
                     processor = StreamEventProcessor(self.ledger)
-                    equity = remote.cash + sum((p.current_value for p in remote.positions), ZERO)
+                    equity = bot_equity(remote, self.reconciler.external_condition_ids)
                     peak = max(Decimal(self.state["peak_equity"]), equity)
                     daily_pnl = equity - Decimal(self.state["day_start_equity"])
                     self.state["peak_equity"] = str(peak)
@@ -828,9 +828,7 @@ class LiveTradingRunner(LiveShadowRunner):
                 final_report = self.reconciler.compare(final_local, final_remote)
                 if final_report.invalid_snapshot:
                     raise ValueError("post-cycle account snapshot failed validation")
-                final_equity = final_remote.cash + sum(
-                    (position.current_value for position in final_remote.positions), ZERO,
-                )
+                final_equity = bot_equity(final_remote, self.reconciler.external_condition_ids)
                 prior_peak = Decimal(self.state["peak_equity"])
                 day_start_equity = Decimal(self.state["day_start_equity"])
                 if (

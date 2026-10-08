@@ -1489,7 +1489,8 @@ def test_real_live_service_processes_every_candidate_but_honors_open_order_cap(
     assert status["limits"]["max_open_orders"] == 2
 
 
-def test_real_service_refreshes_daily_loss_before_each_candidate_submission(tmp_path, monkeypatch):
+def test_real_service_external_value_drop_never_moves_daily_loss(tmp_path, monkeypatch):
+    """A pre-bot holding losing value is not a bot loss and must not trip the daily limit."""
     from src.v3.live_runner import _start
     from src.v3 import live_runner
 
@@ -1521,10 +1522,12 @@ def test_real_service_refreshes_daily_loss_before_each_candidate_submission(tmp_
 
     status = asyncio.run(runner.run_cycle())
 
-    assert status["outcomes_this_cycle"] == {"accepted": 1, "rejected": 4}, status
-    assert len(api.created) == 1
-    assert status["daily_pnl"] == D("-10")
-    assert status["entry_block_reason"] == "daily loss limit reached after submission"
+    assert store.load_state()["peak_equity"] == "90"
+    assert store.load_state()["day_start_equity"] == "90"
+    assert status["outcomes_this_cycle"] == {"accepted": 5}, status
+    assert len(api.created) == 5
+    assert status["daily_pnl"] == D("0")
+    assert status["entry_block_reason"] is None
     assert status["reconciliation"]["safe_to_trade"] is True
 
 
@@ -1565,7 +1568,8 @@ def test_malformed_persisted_risk_baseline_blocks_before_account_reads(
     assert service.submitted == []
 
 
-def test_real_service_carries_intracycle_peak_for_drawdown_fraction(tmp_path, monkeypatch):
+def test_real_service_external_value_swing_never_moves_peak_or_drawdown(tmp_path, monkeypatch):
+    """An external rally must not raise the peak, so its later fall is not a bot drawdown."""
     from src.v3.live_runner import _start
     from src.v3 import live_runner
 
@@ -1598,12 +1602,13 @@ def test_real_service_carries_intracycle_peak_for_drawdown_fraction(tmp_path, mo
 
     status = asyncio.run(runner.run_cycle())
 
-    assert status["outcomes_this_cycle"] == {"accepted": 2, "rejected": 3}, status
-    assert len(api.created) == 2
-    assert status["peak_equity"] == D("110")
-    assert status["equity"] == D("105")
-    assert status["drawdown"] == D("5")
-    assert status["entry_block_reason"] == "maximum drawdown reached after submission"
+    assert status["outcomes_this_cycle"] == {"accepted": 5}, status
+    assert len(api.created) == 5
+    assert status["peak_equity"] == D("90")
+    assert status["equity"] == D("90")
+    assert status["drawdown"] == D("0")
+    assert status["daily_pnl"] == D("0")
+    assert status["entry_block_reason"] is None
 
 
 @pytest.mark.parametrize("bad_cash", ["NaN", "Infinity", "-1", "0"])

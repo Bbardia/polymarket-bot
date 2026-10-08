@@ -13,7 +13,7 @@ from typing import Any
 from .config import V3Settings
 from .execution import ExecutionResult, V3OrderExecutor
 from .ledger import EventLedger, LedgerEvent
-from .reconciliation import LocalSnapshot, Reconciler, RemoteSnapshot
+from .reconciliation import LocalSnapshot, Reconciler, RemoteSnapshot, _quantity_matches
 from .risk import AccountRiskState, OrderIntent, RiskEngine
 from .streaming import StreamEventProcessor
 from .sdk_execution_adapter import SDKExecutionAdapter
@@ -22,6 +22,14 @@ ZERO = Decimal("0")
 TRADE_HISTORY_MAX_ITEMS = 10_000
 TRADE_HISTORY_PAGE_LIMIT = 100
 TRADE_HISTORY_TIMEOUT_SECONDS = 30.0
+
+
+def bot_equity(remote: RemoteSnapshot, external_condition_ids: frozenset[str]) -> Decimal:
+    """Cash plus bot-managed positions; external (pre-bot) holdings never move risk limits."""
+    return remote.cash + sum(
+        (p.current_value for p in remote.positions if p.condition_id not in external_condition_ids),
+        ZERO,
+    )
 
 
 @dataclass
@@ -40,8 +48,8 @@ class LiveRiskContext:
         ):
             raise ValueError("day-start equity must be finite and positive")
 
-    def refresh_from_remote(self, remote: RemoteSnapshot) -> None:
-        equity = remote.cash + sum((position.current_value for position in remote.positions), ZERO)
+    def refresh_from_remote(self, remote: RemoteSnapshot, *, external_condition_ids: frozenset[str]) -> None:
+        equity = bot_equity(remote, external_condition_ids)
         if not equity.is_finite() or equity <= ZERO:
             raise ValueError("remote equity is invalid for risk evaluation")
         self.peak_equity = max(self.peak_equity, equity)
@@ -205,10 +213,10 @@ class LiveOrderService:
                 or initial_value is None or not initial_value.is_finite() or initial_value < ZERO
             ):
                 raise ValueError("remote position is incomplete or invalid")
-            position_value += position.current_value
             if position.condition_id in external:
-                # Pre-bot/manual holdings count toward equity, not bot exposure.
+                # Pre-bot/manual holdings count toward neither bot equity nor exposure.
                 continue
+            position_value += position.current_value
             if position.redeemable:
                 # Resolved: remaining risk is only the unredeemed payout value.
                 exposure_basis = position.current_value
@@ -343,6 +351,13 @@ class LiveOrderService:
                 "unresolved_submission_count": len(unresolved),
             }))
             return ExecutionResult(False, "unresolved prior submission requires manual reconciliation")
+        if intent.side == "BUY" and intent.condition_id in self._reconciler.external_condition_ids:
+            self._ledger.append(LedgerEvent.create("account.preflight.blocked", {
+                "reason": "BUY on external condition",
+                "condition_id": intent.condition_id,
+                "token_id": intent.token_id,
+            }))
+            return ExecutionResult(False, "BUY refused: condition is held outside the bot (external)")
 
         validated_intent, market_block = await self._validated_intent(intent)
         if market_block or validated_intent is None:
@@ -394,7 +409,8 @@ class LiveOrderService:
                 or not isinstance(intent.shares, Decimal) or not intent.shares.is_finite()
                 or intent.shares <= ZERO or intent.shares > quantity
                 or len(matches) != 1 or matches[0].condition_id != intent.condition_id
-                or matches[0].size != quantity
+                or not _quantity_matches(quantity, matches[0].size)
+                or intent.shares > min(matches[0].size, quantity)
                 or managed_conditions != {intent.condition_id}
                 or intent.condition_id in self._reconciler.external_condition_ids
                 or active_order_for_token
@@ -423,7 +439,9 @@ class LiveOrderService:
             return ExecutionResult(False, "account reconciliation blocked order submission")
 
         try:
-            context.refresh_from_remote(remote)
+            context.refresh_from_remote(
+                remote, external_condition_ids=self._reconciler.external_condition_ids,
+            )
             state = self._risk_state(
                 remote, daily_pnl=context.daily_pnl, peak_equity=context.peak_equity,
             )
