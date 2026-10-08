@@ -74,8 +74,9 @@ class LiveRunnerSettings:
             raise ValueError("auto-redeem setting must be boolean")
         if type(self.live_early_exit_enabled) is not bool:
             raise ValueError("live early-exit setting must be boolean")
-        if not self.cost_tolerance.is_finite() or self.cost_tolerance < ZERO:
-            raise ValueError("cost tolerance must be finite and nonnegative")
+        if (not self.cost_tolerance.is_finite() or self.cost_tolerance < ZERO
+                or self.cost_tolerance > Decimal("0.01")):
+            raise ValueError("cost tolerance must be finite, nonnegative and at most 0.01")
         if self.expiry_grace_seconds < 60:
             raise ValueError("expiry grace must be at least 60 seconds")
 
