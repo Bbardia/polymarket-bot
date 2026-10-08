@@ -10,6 +10,7 @@ from src.v3 import live_shadow
 from src.v3.config import V3Settings
 from src.v3.execution import ExecutionResult
 from src.v3.ledger import EventLedger, LedgerEvent
+from src.v3.live_accounting import confirmed_fills
 from src.v3.live_runner import (
     LiveRunnerSettings,
     LiveStore,
@@ -92,6 +93,332 @@ def _apply_maker_fill(processor, *, order_id, side, trade_id, size, price, at):
     }
     result = processor.process(SimpleNamespace(topic="user", type="trade", payload=trade))
     assert result.accepted and not result.requires_reconciliation
+
+
+def test_local_snapshot_deduplicates_identical_trade_rows_with_missing_market(tmp_path):
+    ledger = EventLedger(tmp_path / "duplicate.sqlite")
+    _append_fill_order(ledger, "buy", "BUY", 10)
+    processor = StreamEventProcessor(ledger)
+    _apply_maker_fill(processor, order_id="buy", side="BUY", trade_id="dup",
+                      size=2, price="0.50", at=NOW)
+    original = next(e for e in ledger.events() if e.event_type == "user.trade")
+    duplicate = dict(original.payload)
+    duplicate["market"] = None
+    ledger.append(LedgerEvent.create("user.trade", duplicate, occurred_at=original.occurred_at))
+
+    snapshot = local_snapshot(StreamEventProcessor(ledger), D("100"))
+
+    assert snapshot.position_quantities == {"tok": D("2")}
+    assert snapshot.cash == D("99")
+
+
+def test_duplicate_market_enrichment_preserves_first_fill_chronology(tmp_path):
+    ledger = EventLedger(tmp_path / "chronology-duplicate.sqlite")
+    _append_fill_order(ledger, "buy-a", "BUY", 10)
+    _append_fill_order(ledger, "buy-b", "BUY", 10)
+    processor = StreamEventProcessor(ledger)
+    _apply_maker_fill(processor, order_id="buy-a", side="BUY", trade_id="a",
+                      size=2, price="0.50", at=NOW)
+    original = next(row for row in ledger.events()
+                    if row.event_type == "user.trade" and row.payload["id"] == "a")
+    # Legacy rows can lack market; a later account-history import enriches them.
+    _apply_maker_fill(processor, order_id="buy-b", side="BUY", trade_id="b",
+                      size=2, price="0.50", at=NOW)
+    b = next(row for row in ledger.events()
+             if row.event_type == "user.trade" and row.payload["id"] == "b")
+    legacy = EventLedger(tmp_path / "legacy-chronology.sqlite")
+    _append_fill_order(legacy, "buy-a", "BUY", 10)
+    _append_fill_order(legacy, "buy-b", "BUY", 10)
+    legacy.append(LedgerEvent.create("user.trade", {**original.payload, "market": None}))
+    legacy.append(LedgerEvent.create("user.trade", dict(b.payload)))
+    legacy.append(LedgerEvent.create("user.trade", dict(original.payload)))
+
+    fills = confirmed_fills(StreamEventProcessor(legacy))
+    assert [fill.trade_id for fill in fills] == ["a", "b"]
+
+
+def test_local_snapshot_rejects_conflicting_duplicate_trade_rows(tmp_path):
+    ledger = EventLedger(tmp_path / "conflicting-duplicate.sqlite")
+    _append_fill_order(ledger, "buy", "BUY", 10)
+    processor = StreamEventProcessor(ledger)
+    _apply_maker_fill(processor, order_id="buy", side="BUY", trade_id="dup",
+                      size=2, price="0.50", at=NOW)
+    original = next(e for e in ledger.events() if e.event_type == "user.trade")
+    duplicate = dict(original.payload)
+    duplicate["price"] = "0.51"
+    ledger.append(LedgerEvent.create("user.trade", duplicate, occurred_at=original.occurred_at))
+
+    with pytest.raises(ValueError, match="confirmed fill chronology"):
+        local_snapshot(StreamEventProcessor(ledger), D("100"))
+    assert StreamEventProcessor(ledger).reconciliation_required
+
+
+def _corrected_duplicate_latch_fixture(path, *, duplicate=True, conflict=False, missing_time=False):
+    ledger = EventLedger(path)
+    ledger.path.parent.mkdir(parents=True, exist_ok=True)
+    (ledger.path.parent / "live_state.json").write_text(json.dumps({"baseline_cash": "100", "external_condition_ids": []}), encoding="utf-8")
+    _append_fill_order(ledger, "buy", "BUY", 10)
+    processor = StreamEventProcessor(ledger)
+    _apply_maker_fill(processor, order_id="buy", side="BUY", trade_id="dup",
+                      size=10, price="0.50", at=NOW)
+    if duplicate:
+        original = next(e for e in ledger.events() if e.event_type == "user.trade")
+        row = dict(original.payload)
+        row["market"] = None
+        if conflict:
+            row["price"] = "0.51"
+        if missing_time:
+            row["timestamp"] = None
+        ledger.append(LedgerEvent.create("user.trade", row, occurred_at=original.occurred_at))
+    processor = StreamEventProcessor(ledger)
+    processor.require_reconciliation("confirmed fill chronology or ledger association is invalid")
+    return ledger, processor
+
+
+def _corrected_duplicate_latch_inputs(ledger, processor, *, remote_cash="95"):
+    local = local_snapshot(processor, D("100"))
+    remote = RemoteSnapshot(D(remote_cash), (RemotePosition("cond", "tok", D("10"), D("8"), D("5")),), ())
+    reconciler = Reconciler(cost_tolerance=D("0.01"), cash_tolerance=D("0"))
+    return local, remote, reconciler
+
+
+def test_corrected_duplicate_replay_resolution_persists_and_replays(tmp_path):
+    ledger, processor = _corrected_duplicate_latch_fixture(tmp_path / "resolve-duplicate.sqlite")
+    local, remote, reconciler = _corrected_duplicate_latch_inputs(ledger, processor)
+    result = processor._resolve_corrected_duplicate_trade_latch(
+        remote=remote, reconciler=reconciler, trade_id="dup",
+        account_snapshot_fetched_at=datetime.now(timezone.utc),
+    )
+    replayed = StreamEventProcessor(ledger)
+    assert result.accepted
+    assert not replayed.reconciliation_required
+
+
+def test_corrected_duplicate_resolution_does_not_accept_caller_local_snapshot(tmp_path):
+    ledger, processor = _corrected_duplicate_latch_fixture(tmp_path / "no-caller-local.sqlite")
+    local, remote, reconciler = _corrected_duplicate_latch_inputs(ledger, processor)
+    before = len(tuple(ledger.events()))
+    with pytest.raises(TypeError, match="local"):
+        kwargs = {"remote": remote, "local": local, "reconciler": reconciler,
+                  "trade_id": "dup", "account_snapshot_fetched_at": datetime.now(timezone.utc)}
+        processor._resolve_corrected_duplicate_trade_latch(**kwargs)
+    assert len(tuple(ledger.events())) == before
+
+
+def test_corrected_duplicate_resolution_does_not_accept_caller_cash_baseline(tmp_path):
+    ledger, processor = _corrected_duplicate_latch_fixture(tmp_path / "no-caller-baseline.sqlite")
+    _local, remote, reconciler = _corrected_duplicate_latch_inputs(ledger, processor)
+    before = len(tuple(ledger.events()))
+    with pytest.raises(TypeError, match="baseline_cash"):
+        kwargs = {"remote": remote, "reconciler": reconciler, "trade_id": "dup",
+                  "account_snapshot_fetched_at": datetime.now(timezone.utc), "baseline_cash": D("1")}
+        processor._resolve_corrected_duplicate_trade_latch(**kwargs)
+    assert len(tuple(ledger.events())) == before
+
+
+def test_corrected_duplicate_replay_rechecks_persisted_baseline(tmp_path):
+    ledger, processor = _corrected_duplicate_latch_fixture(tmp_path / "baseline-replay.sqlite")
+    _local, remote, reconciler = _corrected_duplicate_latch_inputs(ledger, processor)
+    processor._resolve_corrected_duplicate_trade_latch(
+        remote=remote, reconciler=reconciler, trade_id="dup",
+        account_snapshot_fetched_at=datetime.now(timezone.utc),
+    )
+    (ledger.path.parent / "live_state.json").write_text(json.dumps({"baseline_cash": "101"}), encoding="utf-8")
+    assert StreamEventProcessor(ledger).reconciliation_required
+
+
+def test_corrected_duplicate_replay_recomputes_local_snapshot_evidence(tmp_path, monkeypatch):
+    ledger, processor = _corrected_duplicate_latch_fixture(tmp_path / "local-digest.sqlite")
+    _local, remote, reconciler = _corrected_duplicate_latch_inputs(ledger, processor)
+    append = ledger.append
+
+    def tampered(event):
+        if event.event_type == "stream.reconciliation_resolved":
+            payload = dict(event.payload)
+            evidence = dict(payload["evidence"])
+            evidence["local_snapshot_sha256"] = "0" * 64
+            payload["evidence"] = evidence
+            event = LedgerEvent.create(event.event_type, payload, event_id=event.event_id, occurred_at=event.occurred_at)
+        return append(event)
+
+    monkeypatch.setattr(ledger, "append", tampered)
+    processor._resolve_corrected_duplicate_trade_latch(
+        remote=remote, reconciler=reconciler, trade_id="dup",
+        account_snapshot_fetched_at=datetime.now(timezone.utc),
+    )
+    assert StreamEventProcessor(ledger).reconciliation_required
+
+
+def test_corrected_duplicate_replay_rejects_permissive_policy_evidence(tmp_path, monkeypatch):
+    ledger, processor = _corrected_duplicate_latch_fixture(tmp_path / "policy-digest.sqlite")
+    _local, remote, reconciler = _corrected_duplicate_latch_inputs(ledger, processor)
+    append = ledger.append
+
+    def tampered(event):
+        if event.event_type == "stream.reconciliation_resolved":
+            payload = dict(event.payload)
+            evidence = dict(payload["evidence"])
+            evidence.update({
+                "external_condition_ids": ["cond"], "cash_tolerance": "1000",
+                "cost_tolerance": "1000", "allow_cash_inflows": True,
+            })
+            payload["evidence"] = evidence
+            event = LedgerEvent.create(event.event_type, payload, event_id=event.event_id, occurred_at=event.occurred_at)
+        return append(event)
+
+    monkeypatch.setattr(ledger, "append", tampered)
+    processor._resolve_corrected_duplicate_trade_latch(
+        remote=remote, reconciler=reconciler, trade_id="dup",
+        account_snapshot_fetched_at=datetime.now(timezone.utc),
+    )
+    assert StreamEventProcessor(ledger).reconciliation_required
+
+
+def test_corrected_duplicate_resolution_refuses_unsafe_account_or_open_orders(tmp_path):
+    ledger, processor = _corrected_duplicate_latch_fixture(tmp_path / "unsafe-duplicate.sqlite")
+    local, remote, reconciler = _corrected_duplicate_latch_inputs(ledger, processor, remote_cash="94")
+    before = len(tuple(ledger.events()))
+    with pytest.raises(ValueError, match="unsafe"):
+        processor._resolve_corrected_duplicate_trade_latch(
+            remote=remote, reconciler=reconciler, trade_id="dup",
+            account_snapshot_fetched_at=datetime.now(timezone.utc),
+        )
+    open_remote = RemoteSnapshot(D("95"), remote.positions, (RemoteOrder("open", "cond", "tok", D("1")),))
+    with pytest.raises(ValueError, match="open orders"):
+        processor._resolve_corrected_duplicate_trade_latch(
+            remote=open_remote, reconciler=reconciler, trade_id="dup",
+            account_snapshot_fetched_at=datetime.now(timezone.utc),
+        )
+    assert len(tuple(ledger.events())) == before
+
+
+def test_corrected_duplicate_resolution_refuses_conflicting_or_missing_time_rows(tmp_path):
+    for label, kwargs in (("conflict", {"conflict": True}), ("missing-time", {"missing_time": True})):
+        ledger, processor = _corrected_duplicate_latch_fixture(tmp_path / f"{label}.sqlite", **kwargs)
+        with pytest.raises(ValueError):
+            local = local_snapshot(processor, D("100"))
+            remote = RemoteSnapshot(D("95"), (RemotePosition("cond", "tok", D("10"), D("8"), D("5")),), ())
+            processor._resolve_corrected_duplicate_trade_latch(
+                remote=remote, reconciler=Reconciler(cost_tolerance=D("0.01"), cash_tolerance=D("0")),
+                trade_id="dup", account_snapshot_fetched_at=datetime.now(timezone.utc),
+            )
+        assert StreamEventProcessor(ledger).reconciliation_required
+
+
+def test_corrected_duplicate_resolution_never_clears_other_manual_latches(tmp_path):
+    ledger, processor = _corrected_duplicate_latch_fixture(tmp_path / "other-latch.sqlite")
+    processor.require_reconciliation("incomplete early-exit SELL requires manual reconciliation")
+    local, remote, reconciler = _corrected_duplicate_latch_inputs(ledger, processor)
+    before = len(tuple(ledger.events()))
+    with pytest.raises(ValueError, match="single corrected duplicate-replay"):
+        processor._resolve_corrected_duplicate_trade_latch(
+            remote=remote, reconciler=reconciler, trade_id="dup",
+            account_snapshot_fetched_at=datetime.now(timezone.utc),
+        )
+    assert len(tuple(ledger.events())) == before
+    assert StreamEventProcessor(ledger).reconciliation_required
+
+
+def test_corrected_duplicate_resolution_rejects_stale_and_future_account_snapshots(tmp_path):
+    for label, fetched in (("stale", datetime.now(timezone.utc) - timedelta(seconds=121)),
+                           ("future", datetime.now(timezone.utc) + timedelta(seconds=1))):
+        ledger, processor = _corrected_duplicate_latch_fixture(tmp_path / f"{label}.sqlite")
+        local, remote, reconciler = _corrected_duplicate_latch_inputs(ledger, processor)
+        before = len(tuple(ledger.events()))
+        with pytest.raises(ValueError, match="fresh"):
+            processor._resolve_corrected_duplicate_trade_latch(
+                remote=remote, reconciler=reconciler, trade_id="dup",
+                account_snapshot_fetched_at=fetched,
+            )
+        assert len(tuple(ledger.events())) == before
+
+
+def test_corrected_duplicate_resolution_refuses_managed_taker_association(tmp_path):
+    ledger = EventLedger(tmp_path / "managed-taker.sqlite")
+    (ledger.path.parent / "live_state.json").write_text(json.dumps({"baseline_cash": "100", "external_condition_ids": []}), encoding="utf-8")
+    _append_fill_order(ledger, "buy", "BUY", 10)
+    processor = StreamEventProcessor(ledger)
+    trade = {
+        "id": "taker-dup", "taker_order_id": "buy", "market": "cond", "asset_id": "tok",
+        "side": "BUY", "size": "10", "price": "0.50", "status": "CONFIRMED",
+        "fee_rate_bps": "0", "timestamp": NOW.isoformat(),
+        "maker_orders": [{"order_id": "external", "asset_id": "tok", "side": "SELL",
+                           "matched_amount": "10", "price": "0.50", "fee_rate_bps": "0"}],
+    }
+    assert processor.process(SimpleNamespace(topic="user", type="trade", payload=trade)).accepted
+    duplicate = dict(trade)
+    duplicate["market"] = None
+    ledger.append(LedgerEvent.create("user.trade", duplicate))
+    processor = StreamEventProcessor(ledger)
+    processor.require_reconciliation("confirmed fill chronology or ledger association is invalid")
+    local = local_snapshot(processor, D("100"))
+    remote = RemoteSnapshot(D("95"), (RemotePosition("cond", "tok", D("10"), D("8"), D("5")),), ())
+    with pytest.raises(ValueError, match="managed order"):
+        processor._resolve_corrected_duplicate_trade_latch(
+            remote=remote, reconciler=Reconciler(cost_tolerance=D("0.01"), cash_tolerance=D("0")),
+            trade_id="taker-dup", account_snapshot_fetched_at=datetime.now(timezone.utc),
+        )
+
+
+def test_corrected_duplicate_resolution_refuses_extra_unmanaged_maker(tmp_path):
+    ledger = EventLedger(tmp_path / "extra-maker.sqlite")
+    (ledger.path.parent / "live_state.json").write_text(json.dumps({"baseline_cash": "100", "external_condition_ids": []}), encoding="utf-8")
+    _append_fill_order(ledger, "buy", "BUY", 10)
+    processor = StreamEventProcessor(ledger)
+    trade = {
+        "id": "maker-dup", "taker_order_id": "external", "market": "cond", "asset_id": "tok",
+        "side": "SELL", "size": "10", "price": "0.50", "status": "CONFIRMED",
+        "fee_rate_bps": "0", "timestamp": NOW.isoformat(),
+        "maker_orders": [
+            {"order_id": "buy", "asset_id": "tok", "side": "BUY", "matched_amount": "10", "price": "0.50", "fee_rate_bps": "0"},
+            {"order_id": "other", "asset_id": "other-token", "side": "SELL", "matched_amount": "1", "price": "0.30", "fee_rate_bps": "0"},
+        ],
+    }
+    assert processor.process(SimpleNamespace(topic="user", type="trade", payload=trade)).accepted
+    duplicate = dict(trade)
+    duplicate["market"] = None
+    ledger.append(LedgerEvent.create("user.trade", duplicate))
+    processor = StreamEventProcessor(ledger)
+    processor.require_reconciliation("confirmed fill chronology or ledger association is invalid")
+    local = local_snapshot(processor, D("100"))
+    remote = RemoteSnapshot(D("95"), (RemotePosition("cond", "tok", D("10"), D("8"), D("5")),), ())
+    with pytest.raises(ValueError, match="exactly one explicit maker"):
+        processor._resolve_corrected_duplicate_trade_latch(
+            remote=remote, reconciler=Reconciler(cost_tolerance=D("0.01"), cash_tolerance=D("0")),
+            trade_id="maker-dup", account_snapshot_fetched_at=datetime.now(timezone.utc),
+        )
+
+
+def test_corrected_duplicate_resolution_refuses_nonduplicate_latch(tmp_path):
+    ledger, processor = _corrected_duplicate_latch_fixture(tmp_path / "not-duplicate.sqlite", duplicate=False)
+    local, remote, reconciler = _corrected_duplicate_latch_inputs(ledger, processor)
+    with pytest.raises(ValueError, match="duplicate"):
+        processor._resolve_corrected_duplicate_trade_latch(
+            remote=remote, reconciler=reconciler, trade_id="dup",
+            account_snapshot_fetched_at=datetime.now(timezone.utc),
+        )
+
+
+def test_corrected_duplicate_resolution_rejects_tampered_snapshot_digest(tmp_path, monkeypatch):
+    ledger, processor = _corrected_duplicate_latch_fixture(tmp_path / "tampered-duplicate.sqlite")
+    local, remote, reconciler = _corrected_duplicate_latch_inputs(ledger, processor)
+    append = ledger.append
+
+    def tampered(event):
+        if event.event_type == "stream.reconciliation_resolved":
+            payload = dict(event.payload)
+            evidence = dict(payload["evidence"])
+            evidence["account_snapshot_sha256"] = "0" * 64
+            payload["evidence"] = evidence
+            event = LedgerEvent.create(event.event_type, payload, event_id=event.event_id, occurred_at=event.occurred_at)
+        return append(event)
+
+    monkeypatch.setattr(ledger, "append", tampered)
+    processor._resolve_corrected_duplicate_trade_latch(
+        remote=remote, reconciler=reconciler, trade_id="dup",
+        account_snapshot_fetched_at=datetime.now(timezone.utc),
+    )
+    assert StreamEventProcessor(ledger).reconciliation_required
 
 
 def test_local_snapshot_replays_interleaved_fills_chronologically(tmp_path):
@@ -274,6 +601,25 @@ def _runner(tmp_path, monkeypatch, *, api=None, service=None, evaluations=None, 
         weather_client=None, forecast=None, observation_provider=None,
     )
     return runner, store
+
+
+def test_runner_resolution_fetches_account_snapshot_from_api(tmp_path, monkeypatch):
+    api = _API(cash="95", positions=(RemotePosition("cond", "tok", D("10"), D("8"), D("5")),))
+    state = {
+        "baseline_at": NOW.isoformat(), "baseline_epoch": int(NOW.timestamp()),
+        "baseline_cash": "100", "baseline_equity": "100", "external_condition_ids": [],
+        "peak_equity": "100", "event_orders": {},
+    }
+    runner, _store = _runner(tmp_path / "runner", monkeypatch, api=api, state=state)
+    source, _processor = _corrected_duplicate_latch_fixture(tmp_path / "source" / "ledger.sqlite")
+    for event in source.events():
+        runner.ledger.append(event)
+
+    result = asyncio.run(runner.resolve_corrected_duplicate_trade_latch("dup"))
+
+    assert result.accepted
+    assert api.snapshot_fetches == 1
+    assert not StreamEventProcessor(runner.ledger).reconciliation_required
 
 
 def _seed_managed_position(ledger, *, token="tok-exit", shares="10", price="0.50"):
@@ -586,7 +932,7 @@ class _EarlyExitAPI(_API):
             token_matches=True, book_timestamp=self.book_time, book_hash="book-exit",
             rules_verified=True, accepting_orders=True, disputed=False,
             tick_size=D("0.01"), min_order_size=D("5"), fee_rate=D("0.10"),
-            fee_exponent=D("1"), fees_enabled=True,
+            fee_exponent=D("1"), fees_enabled=True, taker_only=True,
         )
 
     async def get_order_book(self, token_id):
@@ -642,6 +988,7 @@ def test_live_early_exit_submits_verified_bot_position_via_service_and_blocks_du
     assert intent.side == "SELL" and intent.post_only
     assert intent.exit_stage == "first_tranche" and intent.shares == D("7.5")
     assert intent.decision_id and intent.target_return == D("0.28")
+    assert intent.estimated_fee == D("0")  # post-only maker, not bid-depth taker fee
 
     restarted = StreamEventProcessor(runner.ledger)
     replayed = asyncio.run(runner._run_early_exits(
@@ -670,6 +1017,29 @@ def test_live_early_exit_never_selects_external_holdings(tmp_path, monkeypatch):
 
     assert result == []
     assert service.submitted == []
+
+
+def test_live_early_exit_refuses_unverified_positive_fee_maker_schedule(tmp_path, monkeypatch):
+    api = _EarlyExitAPI(positions=(RemotePosition("cond", "tok-exit", D("10"), D("8"), D("5")),))
+    original_context = api.get_verified_market_context
+
+    async def unverified(condition_id, token_id):
+        context = await original_context(condition_id, token_id)
+        context.taker_only = False
+        return context
+
+    api.get_verified_market_context = unverified
+    runner, _ = _runner(tmp_path, monkeypatch, api=api)
+    _seed_managed_position(runner.ledger)
+    service = _ExitService(runner.ledger)
+    runner.service = service
+    processor = StreamEventProcessor(runner.ledger)
+    result = asyncio.run(runner._run_early_exits(
+        processor=processor, local=local_snapshot(processor, D("100")),
+        remote=api.remote, risk_context=SimpleNamespace(), now=NOW,
+    ))
+    assert result[0]["outcome"] == "blocked"
+    assert not service.submitted
 
 
 def test_live_cycle_runs_exit_when_entry_loss_guard_blocks_and_reconciles_after_submit(tmp_path, monkeypatch):

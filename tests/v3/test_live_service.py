@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -171,6 +172,52 @@ def test_create_binds_sdk_adapter_to_initialized_client_and_routes_sdk_calls():
     cancel_result = asyncio.run(service._executor._client.cancel_all())
     assert api.canceled_order_ids == ("open-fake",)
     assert cancel_result == {"canceled": ("open-fake",), "not_canceled": {}}
+
+
+def test_create_rejects_permissive_reconciliation_policy_before_client_init():
+    settings = live_settings()
+    api = FakeAPI(remote_snapshot(), settings=settings)
+    permissive = Reconciler(
+        external_condition_ids={"condition-1"}, cash_tolerance=D("100"),
+        cost_tolerance=D("100"), allow_cash_inflows=True,
+    )
+    with pytest.raises(ValueError, match="strict cash reconciliation"):
+        asyncio.run(LiveOrderService.create(
+            api=api, settings=settings, risk_engine=risk_engine(),
+            ledger=EventLedger(":memory:"), reconciler=permissive,
+        ))
+    assert not api.initialized
+
+
+def test_create_binds_persistent_reconciler_and_history_baseline_to_session_state(tmp_path):
+    settings = live_settings()
+    api = FakeAPI(remote_snapshot(), settings=settings)
+    data_dir = tmp_path / "live"
+    data_dir.mkdir()
+    state = {
+        "baseline_cash": "50", "baseline_epoch": 123,
+        "external_condition_ids": ["old-condition"],
+    }
+    (data_dir / "live_state.json").write_text(json.dumps(state), encoding="utf-8")
+    ledger = EventLedger(data_dir / "ledger.sqlite")
+    policy = Reconciler(
+        external_condition_ids={"old-condition"}, cash_tolerance=D("0"),
+        cost_tolerance=D("0.01"), allow_cash_inflows=False,
+    )
+    service = asyncio.run(LiveOrderService.create(
+        api=api, settings=settings, risk_engine=risk_engine(), ledger=ledger,
+        reconciler=policy, baseline_cash=D("50"), trade_history_after=123,
+    ))
+    assert service._factory_authorized
+
+    bad_api = FakeAPI(remote_snapshot(), settings=settings)
+    with pytest.raises(ValueError, match="persisted account baseline"):
+        asyncio.run(LiveOrderService.create(
+            api=bad_api, settings=settings, risk_engine=risk_engine(), ledger=ledger,
+            reconciler=Reconciler(cash_tolerance=D("0"), cost_tolerance=D("0.01")),
+            baseline_cash=D("50"), trade_history_after=123,
+        ))
+    assert not bad_api.initialized
 
 
 def test_create_requires_live_limits_and_matching_risk_engine_before_secure_client():
@@ -593,9 +640,13 @@ def test_cancel_pagination_overflow_latches_executor_and_blocks_followup_submit(
         return iterate()
 
     api.list_open_orders = endless_pages
+    (tmp_path / "live_state.json").write_text(json.dumps({
+        "baseline_cash": "10", "baseline_epoch": 123, "external_condition_ids": [],
+    }), encoding="utf-8")
     service = asyncio.run(LiveOrderService.create(
         api=api, settings=settings, risk_engine=risk_engine(),
         ledger=EventLedger(tmp_path / "bounded-cancel.db"),
+        baseline_cash=D("10"), trade_history_after=123,
     ))
     killed = asyncio.run(service.kill_switch())
     assert killed == {"status": "cancel_unknown", "requires_reconciliation": True}

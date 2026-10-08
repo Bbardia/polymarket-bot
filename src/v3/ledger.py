@@ -93,6 +93,23 @@ class EventLedger:
             )
             return cursor.rowcount == 1
 
+    def append_if_unchanged(self, event: LedgerEvent, *, event_count: int, last_event_id: str) -> None:
+        """Append only if the exact append-only tip remains unchanged under a write lock."""
+        if type(event_count) is not int or event_count <= 0 or not isinstance(last_event_id, str):
+            raise ValueError("valid expected ledger tip is required")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            count, tip = connection.execute(
+                "SELECT COUNT(*), (SELECT event_id FROM events ORDER BY sequence DESC LIMIT 1) FROM events"
+            ).fetchone()
+            if count != event_count or tip != last_event_id:
+                raise ValueError("ledger changed during audited resolution")
+            connection.execute(
+                "INSERT INTO events(event_id, event_type, occurred_at, payload_json) VALUES (?, ?, ?, ?)",
+                (event.event_id, event.event_type, event.occurred_at,
+                 json.dumps(dict(event.payload), sort_keys=True, separators=(",", ":"), default=_json_default)),
+            )
+
     def append_batch(self, events: tuple[LedgerEvent, ...]) -> tuple[str, ...]:
         """Insert an all-or-nothing set of unique events in one SQLite transaction."""
         if len({event.event_id for event in events}) != len(events):

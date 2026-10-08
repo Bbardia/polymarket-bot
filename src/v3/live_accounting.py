@@ -38,6 +38,7 @@ def confirmed_fills(processor: Any) -> tuple[ConfirmedFill, ...]:
     """
     orders = processor.orders
     by_key: dict[tuple[str, str], list[ConfirmedFill]] = {}
+    unique_trades: dict[str, tuple[dict[str, Any], int]] = {}
     for index, event in enumerate(processor.ledger.events()):
         if event.event_type != "user.trade" or event.payload.get("status") != "CONFIRMED":
             continue
@@ -45,6 +46,18 @@ def confirmed_fills(processor: Any) -> tuple[ConfirmedFill, ...]:
         trade_id = payload.get("id")
         if not isinstance(trade_id, str) or not trade_id:
             raise ValueError("confirmed trade has no stable trade ID")
+        previous = unique_trades.get(trade_id)
+        if previous is not None:
+            prior, first_index = previous
+            left, right = dict(prior), dict(payload)
+            left_market, right_market = left.pop("market", None), right.pop("market", None)
+            if left != right or (left_market is not None and right_market is not None and left_market != right_market):
+                raise ValueError("duplicate confirmed trade ID has conflicting ledger rows")
+            if left_market is None and right_market is not None:
+                unique_trades[trade_id] = (dict(payload), first_index)
+            continue
+        unique_trades[trade_id] = (dict(payload), index)
+    for trade_id, (payload, index) in unique_trades.items():
         matched_at = _venue_match_time(payload)
         if matched_at is None:
             raise ValueError("confirmed trade has no explicit valid venue match time")
