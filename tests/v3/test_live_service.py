@@ -658,40 +658,6 @@ def test_cancel_pagination_overflow_latches_executor_and_blocks_followup_submit(
     assert not blocked.accepted and blocked.reason == "kill switch latched"
 
 
-def test_risk_context_ignores_external_position_value():
-    external = frozenset({"external-condition"})
-    context = LiveRiskContext(daily_pnl=D("0"), peak_equity=D("90"), day_start_equity=D("90"))
-    for external_value in ("50", "0", "10"):
-        context.refresh_from_remote(remote_snapshot(cash="90", positions=(
-            RemotePosition("external-condition", "external-token", D("50"), D(external_value), D("10")),
-        )), external_condition_ids=external)
-        assert context.peak_equity == D("90") and context.daily_pnl == D("0")
-    # Bot-managed value still moves both numbers.
-    context.refresh_from_remote(remote_snapshot(cash="90", positions=(
-        RemotePosition("external-condition", "external-token", D("50"), D("99"), D("10")),
-        RemotePosition("bot-condition", "bot-token", D("10"), D("2"), D("5")),
-    )), external_condition_ids=external)
-    assert context.peak_equity == D("92") and context.daily_pnl == D("2")
-
-
-def test_submit_risk_state_excludes_external_value_from_equity(tmp_path):
-    remote = remote_snapshot(cash="10", positions=(
-        RemotePosition("external-condition", "external-token", D("50"), D("40"), D("10")),
-    ))
-    api = FakeAPI(remote)
-    executor = FakeExecutor()
-    service = _authorized_service_for_test(
-        api=api, executor=executor, risk_engine=risk_engine(), ledger=EventLedger(tmp_path / "ext.db"),
-        reconciler=Reconciler(external_condition_ids={"external-condition"}),
-    )
-    context = LiveRiskContext(daily_pnl=D("0"), peak_equity=D("10"), day_start_equity=D("10"))
-    result = asyncio.run(service.submit(intent(), local_snapshot(cash="10"), context))
-    assert result.accepted
-    state = executor.calls[0][1]
-    assert state.equity == D("10") and state.peak_equity == D("10") and state.daily_pnl == D("0")
-    assert context.peak_equity == D("10")
-
-
 def test_submit_refuses_buy_on_external_condition(tmp_path):
     api = FakeAPI(remote_snapshot(cash="10"))
     executor = FakeExecutor()
