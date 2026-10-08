@@ -529,7 +529,8 @@ class LiveTradingRunner(LiveShadowRunner):
                 results.append({"token_id": token_id, "outcome": "accepted" if outcome.accepted else "rejected",
                                 "decision_id": intent.decision_id, "stage": sell.stage, "reason": outcome.reason})
             except Exception as exc:
-                results.append({"token_id": token_id, "outcome": "blocked", "reason": type(exc).__name__})
+                results.append({"token_id": token_id, "outcome": "blocked",
+                                "reason": f"{type(exc).__name__}: {str(exc)[:160]}"})
         return results
 
     def _event_block_reason(

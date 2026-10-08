@@ -128,8 +128,11 @@ def verified_book_from_api(
         for level in levels
     ):
         raise ValueError("order-book bid level economics are invalid")
-    if tuple(sorted(levels, key=lambda item: item.price, reverse=True)) != levels:
-        raise ValueError("bid levels are not in canonical descending order")
+    # The CLOB returns bids ascending (best bid last); the planner walks depth
+    # best-first. Canonicalize, but never merge or guess at duplicate prices.
+    if len({level.price for level in levels}) != len(levels):
+        raise ValueError("bid levels contain duplicate prices")
+    levels = tuple(sorted(levels, key=lambda item: item.price, reverse=True))
     tick_size = getattr(context, "tick_size", None)
     min_order_size = getattr(context, "min_order_size", None)
     if not isinstance(tick_size, Decimal) or not isinstance(min_order_size, Decimal):

@@ -173,7 +173,7 @@ def test_api_verified_book_rejects_nonfinite_or_nonpositive_depth(price, size):
         )
 
 
-def test_api_verified_book_rejects_stale_mismatched_and_unsorted_depth():
+def test_api_verified_book_rejects_stale_mismatched_depth():
     context, raw, now = _verified_api_pair()
     with pytest.raises(ValueError, match="stale"):
         verified_book_from_api(
@@ -185,15 +185,6 @@ def test_api_verified_book_rejects_stale_mismatched_and_unsorted_depth():
             context, SimpleNamespace(**{**vars(raw), "hash": "other"}),
             condition_id="cond", token_id="tok", now=now, max_quote_age_seconds=30,
         )
-    unsorted = SimpleNamespace(**{
-        **vars(raw), "bids": (SimpleNamespace(price=D("0.6"), size=D("5")),
-                               SimpleNamespace(price=D("0.8"), size=D("5"))),
-    })
-    with pytest.raises(ValueError, match="descending"):
-        verified_book_from_api(
-            context, unsorted, condition_id="cond", token_id="tok", now=now,
-            max_quote_age_seconds=30,
-        )
     changed_rules = SimpleNamespace(**{**vars(raw), "tick_size": D("0.05")})
     with pytest.raises(ValueError, match="rules differ"):
         verified_book_from_api(
@@ -201,3 +192,31 @@ def test_api_verified_book_rejects_stale_mismatched_and_unsorted_depth():
             max_quote_age_seconds=30,
         )
 
+
+
+def test_api_verified_book_canonicalizes_clob_ascending_bids():
+    context, raw, now = _verified_api_pair()
+    ascending = SimpleNamespace(**{**vars(raw), "bids": (
+        SimpleNamespace(price=D("0.6"), size=D("5")),
+        SimpleNamespace(price=D("0.7"), size=D("5")),
+        SimpleNamespace(price=D("0.8"), size=D("10")),
+    )})
+    verified = verified_book_from_api(
+        context, ascending, condition_id="cond", token_id="tok", now=now,
+        max_quote_age_seconds=30,
+    )
+    assert verified.best_bid == D("0.8")
+    assert [level.price for level in verified.bids] == [D("0.8"), D("0.7"), D("0.6")]
+
+
+def test_api_verified_book_rejects_duplicate_bid_prices():
+    context, raw, now = _verified_api_pair()
+    duplicated = SimpleNamespace(**{**vars(raw), "bids": (
+        SimpleNamespace(price=D("0.8"), size=D("5")),
+        SimpleNamespace(price=D("0.8"), size=D("10")),
+    )})
+    with pytest.raises(ValueError, match="duplicate"):
+        verified_book_from_api(
+            context, duplicated, condition_id="cond", token_id="tok", now=now,
+            max_quote_age_seconds=30,
+        )
