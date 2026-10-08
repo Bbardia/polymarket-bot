@@ -253,7 +253,16 @@ def test_create_requires_live_limits_and_matching_risk_engine_before_secure_clie
     result = asyncio.run(service.submit(
         intent(), local_snapshot(), LiveRiskContext(daily_pnl=D("0"), peak_equity=D("10")),
     ))
-    assert not result.accepted and "lifecycle reconciliation" in result.reason
+    assert not result.accepted and "trade history read failed" in result.reason
+    from src.v3.streaming import StreamEventProcessor
+    # A transient read failure is a per-read block, never a durable latch.
+    assert not StreamEventProcessor(ledger).reconciliation_required
+    api.trade_error = None
+    assert asyncio.run(service.recover_trade_history(max_items=10, page_limit=1))["lifecycle_clear"]
+    result = asyncio.run(service.submit(
+        intent(), local_snapshot(), LiveRiskContext(daily_pnl=D("0"), peak_equity=D("10")),
+    ))
+    assert result.accepted
 
     missing = V3Settings(
         live_enabled=True, paper_trading=False,
@@ -537,7 +546,7 @@ def test_trade_history_import_replays_confirmed_trade_and_persists_latch(tmp_pat
     assert processor.orders["managed-1"].confirmed_size == D("2")
 
 
-def test_trade_history_timeout_latches_reconciliation(tmp_path):
+def test_trade_history_timeout_blocks_per_read_without_durable_latch(tmp_path):
     class HangingTradeAPI(FakeAPI):
         async def fetch_account_trades(self, *, max_items, page_limit):
             self.trade_fetches.append((max_items, page_limit))
@@ -551,15 +560,23 @@ def test_trade_history_timeout_latches_reconciliation(tmp_path):
     result = asyncio.run(service.recover_trade_history(
         max_items=10, page_limit=2, timeout_seconds=0.01,
     ))
-    assert result == {"imported_count": 0, "lifecycle_clear": False}
+    assert result == {"imported_count": 0, "lifecycle_clear": False,
+                      "read_error": "trade history read failed: TimeoutError"}
     assert api.trade_fetches == [(10, 2)]
-    assert any(e.event_type == "stream.reconciliation_required" for e in ledger.events())
+    assert not any(e.event_type == "stream.reconciliation_required" for e in ledger.events())
+    assert [e.payload for e in ledger.events() if e.event_type == "account.trade_history.read_failed"] == [
+        {"failure_type": "TimeoutError"},
+    ]
     restarted = EventLedger(ledger_path)
     from src.v3.streaming import StreamEventProcessor
-    assert StreamEventProcessor(restarted).reconciliation_required
+    assert not StreamEventProcessor(restarted).reconciliation_required
+    blocked = asyncio.run(service.submit(
+        intent(), local_snapshot(), LiveRiskContext(daily_pnl=D("0"), peak_equity=D("10")),
+    ))
+    assert not blocked.accepted and "trade history read failed" in blocked.reason
 
 
-def test_trade_history_cancellation_latches_before_propagating(tmp_path):
+def test_trade_history_cancellation_propagates_without_durable_latch(tmp_path):
     class HangingTradeAPI(FakeAPI):
         async def fetch_account_trades(self, *, max_items, page_limit):
             self.trade_fetches.append((max_items, page_limit))
@@ -580,11 +597,14 @@ def test_trade_history_cancellation_latches_before_propagating(tmp_path):
     service = _authorized_service_for_test(api, FakeExecutor(), risk_engine(), ledger, Reconciler())
     asyncio.run(run_cancelled_fetch(service, api))
 
-    events = ledger.events()
-    latch = next(e for e in events if e.event_type == "stream.reconciliation_required")
-    assert latch.payload["reason"] == "trade history read cancelled: CancelledError"
+    events = tuple(ledger.events())
+    assert not any(e.event_type == "stream.reconciliation_required" for e in events)
+    assert [e.payload for e in events if e.event_type == "account.trade_history.read_failed"] == [
+        {"failure_type": "CancelledError"},
+    ]
     from src.v3.streaming import StreamEventProcessor
-    assert StreamEventProcessor(EventLedger(ledger_path)).reconciliation_required
+    assert not StreamEventProcessor(EventLedger(ledger_path)).reconciliation_required
+    assert service._trade_history_read_error == "trade history read failed: CancelledError"
 
 
 @pytest.mark.parametrize("timeout_seconds", [0, -1, float("nan"), float("inf")])
@@ -605,7 +625,9 @@ def test_trade_history_failures_unknown_trades_latch_across_restart_and_block_su
     service = _authorized_service_for_test(api, FakeExecutor(), risk_engine(), ledger, Reconciler())
     failed = asyncio.run(service.recover_trade_history(max_items=10, page_limit=2))
     assert failed["lifecycle_clear"] is False
-    assert any(e.event_type == "stream.reconciliation_required" for e in ledger.events())
+    assert failed["read_error"] == "trade history read failed: RuntimeError"
+    # Read failures are transient; only content inconsistencies latch durably.
+    assert not any(e.event_type == "stream.reconciliation_required" for e in ledger.events())
 
     restarted_ledger = EventLedger(ledger_path)
     api.trade_error = None
@@ -656,3 +678,64 @@ def test_cancel_pagination_overflow_latches_executor_and_blocks_followup_submit(
         intent(), AccountRiskState(equity=D("0"), cash=D("0"), total_exposure=D("0")),
     ))
     assert not blocked.accepted and blocked.reason == "kill switch latched"
+
+
+def test_submit_refuses_buy_on_external_condition(tmp_path):
+    api = FakeAPI(remote_snapshot(cash="10"))
+    executor = FakeExecutor()
+    ledger = EventLedger(tmp_path / "ext-buy.db")
+    service = _authorized_service_for_test(
+        api=api, executor=executor, risk_engine=risk_engine(), ledger=ledger,
+        reconciler=Reconciler(external_condition_ids={"condition-1"}),
+    )
+    result = asyncio.run(service.submit(
+        intent(), local_snapshot(cash="10"), LiveRiskContext(daily_pnl=D("0"), peak_equity=D("10")),
+    ))
+    assert not result.accepted
+    assert "external" in result.reason
+    assert executor.calls == [] and api.market_fetches == 0 and api.fetches == 0
+    blocked = [e.payload for e in ledger.events() if e.event_type == "account.preflight.blocked"]
+    assert blocked == [{"reason": "BUY on external condition",
+                        "condition_id": "condition-1", "token_id": "new-token"}]
+
+
+def test_sell_exit_freshness_uses_context_read_time_not_last_book_change(tmp_path):
+    from dataclasses import replace
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    sell = replace(intent(), side="SELL", decision_id="exit-1", exit_stage="full")
+    quiet = {"book_timestamp": now - timedelta(minutes=90)}
+    cases = (
+        ({**quiet, "fetched_at": now}, None),
+        ({**quiet, "fetched_at": now - timedelta(hours=1)}, "order-book quote is stale"),
+        (quiet, "market context is incomplete"),
+        ({"book_timestamp": now + timedelta(minutes=5), "fetched_at": now}, "order-book quote is stale"),
+        # A freshly read book unchanged beyond the separate last-change bound.
+        ({"book_timestamp": now - timedelta(hours=2, seconds=1), "fetched_at": now}, "order-book quote is stale"),
+    )
+    for index, (update, expected) in enumerate(cases):
+        api = FakeAPI(remote_snapshot())
+        api.market_context = SimpleNamespace(**{**vars(api.market_context), **update})
+        service = _authorized_service_for_test(
+            api, FakeExecutor(), risk_engine(), EventLedger(tmp_path / f"sell-{index}.db"), Reconciler(),
+        )
+        validated, reason = asyncio.run(service._validated_intent(sell))
+        assert reason == expected
+        if expected is None:
+            assert validated is not None and validated.quote_age_seconds <= 5
+
+
+def test_buy_entry_freshness_still_uses_last_book_change(tmp_path):
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    api = FakeAPI(remote_snapshot())
+    api.market_context = SimpleNamespace(**{
+        **vars(api.market_context), "book_timestamp": now - timedelta(hours=2), "fetched_at": now,
+    })
+    service = _authorized_service_for_test(
+        api, FakeExecutor(), risk_engine(), EventLedger(tmp_path / "buy.db"), Reconciler(),
+    )
+    validated, reason = asyncio.run(service._validated_intent(intent()))
+    assert validated is None and reason == "order-book quote is stale"

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -27,6 +27,12 @@ class MarketContext:
     fees_enabled: bool | None = None
     fee_exponent: Decimal | None = None
     taker_only: bool | None = None
+    # Local read time of the order book. The book's own timestamp is its last
+    # change; freshness of a quiet book is bounded by when it was read.
+    fetched_at: datetime | None = None
+    # The exact book snapshot this context was built from, so callers never
+    # refetch (and race) a different book than the one verified here.
+    book: Any = field(default=None, compare=False, repr=False)
 
     @classmethod
     def from_sdk(cls, market: Any, book: Any) -> "MarketContext":

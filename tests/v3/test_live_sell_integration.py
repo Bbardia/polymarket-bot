@@ -62,11 +62,11 @@ class OfflineAuthenticatedAPI:
             "fee_rate": D("0.1"), "fee_exponent": D("1"),
             "fees_enabled": True, "taker_only": True,
             "book_timestamp": self.book_time, "book_hash": "offline-book",
+            "book": self._book(), "fetched_at": datetime.now(timezone.utc),
             **self.context_override,
         })
 
-    async def get_order_book(self, token_id):
-        assert token_id == TOKEN
+    def _book(self):
         return SimpleNamespace(
             condition_id=CONDITION, token_id=TOKEN, timestamp=self.book_time,
             hash="offline-book", bids=(SimpleNamespace(price=D("0.80"), size=D("50")),),
@@ -82,7 +82,7 @@ class OfflineAuthenticatedAPI:
         return SimpleNamespace(ok=True, order_id=f"offline-sell-{len(self.posted)}", status="live")
 
 
-async def _system(tmp_path, *, external=(), max_order_notional="25"):
+async def _system(tmp_path, *, external=(), max_order_notional="25", fill_size="30"):
     store = LiveStore(tmp_path / "isolated-live")
     now = datetime.now(timezone.utc)
     store.save_state({
@@ -94,14 +94,14 @@ async def _system(tmp_path, *, external=(), max_order_notional="25"):
     ledger.append(LedgerEvent.create("order.accepted", {
         "client_order_id": "buy-client", "order_id": BUY, "status": "live",
         "condition_id": CONDITION, "token_id": TOKEN, "side": "BUY",
-        "price": "0.50", "requested_size": "30", "post_only": True,
+        "price": "0.50", "requested_size": fill_size, "post_only": True,
     }))
     ledger.append(LedgerEvent.create("user.trade", {
         "id": "buy-fill", "taker_order_id": "external-buy", "market": CONDITION,
-        "asset_id": TOKEN, "side": "SELL", "size": "30", "price": "0.50",
+        "asset_id": TOKEN, "side": "SELL", "size": fill_size, "price": "0.50",
         "status": "CONFIRMED", "fee_rate_bps": "0", "timestamp": now.isoformat(),
         "maker_orders": [{"order_id": BUY, "asset_id": TOKEN, "side": "BUY",
-                          "matched_amount": "30", "price": "0.50", "fee_rate_bps": "0"}],
+                          "matched_amount": fill_size, "price": "0.50", "fee_rate_bps": "0"}],
     }))
     settings = V3Settings(
         live_enabled=True, paper_trading=False,
@@ -235,4 +235,49 @@ def test_real_service_early_exit_fails_closed_without_sdk_post(tmp_path, failure
             assert any(e.event_type == "order.risk_rejected" and "max order notional" in e.payload["reason"]
                        for e in runner.ledger.events())
         assert local_snapshot(StreamEventProcessor(runner.ledger), BASELINE).position_quantities == {TOKEN: D("30")}
+    asyncio.run(scenario())
+
+
+def _sub_quantum_fill_system(tmp_path):
+    """Ledger holds 30.00004 shares; the account API displays the 4dp-rounded 30.0000."""
+    async def build():
+        runner, api = await _system(tmp_path, fill_size="30.00004")
+        api.remote = RemoteSnapshot(
+            D("84.99998"), (RemotePosition(CONDITION, TOKEN, D("30.0000"), D("24"), D("15")),), (),
+        )
+        return runner, api
+    return build()
+
+
+def test_sell_preflight_accepts_four_decimal_rounded_remote_size(tmp_path):
+    async def scenario():
+        runner, api = await _sub_quantum_fill_system(tmp_path)
+        local = local_snapshot(StreamEventProcessor(runner.ledger), BASELINE)
+        assert local.position_quantities == {TOKEN: D("30.00004")}
+        assert runner.reconciler.compare(local, api.remote).safe_to_trade
+        result = await _exit(runner, api)
+        assert result[0]["outcome"] == "accepted", result
+        assert len(api.created) == 1 and api.created[0]["size"] == D("22.50")
+    asyncio.run(scenario())
+
+
+def test_sell_preflight_caps_size_at_min_of_remote_and_local(tmp_path):
+    from src.v3.risk import OrderIntent
+
+    async def scenario():
+        runner, api = await _sub_quantum_fill_system(tmp_path)
+        processor = StreamEventProcessor(runner.ledger)
+        local = local_snapshot(processor, BASELINE)
+        oversized = OrderIntent(
+            condition_id=CONDITION, token_id=TOKEN, side="SELL", price=D("0.80"),
+            shares=D("30.00004"), estimated_fee=D("0"), post_only=True, ttl_seconds=300,
+            quote_age_seconds=0, tick_size=D("0.01"), min_order_size=D("5"),
+            market_accepting_orders=True, rules_verified=True,
+        )
+        result = await runner.service.submit(
+            oversized, local, LiveRiskContext(daily_pnl=D("0"), peak_equity=BASELINE),
+        )
+        assert not result.accepted and "not exact" in result.reason
+        assert not api.created and not api.posted
+        assert any(e.event_type == "account.sell_preflight.blocked" for e in runner.ledger.events())
     asyncio.run(scenario())
