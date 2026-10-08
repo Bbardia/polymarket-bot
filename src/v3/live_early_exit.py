@@ -14,6 +14,9 @@ from .math import BookLevel, execution_bid_vwap, execution_fee
 
 ZERO = Decimal("0")
 ONE = Decimal("1")
+# Polymarket CLOB share sizes have two decimals; anything below one step can
+# never be sold and is treated as dust for exit planning and event blocking.
+SHARE_SIZE_STEP = Decimal("0.01")
 
 
 @dataclass(frozen=True)
@@ -60,6 +63,49 @@ class PlanResult:
     reason: str | None
 
 
+# A quiet book read just now is current, but a book unchanged for longer than
+# this is not trusted for an exit quote even when freshly read.
+MAX_BOOK_LAST_CHANGE_AGE_SECONDS = 2 * 60 * 60
+
+
+def _aware(value: Any) -> bool:
+    return isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() is not None
+
+
+def book_quote_age_seconds(
+    *,
+    book_timestamp: Any,
+    fetched_at: Any,
+    now: datetime,
+    max_quote_age_seconds: int,
+) -> float:
+    """Return the quote age in seconds, or raise ValueError if stale or future-dated.
+
+    The CLOB book ``timestamp`` is the time of the last book change, not of the
+    read. With a read time (``fetched_at``) the quote age is measured from the
+    read, and the last change is separately bounded by
+    ``MAX_BOOK_LAST_CHANGE_AGE_SECONDS``. Without one, the stricter last-change
+    age is the quote age. A book changed after ``now`` is always rejected.
+    """
+    if (
+        not _aware(book_timestamp) or not _aware(now)
+        or (fetched_at is not None and not _aware(fetched_at))
+        or type(max_quote_age_seconds) is not int or max_quote_age_seconds <= 0
+    ):
+        raise ValueError("book freshness timestamps are missing or timezone-naive")
+    now_utc = now.astimezone(timezone.utc)
+    change_age = (now_utc - book_timestamp.astimezone(timezone.utc)).total_seconds()
+    if fetched_at is None:
+        age = change_age
+    else:
+        age = (now_utc - fetched_at.astimezone(timezone.utc)).total_seconds()
+        if change_age > MAX_BOOK_LAST_CHANGE_AGE_SECONDS:
+            raise ValueError("order book is future-dated or stale")
+    if age < 0 or change_age < 0 or age > max_quote_age_seconds:
+        raise ValueError("order book is future-dated or stale")
+    return age
+
+
 def verified_book_from_api(
     context: Any,
     raw_book: Any,
@@ -74,9 +120,12 @@ def verified_book_from_api(
     The order-book response passed here must be the exact snapshot represented
     by the context hash/timestamp; unknown fee curves or market rules fail closed.
     Polymarket order docs specify two share-size decimals for all listed ticks.
+
+    Freshness follows :func:`book_quote_age_seconds`.
     """
     timestamp = getattr(raw_book, "timestamp", None)
     context_timestamp = getattr(context, "book_timestamp", None)
+    fetched_at = getattr(context, "fetched_at", None)
     if (
         not isinstance(condition_id, str) or not condition_id
         or not isinstance(token_id, str) or not token_id
@@ -84,13 +133,18 @@ def verified_book_from_api(
         or not isinstance(timestamp, datetime) or timestamp.tzinfo is None or timestamp.utcoffset() is None
         or not isinstance(context_timestamp, datetime) or context_timestamp.tzinfo is None
         or context_timestamp.utcoffset() is None
+        or fetched_at is not None and (
+            not isinstance(fetched_at, datetime) or fetched_at.tzinfo is None
+            or fetched_at.utcoffset() is None
+        )
         or type(max_quote_age_seconds) is not int or max_quote_age_seconds <= 0
     ):
         raise ValueError("verified book identity or timestamp inputs are invalid")
-    now_utc, timestamp_utc = now.astimezone(timezone.utc), timestamp.astimezone(timezone.utc)
-    age = (now_utc - timestamp_utc).total_seconds()
-    if age < 0 or age > max_quote_age_seconds:
-        raise ValueError("order book is future-dated or stale")
+    book_quote_age_seconds(
+        book_timestamp=timestamp, fetched_at=fetched_at, now=now,
+        max_quote_age_seconds=max_quote_age_seconds,
+    )
+    timestamp_utc = timestamp.astimezone(timezone.utc)
     context_hash = getattr(context, "book_hash", None)
     raw_hash = getattr(raw_book, "hash", None)
     if (
@@ -148,13 +202,22 @@ def verified_book_from_api(
         # Polymarket CLOB order docs: Size decimals = 2; round share quantity down.
         # https://docs.polymarket.com/trading/place-orders
         bids=levels, best_bid=levels[0].price, tick_size=tick_size,
-        min_order_size=min_order_size, size_step=Decimal("0.01"),
+        min_order_size=min_order_size, size_step=SHARE_SIZE_STEP,
         fee_rate=fee_rate, fresh=True, rules_verified=True, fee_verified=True,
     )
 
 
 def _ceil_step(value: Decimal, step: Decimal) -> Decimal:
     return (value / step).to_integral_value(rounding=ROUND_CEILING) * step
+
+
+def _floor_step(value: Decimal, step: Decimal) -> Decimal:
+    return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
+def is_dust(quantity: Any) -> bool:
+    """True for a finite holding smaller than one venue share-size step."""
+    return isinstance(quantity, Decimal) and quantity.is_finite() and quantity < SHARE_SIZE_STEP
 
 
 def _d(value: Decimal) -> bool:
@@ -215,9 +278,17 @@ def plan_live_early_exit(
         stage = "first_tranche" if partial else ("runner" if position.hybrid_enabled else "full")
         qty = (first_tranche_quantity if first_tranche_quantity is not None and partial
                else position.shares * hybrid_fraction if partial else position.shares)
-        cost = position.all_in_cost * qty / position.shares
         target = target_return if not position.hybrid_enabled or partial else runner_target_return
-        qty = (qty / book.size_step).to_integral_value(rounding=ROUND_DOWN) * book.size_step
+        qty = _floor_step(qty, book.size_step)
+        if partial:
+            # A tranche below the venue minimum, or one leaving an unsellable
+            # sub-minimum runner, would strand inventory. Sell the whole
+            # (step-rounded) position instead, at first-tranche economics.
+            whole = _floor_step(position.shares, book.size_step)
+            if whole >= book.min_order_size and (
+                qty < book.min_order_size or position.shares - qty < book.min_order_size
+            ):
+                stage, qty = "full", whole
         # Allocate basis at the actual venue-rounded share fraction. The CLOB
         # requires share size rounding down, never up, to avoid overselling.
         cost = position.all_in_cost * qty / position.shares

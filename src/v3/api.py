@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -25,6 +25,8 @@ from .reconciliation import (
 
 PUSD_BASE_UNITS = Decimal("1000000")
 ACTIVITY_PAGE_SIZE_CAP = 500
+# SDK default is 20; the data-api positions cap is 500 per request.
+POSITIONS_PAGE_SIZE = 500
 
 
 
@@ -87,6 +89,10 @@ class CompleteAccountCashFlowHistory:
 
 
 SecureClientFactory = Callable[..., Awaitable[Any]]
+
+
+class MarketClosedError(RuntimeError):
+    """The condition's market is closed; no live order can be placed in it."""
 
 
 class UnifiedPolymarketAPI:
@@ -160,7 +166,7 @@ class UnifiedPolymarketAPI:
         positions: list[RemotePosition] = []
         position_tokens: set[str] = set()
         position_pages = position_rows = 0
-        async for page in client.list_positions(size_threshold=0):
+        async for page in client.list_positions(size_threshold=0, page_size=POSITIONS_PAGE_SIZE):
             position_pages += 1
             if position_pages > page_limit:
                 raise RuntimeError("position reconciliation page limit exceeded")
@@ -602,22 +608,37 @@ class UnifiedPolymarketAPI:
             rows.extend(batch)
         return tuple(rows)
 
+    async def _closed_market_records(self, condition_id: str) -> list[Any]:
+        """Bounded read of closed Gamma market records matching one condition."""
+        matches: list[Any] = []
+        pages = 0
+        async for page in self.public_client.list_markets(
+            condition_ids=[condition_id], closed=True, page_size=20,
+        ):
+            pages += 1
+            if pages > 5:
+                raise RuntimeError("closed market page limit exceeded")
+            items = getattr(page, "items", None)
+            if items is None or isinstance(items, (str, bytes)):
+                raise RuntimeError("malformed closed market page")
+            batch = list(items)
+            if len(batch) > 20:
+                raise RuntimeError("closed market page size exceeded")
+            matches.extend(
+                market for market in batch
+                if str(getattr(market, "condition_id", "") or "") == condition_id
+            )
+        return matches
+
     async def fetch_market_is_neg_risk(self, condition_id: str) -> bool | None:
         """Return explicit market neg-risk metadata; refuse unknown/ambiguous markets."""
         if not isinstance(condition_id, str) or not condition_id:
             raise ValueError("condition_id is required")
-        matches: list[Any] = []
-        pages = 0
-        async for page in self.public_client.list_markets(condition_ids=[condition_id], page_size=20):
-            pages += 1
-            if pages > 5:
-                raise RuntimeError("market metadata page limit exceeded")
-            items = getattr(page, "items", None)
-            if items is None or isinstance(items, (str, bytes)):
-                raise RuntimeError("malformed market metadata page")
-            matches.extend(m for m in items if str(getattr(m, "condition_id", "")) == condition_id)
-            if len(matches) > 1:
-                raise RuntimeError("condition resolved to multiple market records")
+        # Redemption only concerns resolved markets; Gamma omits closed markets
+        # unless they are requested explicitly.
+        matches = await self._closed_market_records(condition_id)
+        if len(matches) > 1:
+            raise RuntimeError("condition resolved to multiple market records")
         if len(matches) != 1:
             raise RuntimeError("condition did not resolve to exactly one market")
         value = getattr(getattr(matches[0], "state", None), "neg_risk", None)
@@ -625,19 +646,7 @@ class UnifiedPolymarketAPI:
 
     async def fetch_resolved_winner(self, condition_id: str) -> str:
         """Require exactly one closed Gamma market with one-hot outcome prices."""
-        matches: list[Any] = []
-        pages = 0
-        async for page in self.public_client.list_markets(condition_ids=[condition_id], closed=True, page_size=20):
-            pages += 1
-            if pages > 5:
-                raise RuntimeError("resolution market page limit exceeded")
-            items = getattr(page, "items", None)
-            if items is None or isinstance(items, (str, bytes)):
-                raise RuntimeError("malformed resolution market page")
-            batch = list(items)
-            if len(batch) > 20:
-                raise RuntimeError("resolution market page size exceeded")
-            matches.extend(m for m in batch if str(getattr(m, "condition_id", "")) == condition_id)
+        matches = await self._closed_market_records(condition_id)
         if len(matches) != 1 or getattr(matches[0].state, "closed", None) is not True:
             raise RuntimeError("condition lacks a unique closed market")
         resolution = getattr(matches[0], "resolution", None)
@@ -670,13 +679,17 @@ class UnifiedPolymarketAPI:
                     matches.append(market)
                     if len(matches) > 1:
                         raise RuntimeError("condition resolved to multiple market records")
+        if not matches and await self._market_is_closed(condition_id):
+            raise MarketClosedError("market closed")
         if len(matches) != 1:
             raise RuntimeError("condition did not resolve to exactly one market")
 
+        fetched_at = datetime.now(timezone.utc)
         book = await self.public_client.get_order_book(token_id=token_id)
         if str(getattr(book, "token_id", "") or "") != token_id:
             raise RuntimeError("order book token does not match requested token")
-        context = MarketContext.from_sdk(matches[0], book)
+        # The read time is taken before the request, so age is never understated.
+        context = replace(MarketContext.from_sdk(matches[0], book), fetched_at=fetched_at, book=book)
         if not context.condition_matches:
             raise RuntimeError("market and order book condition IDs do not match")
         if not context.token_matches:
@@ -686,6 +699,11 @@ class UnifiedPolymarketAPI:
         if not context.book_hash:
             raise RuntimeError("order book hash is missing")
         return context
+
+    async def _market_is_closed(self, condition_id: str) -> bool:
+        """True only for exactly one explicitly closed market record."""
+        matches = await self._closed_market_records(condition_id)
+        return len(matches) == 1 and getattr(getattr(matches[0], "state", None), "closed", None) is True
 
     async def get_order_book(self, token_id: str):
         """Read-only typed Decimal order book from CLOB V2."""

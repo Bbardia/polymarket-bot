@@ -62,11 +62,11 @@ class OfflineAuthenticatedAPI:
             "fee_rate": D("0.1"), "fee_exponent": D("1"),
             "fees_enabled": True, "taker_only": True,
             "book_timestamp": self.book_time, "book_hash": "offline-book",
+            "book": self._book(), "fetched_at": datetime.now(timezone.utc),
             **self.context_override,
         })
 
-    async def get_order_book(self, token_id):
-        assert token_id == TOKEN
+    def _book(self):
         return SimpleNamespace(
             condition_id=CONDITION, token_id=TOKEN, timestamp=self.book_time,
             hash="offline-book", bids=(SimpleNamespace(price=D("0.80"), size=D("50")),),

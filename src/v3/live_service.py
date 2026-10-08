@@ -13,6 +13,7 @@ from typing import Any
 from .config import V3Settings
 from .execution import ExecutionResult, V3OrderExecutor
 from .ledger import EventLedger, LedgerEvent
+from .live_early_exit import book_quote_age_seconds
 from .reconciliation import LocalSnapshot, Reconciler, RemoteSnapshot, _quantity_matches
 from .risk import AccountRiskState, OrderIntent, RiskEngine
 from .streaming import StreamEventProcessor
@@ -75,6 +76,9 @@ class LiveOrderService:
         self._baseline_cash: Decimal | None = None
         # Account baseline (Unix seconds); trades before it predate the bot.
         self._trade_history_after: int | None = None
+        # In-memory, per-read gate: a failed history read blocks submits until
+        # the next successful read, without writing a durable latch.
+        self._trade_history_read_error: str | None = None
 
     @classmethod
     async def create(
@@ -288,8 +292,22 @@ class LiveOrderService:
                 timestamp = context.book_timestamp
                 if timestamp is None or timestamp.tzinfo is None:
                     raise ValueError("book timestamp missing or timezone-naive")
-                age = (datetime.now(timezone.utc) - timestamp).total_seconds()
-                if age < 0 or age > self._risk.limits.max_quote_age_seconds:
+                # Exits use the shared read-time freshness rule; BUY entries keep
+                # the stricter last-change age (no read time is passed).
+                fetched_at = None
+                if intent.side == "SELL":
+                    fetched_at = getattr(context, "fetched_at", None)
+                    if not isinstance(fetched_at, datetime) or fetched_at.tzinfo is None:
+                        raise ValueError("book read time missing or timezone-naive")
+                try:
+                    age: float | None = book_quote_age_seconds(
+                        book_timestamp=timestamp, fetched_at=fetched_at,
+                        now=datetime.now(timezone.utc),
+                        max_quote_age_seconds=self._risk.limits.max_quote_age_seconds,
+                    )
+                except ValueError:
+                    age = None
+                if age is None:
                     reason = "order-book quote is stale"
                 elif not context.book_hash:
                     reason = "order-book hash is missing"
@@ -336,6 +354,11 @@ class LiveOrderService:
                 "reason": "lifecycle reconciliation required",
             }))
             return ExecutionResult(False, "lifecycle reconciliation required; no order submitted")
+        if self._trade_history_read_error is not None:
+            self._ledger.append(LedgerEvent.create("account.preflight.blocked", {
+                "reason": "latest trade history read failed",
+            }))
+            return ExecutionResult(False, "latest trade history read failed; no order submitted")
         unresolved = self._unresolved_submissions()
         if unresolved:
             self._ledger.append(LedgerEvent.create("account.preflight.blocked", {
@@ -454,6 +477,9 @@ class LiveOrderService:
 
         Only trades at or after the factory's account baseline are replayed;
         any later trade not attributable to a managed order still latches.
+        A failed or cancelled read imports nothing, so it is reported as a
+        per-cycle ``read_error`` (callers must block entries and exits for that
+        cycle) rather than persisted as a durable content-inconsistency latch.
         """
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be a finite positive number")
@@ -468,21 +494,24 @@ class LiveOrderService:
                 )
             )
             trades = await asyncio.wait_for(fetch, timeout=timeout_seconds)
-        except asyncio.CancelledError:
-            processor.require_reconciliation(
-                "trade history read cancelled: CancelledError"
-            )
-            raise
-        except Exception as exc:
-            processor.require_reconciliation(
-                f"trade history read failed: {type(exc).__name__}"
-            )
-            return {"imported_count": 0, "lifecycle_clear": False}
+        except (Exception, asyncio.CancelledError) as exc:
+            self._trade_history_read_error = f"trade history read failed: {type(exc).__name__}"
+            self._ledger.append(LedgerEvent.create("account.trade_history.read_failed", {
+                "failure_type": type(exc).__name__,
+            }))
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return {
+                "imported_count": 0, "lifecycle_clear": False,
+                "read_error": self._trade_history_read_error,
+            }
         imported = 0
         for trade in trades:
             result = processor.import_remote_trade(trade)
             if result.accepted and not result.duplicate and not result.requires_reconciliation:
                 imported += 1
+        # Only a fully imported read clears the per-read submit block.
+        self._trade_history_read_error = None
         # This reports only processor-latch state, not whole-account trade readiness.
         processor = StreamEventProcessor(self._ledger)
         return {"imported_count": imported, "lifecycle_clear": not processor.reconciliation_required}
