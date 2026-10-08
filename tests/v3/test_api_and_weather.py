@@ -485,3 +485,88 @@ def test_snapshot_rejects_duplicate_open_order_ids():
     api._secure_client = Client()
     with pytest.raises(RuntimeError, match="duplicate open-order identity"):
         asyncio.run(api.fetch_remote_snapshot())
+
+
+def _context_market(closed=False):
+    return SimpleNamespace(
+        condition_id="condition-1", question="Question",
+        outcomes=SimpleNamespace(
+            yes=SimpleNamespace(token_id="token-1"), no=SimpleNamespace(token_id="token-2"),
+        ),
+        state=SimpleNamespace(accepting_orders=not closed, active=True, closed=closed,
+                              archived=False, neg_risk=True),
+        trading=SimpleNamespace(
+            minimum_tick_size=D("0.01"), minimum_order_size=D("5"),
+            fees_enabled=False, fee_schedule=None,
+        ),
+        resolution=SimpleNamespace(source="official", uma_resolution_status=None),
+    )
+
+
+class _Pages:
+    def __init__(self, items):
+        self.items = items
+
+    def __aiter__(self):
+        async def pages():
+            yield SimpleNamespace(items=self.items)
+        return pages()
+
+
+def test_market_context_carries_its_exact_book_snapshot_and_read_time():
+    quiet_since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    book = SimpleNamespace(
+        condition_id="condition-1", token_id="token-1", timestamp=quiet_since,
+        tick_size=D("0.01"), min_order_size=D("5"), neg_risk=True, hash="book-hash",
+    )
+    fetches = []
+
+    class PublicClient:
+        def list_markets(self, **kwargs):
+            return _Pages([_context_market()])
+
+        async def get_order_book(self, *, token_id):
+            fetches.append(token_id)
+            return book
+
+    api = UnifiedPolymarketAPI(settings=V3Settings())
+    api.public_client = PublicClient()
+    before = datetime.now(timezone.utc)
+    context = asyncio.run(api.get_verified_market_context("condition-1", "token-1"))
+    assert context.book is book and fetches == ["token-1"]
+    assert context.book_timestamp == quiet_since
+    assert before <= context.fetched_at <= datetime.now(timezone.utc)
+
+
+def test_market_context_reports_closed_market_distinctly():
+    from src.v3.api import MarketClosedError
+
+    calls = []
+
+    class PublicClient:
+        def list_markets(self, **kwargs):
+            calls.append(kwargs.get("closed"))
+            return _Pages([_context_market(closed=True)] if kwargs.get("closed") else [])
+
+        async def get_order_book(self, *, token_id):
+            raise AssertionError("closed markets need no book read")
+
+    api = UnifiedPolymarketAPI(settings=V3Settings())
+    api.public_client = PublicClient()
+    with pytest.raises(MarketClosedError, match="market closed"):
+        asyncio.run(api.get_verified_market_context("condition-1", "token-1"))
+    assert calls == [None, True]
+
+
+def test_market_context_unknown_condition_still_fails_generically():
+    from src.v3.api import MarketClosedError
+
+    class PublicClient:
+        def list_markets(self, **kwargs):
+            return _Pages([])
+
+    api = UnifiedPolymarketAPI(settings=V3Settings())
+    api.public_client = PublicClient()
+    with pytest.raises(RuntimeError, match="exactly one market") as raised:
+        asyncio.run(api.get_verified_market_context("condition-1", "token-1"))
+    assert not isinstance(raised.value, MarketClosedError)

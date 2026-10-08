@@ -288,8 +288,18 @@ class LiveOrderService:
                 timestamp = context.book_timestamp
                 if timestamp is None or timestamp.tzinfo is None:
                     raise ValueError("book timestamp missing or timezone-naive")
-                age = (datetime.now(timezone.utc) - timestamp).total_seconds()
-                if age < 0 or age > self._risk.limits.max_quote_age_seconds:
+                checked_at = datetime.now(timezone.utc)
+                if intent.side == "SELL":
+                    # The book timestamp is its last change, not its read time:
+                    # a quiet book read just now is current. Exits measure age
+                    # from the context's own read and reject future-dated books.
+                    fetched_at = getattr(context, "fetched_at", None)
+                    if not isinstance(fetched_at, datetime) or fetched_at.tzinfo is None:
+                        raise ValueError("book read time missing or timezone-naive")
+                    age = (checked_at - fetched_at).total_seconds()
+                else:
+                    age = (checked_at - timestamp).total_seconds()
+                if age < 0 or age > self._risk.limits.max_quote_age_seconds or timestamp > checked_at:
                     reason = "order-book quote is stale"
                 elif not context.book_hash:
                     reason = "order-book hash is missing"

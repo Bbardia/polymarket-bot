@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.v3.live_early_exit import (
-    ExitPosition, VerifiedBook, plan_live_early_exit, verified_book_from_api,
+    ExitPosition, VerifiedBook, is_dust, plan_live_early_exit, verified_book_from_api,
 )
 from src.v3.math import BookLevel
 
@@ -83,9 +83,14 @@ def test_hybrid_first_tranche_quantity_override_is_bounded_and_rounded_down():
 
 
 def test_too_small_tranche_and_unverified_metadata_rejected():
-    small = plan_live_early_exit(position(shares=D("1"), all_in_cost=D("0.5"), hybrid_enabled=True), book(min_size="1"))
+    small = plan_live_early_exit(position(shares=D("0.9"), all_in_cost=D("0.45"), hybrid_enabled=True), book(min_size="1"))
     assert small.intent is None
     assert "minimum" in small.reason
+    runner = plan_live_early_exit(
+        position(shares=D("4.99"), all_in_cost=D("2"), hybrid_enabled=True, hybrid_exit_done=True),
+        book(min_size="5", step="0.01"),
+    )
+    assert runner.intent is None and "minimum" in runner.reason
     unverified = plan_live_early_exit(position(), book(fresh=False))
     assert unverified.intent is None
     assert "unverified" in unverified.reason
@@ -220,3 +225,83 @@ def test_api_verified_book_rejects_duplicate_bid_prices():
             context, duplicated, condition_id="cond", token_id="tok", now=now,
             max_quote_age_seconds=30,
         )
+
+
+def _live_book():
+    # Real venue rules: 5-share minimum, two share decimals.
+    return book(min_size="5", step="0.01", bids=(BookLevel(D("0.8"), D("50")),))
+
+
+@pytest.mark.parametrize("shares", [D("5"), D("5.3"), D("6.5")])
+def test_sub_minimum_first_tranche_falls_back_to_full_exit(shares):
+    cost = shares * D("0.5")
+    result = plan_live_early_exit(position(shares=shares, all_in_cost=cost, hybrid_enabled=True), _live_book())
+    intent = result.intent
+    assert intent is not None, result.reason
+    assert intent.stage == "full" and intent.size == shares
+    # Same economics as the first tranche, not the runner's.
+    assert intent.target_return == D("0.28")
+    assert intent.estimated_profit == intent.estimated_net_proceeds - cost
+
+
+def test_sub_minimum_runner_remainder_sells_everything_at_once():
+    # 75% of 13.36 is 10.02, which would leave an unsellable 3.34-share runner.
+    result = plan_live_early_exit(
+        position(shares=D("13.36"), all_in_cost=D("6.68"), hybrid_enabled=True), _live_book(),
+    )
+    assert result.intent is not None, result.reason
+    assert result.intent.stage == "full" and result.intent.size == D("13.36")
+    assert result.intent.target_return == D("0.28")
+
+
+def test_tranche_with_sellable_runner_is_unchanged():
+    result = plan_live_early_exit(
+        position(shares=D("30"), all_in_cost=D("15"), hybrid_enabled=True), _live_book(),
+    )
+    assert result.intent is not None
+    assert result.intent.stage == "first_tranche" and result.intent.size == D("22.50")
+
+
+def test_sub_step_dust_is_rounded_down_and_left_behind():
+    result = plan_live_early_exit(
+        position(shares=D("5.173528"), all_in_cost=D("1.6555"), hybrid_enabled=True), _live_book(),
+    )
+    assert result.intent is not None
+    assert result.intent.stage == "full" and result.intent.size == D("5.17")
+    assert is_dust(D("5.173528") - result.intent.size)
+    assert is_dust(D("0.009")) and not is_dust(D("0.01")) and not is_dust(None)
+
+
+def test_partial_first_tranche_remainder_below_minimum_sells_whole_position():
+    # 2 of a 10-share first tranche remain unfilled; 2 < 5 cannot be quoted.
+    result = plan_live_early_exit(
+        position(shares=D("12"), all_in_cost=D("6"), hybrid_enabled=True), _live_book(),
+        first_tranche_quantity=D("2"),
+    )
+    assert result.intent is not None
+    assert result.intent.stage == "full" and result.intent.size == D("12")
+
+
+def test_api_verified_book_measures_age_from_read_time_not_last_book_change():
+    context, raw, at = _verified_api_pair()
+    quiet_now = at.replace(hour=13)  # book unchanged for an hour
+    with pytest.raises(ValueError, match="stale"):
+        verified_book_from_api(context, raw, condition_id="cond", token_id="tok",
+                               now=quiet_now, max_quote_age_seconds=30)
+    fresh = SimpleNamespace(**{**vars(context), "fetched_at": quiet_now.replace(second=5)})
+    verified = verified_book_from_api(fresh, raw, condition_id="cond", token_id="tok",
+                                      now=quiet_now.replace(second=10), max_quote_age_seconds=30)
+    assert verified.fresh
+    stale_read = SimpleNamespace(**{**vars(context), "fetched_at": quiet_now})
+    with pytest.raises(ValueError, match="stale"):
+        verified_book_from_api(stale_read, raw, condition_id="cond", token_id="tok",
+                               now=quiet_now.replace(minute=1), max_quote_age_seconds=30)
+    future_book = SimpleNamespace(**{**vars(raw), "timestamp": quiet_now.replace(minute=5)})
+    future_context = SimpleNamespace(**{**vars(fresh), "book_timestamp": future_book.timestamp})
+    with pytest.raises(ValueError, match="future-dated"):
+        verified_book_from_api(future_context, future_book, condition_id="cond", token_id="tok",
+                               now=quiet_now.replace(second=10), max_quote_age_seconds=30)
+    naive = SimpleNamespace(**{**vars(context), "fetched_at": quiet_now.replace(tzinfo=None)})
+    with pytest.raises(ValueError, match="invalid"):
+        verified_book_from_api(naive, raw, condition_id="cond", token_id="tok",
+                               now=quiet_now, max_quote_age_seconds=30)

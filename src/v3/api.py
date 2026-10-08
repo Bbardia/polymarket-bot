@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -87,6 +87,10 @@ class CompleteAccountCashFlowHistory:
 
 
 SecureClientFactory = Callable[..., Awaitable[Any]]
+
+
+class MarketClosedError(RuntimeError):
+    """The condition's market is closed; no live order can be placed in it."""
 
 
 class UnifiedPolymarketAPI:
@@ -608,7 +612,11 @@ class UnifiedPolymarketAPI:
             raise ValueError("condition_id is required")
         matches: list[Any] = []
         pages = 0
-        async for page in self.public_client.list_markets(condition_ids=[condition_id], page_size=20):
+        # Redemption only concerns resolved markets; Gamma omits closed markets
+        # unless they are requested explicitly.
+        async for page in self.public_client.list_markets(
+            condition_ids=[condition_id], closed=True, page_size=20,
+        ):
             pages += 1
             if pages > 5:
                 raise RuntimeError("market metadata page limit exceeded")
@@ -670,13 +678,17 @@ class UnifiedPolymarketAPI:
                     matches.append(market)
                     if len(matches) > 1:
                         raise RuntimeError("condition resolved to multiple market records")
+        if not matches and await self._market_is_closed(condition_id):
+            raise MarketClosedError("market closed")
         if len(matches) != 1:
             raise RuntimeError("condition did not resolve to exactly one market")
 
+        fetched_at = datetime.now(timezone.utc)
         book = await self.public_client.get_order_book(token_id=token_id)
         if str(getattr(book, "token_id", "") or "") != token_id:
             raise RuntimeError("order book token does not match requested token")
-        context = MarketContext.from_sdk(matches[0], book)
+        # The read time is taken before the request, so age is never understated.
+        context = replace(MarketContext.from_sdk(matches[0], book), fetched_at=fetched_at, book=book)
         if not context.condition_matches:
             raise RuntimeError("market and order book condition IDs do not match")
         if not context.token_matches:
@@ -686,6 +698,20 @@ class UnifiedPolymarketAPI:
         if not context.book_hash:
             raise RuntimeError("order book hash is missing")
         return context
+
+    async def _market_is_closed(self, condition_id: str) -> bool:
+        """True only for exactly one explicitly closed market record."""
+        matches: list[Any] = []
+        async for page in self.public_client.list_markets(
+            condition_ids=[condition_id], closed=True, page_size=5,
+        ):
+            matches.extend(
+                market for market in page.items
+                if str(getattr(market, "condition_id", "") or "") == condition_id
+            )
+            if len(matches) > 1:
+                return False
+        return len(matches) == 1 and getattr(getattr(matches[0], "state", None), "closed", None) is True
 
     async def get_order_book(self, token_id: str):
         """Read-only typed Decimal order book from CLOB V2."""

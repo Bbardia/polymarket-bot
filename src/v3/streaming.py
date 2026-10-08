@@ -1713,6 +1713,11 @@ class StreamEventProcessor:
             return ProcessResult(False, requires_reconciliation=True, reason=reason)
         # SELL-maker replay is deliberately limited to one uniquely persisted,
         # post-only managed order with complete, internally consistent fill data.
+        # Like BUY makers, a not-yet-confirmed row is recorded without inventory
+        # effect, and the maker fee may come from an explicit zero trade fee;
+        # an unknown fee on a confirmed row takes the common latch below. The
+        # trade's top-level side/token/size/price describe the taker and may
+        # legitimately differ (complementary or multi-maker matches).
         sell_makers = [maker for maker in trade.maker_orders
                        if maker.order_id in self.managed_order_ids
                        and self.orders.get(maker.order_id) is not None
@@ -1720,6 +1725,7 @@ class StreamEventProcessor:
         if sell_makers:
             maker = sell_makers[0]
             order = self.orders[maker.order_id]
+            maker_fee = next(row["fee_rate_bps"] for row in maker_rows if row["order_id"] == maker.order_id)
             accepted = [event for event in self.ledger.events()
                         if event.event_type == "order.accepted"
                         and event.payload.get("order_id") == maker.order_id]
@@ -1727,17 +1733,14 @@ class StreamEventProcessor:
                 len(sell_makers) == 1 and len(accepted) == 1
                 and accepted[0].payload.get("post_only") is True
                 and accepted[0].payload.get("side") == "SELL"
-                and accepted[0].payload.get("token_id") == order.token_id == maker.token_id == trade.token_id
+                and accepted[0].payload.get("token_id") == order.token_id == maker.token_id
                 and accepted[0].payload.get("condition_id") == trade.condition_id
-                and maker.side == "SELL" and trade.side == "BUY"
+                and maker.side == "SELL"
                 and trade.trader_side == "MAKER"
-                and trade.status == "CONFIRMED"
-                and trade.fee_rate_bps is not None and maker.fee_rate_bps is not None
                 and maker.matched_amount.is_finite() and maker.matched_amount > ZERO
                 and maker.matched_amount <= order.requested_size
-                and maker.price.is_finite() and maker.price > ZERO
-                and maker.fee_rate_bps.is_finite() and maker.fee_rate_bps >= ZERO
-                and trade.size == maker.matched_amount and trade.price == maker.price
+                and maker.price.is_finite() and ZERO < maker.price < Decimal("1")
+                and (maker_fee is None or (maker_fee.is_finite() and maker_fee >= ZERO))
             )
             if not valid:
                 reason = "managed SELL maker fill lacks unique post-only evidence or consistent confirmed fee/quantity"
@@ -1952,14 +1955,15 @@ class StreamEventProcessor:
                     _value(target_payload, "asset_id", "token_id", default="")
                 )
                 if order.side == "SELL":
+                    # Confirmed rows without a fee already failed above; earlier
+                    # statuses are recorded without inventory effect, as for BUYs.
                     accepted = [event for event in self.ledger.events()
                                 if event.event_type == "order.accepted"
                                 and event.payload.get("order_id") == order.order_id]
                     if (
-                        size_key != "matched_amount" or status is not TradeStatus.CONFIRMED
+                        size_key != "matched_amount"
                         or str(_value(target_payload, "side", default="")) != "SELL"
-                        or str(_value(payload, "side", default="")) != "BUY"
-                        or fee_rate_value is None or len(accepted) != 1
+                        or len(accepted) != 1
                         or accepted[0].payload.get("post_only") is not True
                         or accepted[0].payload.get("side") != "SELL"
                         or accepted[0].payload.get("token_id") != order.token_id

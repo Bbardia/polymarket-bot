@@ -312,3 +312,49 @@ def test_market_neg_risk_metadata_refuses_missing_or_ambiguous_market():
     rows = [NS(condition_id="weather-1", state=NS(neg_risk=False))] * 2
     with pytest.raises(RuntimeError, match="multiple market"):
         asyncio.run(check(rows))
+
+
+def test_market_neg_risk_lookup_queries_closed_markets():
+    calls = []
+
+    class MarketFeed:
+        async def list_markets(self, **kwargs):
+            calls.append(kwargs)
+            yield NS(items=[NS(condition_id="weather-1", state=NS(neg_risk=True, closed=True))])
+
+    api = UnifiedPolymarketAPI(settings=V3Settings())
+    cast(Any, api).public_client = MarketFeed()
+    assert asyncio.run(api.fetch_market_is_neg_risk("weather-1")) is True
+    assert calls == [{"condition_ids": ["weather-1"], "closed": True, "page_size": 20}]
+
+
+def _run_with(api):
+    ledger = _ledger()
+    skipped = []
+    fresh, records, pending = asyncio.run(auto_redeem_one_managed_winner(
+        ledger=ledger, processor=_processor(ledger), baseline_cash=D("100"), remote=_remote(),
+        api=api, reconciler=Reconciler(), external_condition_ids=frozenset(),
+        baseline_epoch=0, now=NOW, skipped=skipped,
+    ))
+    assert records == () and pending is None
+    assert api.client.calls == []
+    assert not any(e.event_type.startswith("auto_redemption.") for e in ledger.events())
+    return skipped
+
+
+def test_neg_risk_winner_is_skipped_with_explicit_status_reason():
+    api = FakeAPI(_remote(quantity=None, cash="102.5"))
+    api.fetch_market_is_neg_risk = AsyncMock(return_value=True)
+    assert _run_with(api) == [{
+        "condition_id": "weather-1", "token_id": "managed",
+        "reason": "skipped: neg-risk redemption unsupported",
+    }]
+
+
+@pytest.mark.parametrize("lookup", ["fetch_market_is_neg_risk", "fetch_resolved_winner"])
+def test_per_candidate_lookup_error_is_a_skip_not_an_exception(lookup):
+    api = FakeAPI(_remote(quantity=None, cash="102.5"))
+    setattr(api, lookup, AsyncMock(side_effect=RuntimeError("condition did not resolve to exactly one market")))
+    skipped = _run_with(api)
+    assert len(skipped) == 1 and skipped[0]["token_id"] == "managed"
+    assert skipped[0]["reason"].startswith("skipped: ") and "RuntimeError" in skipped[0]["reason"]
