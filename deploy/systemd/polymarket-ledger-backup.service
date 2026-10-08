@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily consistent backup of the live V7 ledger and live_state.json
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/rasbardi/polymarket-bot
+ExecStart=/bin/bash /home/rasbardi/polymarket-bot/scripts/backup_live_ledger.sh
+Environment=PYTHON=/home/rasbardi/polymarket-bot/venv/bin/python
+TimeoutStartSec=10min

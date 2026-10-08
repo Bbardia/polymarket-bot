@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily user logrotate for Polymarket bot logs
+
+[Timer]
+OnCalendar=*-*-* 00:05:00
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
