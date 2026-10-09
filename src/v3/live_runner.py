@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import signal
+import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -713,6 +714,7 @@ class LiveTradingRunner(LiveShadowRunner):
         return status
 
     async def run_cycle(self, *, now: datetime | None = None) -> dict[str, Any]:
+        cycle_clock = time.monotonic()
         now = now or _utc_now()
         today = now.date().isoformat()
         status: dict[str, Any] = {
@@ -759,6 +761,7 @@ class LiveTradingRunner(LiveShadowRunner):
                 raise
             status["remote_snapshot_error"] = type(exc).__name__
             return self._soft_failure(status, "remote account snapshot unavailable", advance_cycle=True)
+        account_read_seconds = round(time.monotonic() - cycle_clock, 3)
         processor = StreamEventProcessor(self.ledger)
         status["orders_marked_expired"] = []
         status["orders_marked_terminal_canceled"] = []
@@ -915,6 +918,7 @@ class LiveTradingRunner(LiveShadowRunner):
         status["early_exits"] = []
         status["early_exit_block_reason"] = exit_block
         exit_accepted = False
+        exit_clock = time.monotonic()
         if self.runner_settings.live_early_exit_enabled and exit_block is None:
             status["early_exits"] = await self._run_early_exits(
                 processor=processor, local=local, remote=remote, risk_context=risk_context, now=now,
@@ -933,6 +937,7 @@ class LiveTradingRunner(LiveShadowRunner):
                     post_exit_processor.reconciliation_reasons
                 )
 
+        exit_seconds = round(time.monotonic() - exit_clock, 3)
         policy = self.policy
         if policy.kelly_sizing_enabled:
             bankroll = max(ZERO, min(
@@ -942,10 +947,12 @@ class LiveTradingRunner(LiveShadowRunner):
                 policy, sizing_bankroll=bankroll,
                 max_order_notional=min(self.settings.max_order_notional, policy.max_order_notional),
             )
+        weather_clock = time.monotonic()
         result = await evaluate_weather_universe(
             client=self.weather_client, forecast=self.forecast, policy=policy,
             observation_provider=self.observation_provider, now=now,
         )
+        weather_seconds = round(time.monotonic() - weather_clock, 3)
         candidates = select_v7_candidates(result.evaluations)
         outcomes: dict[str, int] = {}
         for evaluation in candidates:
@@ -1057,6 +1064,12 @@ class LiveTradingRunner(LiveShadowRunner):
         self.store.save_state(self.state)
         status.update({
             "cycle": self.state["cycles"],
+            "cycle_timing_seconds": {
+                "account_read": account_read_seconds,
+                "early_exits": exit_seconds,
+                "weather_evaluation": weather_seconds,
+                "total": round(time.monotonic() - cycle_clock, 3),
+            },
             "entry_block_reason": entry_block,
             "weather_markets_evaluated": result.markets_evaluated,
             "weather_forecast_status": result.forecast_status,

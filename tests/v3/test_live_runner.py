@@ -1200,6 +1200,10 @@ def test_cycle_submits_through_service_and_records_event_order(tmp_path, monkeyp
     runner, store = _runner(tmp_path, monkeypatch, service=service)
     status = asyncio.run(runner.run_cycle(now=NOW))
     assert status["outcomes_this_cycle"] == {"accepted": 1}
+    timings = status["cycle_timing_seconds"]
+    assert set(timings) == {"account_read", "early_exits", "weather_evaluation", "total"}
+    assert all(isinstance(value, float) and value >= 0 for value in timings.values())
+    assert timings["total"] >= timings["account_read"]
     intent, local, context = service.submitted[0]
     assert intent.post_only and intent.side == "BUY" and intent.all_in_notional == D("1.90")
     assert context.daily_pnl == D("0") and context.peak_equity == D("237.13")
