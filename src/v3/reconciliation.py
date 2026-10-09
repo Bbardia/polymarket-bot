@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 import re
 from typing import Iterable
 
@@ -115,14 +115,21 @@ def _validate_trade_economics(price: Decimal, size: Decimal, fee: Decimal | None
 
 
 def _quantity_matches(local: Decimal, remote: Decimal) -> bool:
-    """Only a four-decimal remote display may round higher-precision inventory."""
+    """Match exact inventory or an observed four-decimal API display.
+
+    The positions API can truncate a higher-precision holding (4.666664 to
+    4.6666), while other rows round to nearest. These are display-compatible
+    values, NOT proof of exact ERC-1155 balance; independently check exact chain
+    inventory before activating live trading. Never widen the comparison by a
+    full display unit or accept a different reported precision.
+    """
     quantum = Decimal('0.0001')
     return local == remote or (
         remote.as_tuple().exponent == -4
         and isinstance(local.as_tuple().exponent, int)
         and local.as_tuple().exponent < -4
-        and local.quantize(quantum) == remote
-        and abs(local - remote) <= quantum / 2
+        and local > ZERO
+        and remote in (local.quantize(quantum), local.quantize(quantum, rounding=ROUND_DOWN))
     )
 
 

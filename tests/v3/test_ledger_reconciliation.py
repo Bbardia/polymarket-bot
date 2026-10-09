@@ -128,6 +128,44 @@ def test_partial_fill_quantity_drift_blocks_trading():
     assert report.position_mismatches == ("token-1",)
 
 
+def test_four_decimal_remote_display_can_truncate_exact_managed_quantity():
+    local = LocalSnapshot(
+        cash=D("10"), position_tokens=frozenset({"token-1"}), order_ids=frozenset(),
+        position_quantities={"token-1": D("4.666664")},
+        position_cost_basis={"token-1": D("1.166666")},
+    )
+    remote = RemoteSnapshot(
+        cash=D("10"),
+        positions=(RemotePosition("c1", "token-1", D("4.6666"), D("1"), D("1.1666")),),
+        open_orders=(),
+    )
+    assert Reconciler(cost_tolerance=D("0.01")).compare(local, remote).safe_to_trade
+    rounded = RemoteSnapshot(
+        cash=D("10"),
+        positions=(RemotePosition("c1", "token-1", D("4.6667"), D("1"), D("1.1666")),),
+        open_orders=(),
+    )
+    assert Reconciler(cost_tolerance=D("0.01")).compare(local, rounded).safe_to_trade
+
+
+def test_display_precision_does_not_mask_full_unit_drift_or_other_precision():
+    for remote_quantity in ("4.6665", "4.6668", "4.66660", "4.666"):
+        report = Reconciler(cost_tolerance=D("0.01")).compare(
+            LocalSnapshot(
+                cash=D("10"), position_tokens=frozenset({"token-1"}), order_ids=frozenset(),
+                position_quantities={"token-1": D("4.666664")},
+                position_cost_basis={"token-1": D("1.166666")},
+            ),
+            RemoteSnapshot(
+                cash=D("10"), positions=(RemotePosition(
+                    "c1", "token-1", D(remote_quantity), D("1"), D("1.1666"),
+                ),), open_orders=(),
+            ),
+        )
+        assert not report.safe_to_trade, remote_quantity
+        assert report.position_mismatches == ("token-1",)
+
+
 def test_cost_basis_drift_and_missing_local_position_detail_block_trading():
     remote = RemoteSnapshot(
         cash=D("10"),
