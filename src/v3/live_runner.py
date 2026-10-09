@@ -67,6 +67,22 @@ SNAPSHOT_RETRY_MAX_DELAY_SECONDS = 10.0
 _sleep = asyncio.sleep
 
 
+def _weather_failure_code(reason: str) -> str:
+    """A fixed diagnostic category; never persist provider exception text or URLs."""
+    detail = reason.lower()
+    if "429" in detail or "quota" in detail or "rate limit" in detail:
+        return "rate_limited"
+    if "backoff" in detail:
+        return "backoff"
+    if "timeout" in detail or "timed out" in detail:
+        return "timeout"
+    if "http 5" in detail or "status 5" in detail:
+        return "upstream_http_error"
+    if "response" in detail or "parse" in detail or "valueerror" in detail:
+        return "invalid_response"
+    return "provider_error"
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -694,6 +710,7 @@ class LiveTradingRunner(LiveShadowRunner):
             "weather_markets_evaluated": 0,
             "weather_forecast_status": "not_started",
             "weather_errors": 0,
+            "weather_provider_failures": {},
             "v7_candidates": 0,
             "outcomes_this_cycle": {},
             "limits": asdict(self.risk.limits),
@@ -1074,6 +1091,11 @@ class LiveTradingRunner(LiveShadowRunner):
             "weather_markets_evaluated": result.markets_evaluated,
             "weather_forecast_status": result.forecast_status,
             "weather_errors": len(result.errors),
+            "weather_provider_failures": {
+                str(name) if name in {"open-meteo", "met-no", "seven-timer", "nws", "jma"} else "unknown":
+                _weather_failure_code(str(reason))
+                for name, reason in getattr(result, "provider_failures", ())
+            },
             "v7_candidates": len(candidates),
             "outcomes_this_cycle": outcomes,
             "limits": asdict(self.risk.limits),

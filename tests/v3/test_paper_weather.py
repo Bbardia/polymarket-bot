@@ -1630,6 +1630,147 @@ def test_jma_forecast_parses_tokyo_daily_maximum_and_rejects_other_cities():
         asyncio.run(JMAForecast(fetch_json=fetch_json).forecast(other))
 
 
+def test_jma_missing_target_date_is_coverage_gap_not_a_provider_outage():
+    tokyo = parse_exact_high_contract(
+        "Will the highest temperature in Tokyo be 24°C on October 9?",
+        end_date=datetime(2026, 10, 9, 12, tzinfo=timezone.utc),
+    )
+    tomorrow = parse_exact_high_contract(
+        "Will the highest temperature in Tokyo be 24°C on October 10?",
+        end_date=datetime(2026, 10, 10, 12, tzinfo=timezone.utc),
+    )
+    assert tokyo is not None and tomorrow is not None
+    calls = []
+
+    def fetch_json(url, *, params, headers, timeout):
+        calls.append(url)
+        return [{"timeSeries": [{
+            "timeDefines": ["2026-10-10T09:00:00+09:00"],
+            "areas": [{"area": {"code": "44132"}, "tempsMax": ["24"]}],
+        }]}]
+
+    jma = JMAForecast(fetch_json=fetch_json)
+    with pytest.raises(ForecastUnavailableError) as unavailable:
+        asyncio.run(jma.forecast(tokyo))
+    assert not unavailable.value.provider_covered
+    assert not unavailable.value.provider_global
+
+    class Fallback:
+        name = "met-no"
+
+        async def forecast(self, contract, *, now=None):
+            return EnsembleForecast(
+                raw_probability=D("0.6"), ensemble_mean_c=D("24"),
+                ensemble_std_c=D("1"), n_members=4, lead_days=1,
+            )
+
+    ensemble = ResilientForecastEnsemble((jma, Fallback()))
+    first = asyncio.run(ensemble.forecast(tokyo))
+    assert first.provider_failures == ()
+    next_day = asyncio.run(ensemble.forecast(tomorrow))
+    assert "jma" in next_day.provider_names
+    assert next_day.provider_failures == ()
+    assert len(calls) == 3  # direct probe, coverage gap, and the later valid day
+
+
+def test_total_provider_outage_preserves_structured_failure_diagnostics():
+    market = weather_market()
+    books = [book(f"{side}-weather-1", bid=bid, ask=ask) for side, bid, ask in (
+        ("yes", "0.09", "0.10"), ("no", "0.89", "0.90"),
+    )]
+
+    class Client(FakePublicClient):
+        book_calls = 0
+
+        async def get_order_books(self, *, token_ids):
+            self.book_calls += 1
+            return await super().get_order_books(token_ids=token_ids)
+
+    class Broken:
+        name = "met-no"
+
+        async def forecast(self, contract, *, now=None):
+            raise ForecastUnavailableError("HTTP 429 private URL", provider_global=True)
+
+    client = Client([market], books)
+    result = asyncio.run(evaluate_weather_universe(
+        client=client, forecast=ResilientForecastEnsemble([Broken()]),
+        policy=WeatherPaperPolicy(), now=datetime(2026, 8, 24, tzinfo=timezone.utc),
+    ))
+    assert result.forecast_status == "unavailable"
+    assert result.provider_failures == (("met-no", "ForecastUnavailableError: HTTP 429 private URL"),)
+    assert result.evaluations == ()
+    assert client.book_calls == 0
+
+
+def test_jma_point_temperature_cannot_replace_missing_daily_high():
+    tokyo = parse_exact_high_contract(
+        "Will the highest temperature in Tokyo be 24°C on October 9?",
+        end_date=datetime(2026, 10, 9, 12, tzinfo=timezone.utc),
+    )
+    assert tokyo is not None
+    payload = [{"timeSeries": [{
+        "timeDefines": ["2026-10-09T09:00:00+09:00"],
+        "areas": [{"area": {"code": "44132"}, "temps": ["24"], "tempsMax": [""]}],
+    }]}]
+    jma = JMAForecast(fetch_json=lambda *args, **kwargs: payload)
+    with pytest.raises(ForecastUnavailableError) as unavailable:
+        asyncio.run(jma.forecast(tokyo))
+    assert not unavailable.value.provider_covered
+    assert (tokyo.city, tokyo.target_date) not in jma._cache
+
+
+def test_jma_malformed_response_is_still_a_covered_provider_failure():
+    tokyo = parse_exact_high_contract(
+        "Will the highest temperature in Tokyo be 24°C on October 9?",
+        end_date=datetime(2026, 10, 9, 12, tzinfo=timezone.utc),
+    )
+    assert tokyo is not None
+    jma = JMAForecast(fetch_json=lambda *args, **kwargs: [])
+    with pytest.raises(ForecastUnavailableError) as unavailable:
+        asyncio.run(jma.forecast(tokyo))
+    assert unavailable.value.provider_covered
+    assert "no usable maximum temperatures" in str(unavailable.value)
+
+
+def test_ensemble_backoff_does_not_mark_uncovered_city_degraded():
+    tokyo = parse_exact_high_contract(
+        "Will the highest temperature in Tokyo be 24°C on October 9?",
+        end_date=datetime(2026, 10, 9, 12, tzinfo=timezone.utc),
+    )
+    ankara = parse_exact_high_contract(
+        "Will the highest temperature in Ankara be 24°C on October 9?",
+        end_date=datetime(2026, 10, 9, 12, tzinfo=timezone.utc),
+    )
+    assert tokyo is not None and ankara is not None
+
+    class UnavailableTokyo:
+        name = "jma"
+        covered_cities = frozenset({"tokyo"})
+        calls = 0
+
+        async def forecast(self, contract, *, now=None):
+            self.calls += 1
+            raise ForecastUnavailableError("JMA HTTP 429", provider_global=True)
+
+    class Fallback:
+        name = "met-no"
+
+        async def forecast(self, contract, *, now=None):
+            return EnsembleForecast(
+                raw_probability=D("0.6"), ensemble_mean_c=D("24"),
+                ensemble_std_c=D("1"), n_members=4, lead_days=1,
+            )
+
+    jma = UnavailableTokyo()
+    ensemble = ResilientForecastEnsemble((jma, Fallback()))
+    first = asyncio.run(ensemble.forecast(tokyo))
+    assert first.provider_failures[0][0] == "jma"
+    other = asyncio.run(ensemble.forecast(ankara))
+    assert other.provider_failures == ()
+    assert jma.calls == 1  # provider-wide backoff still suppresses covered retries
+
+
 def test_resilient_ensemble_selects_weights_by_city_continent():
     tokyo = parse_exact_high_contract(
         "Will the highest temperature in Tokyo be 32°C on August 25?",

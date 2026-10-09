@@ -1195,6 +1195,25 @@ def test_live_early_exit_setting_defaults_off_and_reads_explicit_opt_in(monkeypa
     assert LiveRunnerSettings.from_env(tmp_path).live_early_exit_enabled
 
 
+def test_live_cycle_persists_bounded_weather_provider_reasons(tmp_path, monkeypatch):
+    runner, store = _runner(tmp_path, monkeypatch, evaluations=())
+
+    async def degraded_universe(**kwargs):
+        return SimpleNamespace(
+            evaluations=(), markets_evaluated=1, forecast_status="degraded",
+            errors=(), provider_failures=(("jma", "HTTP 429 https://example.invalid/?token=secret"),),
+        )
+
+    from src.v3 import live_runner
+    monkeypatch.setattr(live_runner, "evaluate_weather_universe", degraded_universe)
+    status = asyncio.run(runner.run_cycle(now=NOW))
+    assert status["weather_provider_failures"] == {"jma": "rate_limited"}
+    assert json.loads(store.status_path.read_text())["weather_provider_failures"] == {
+        "jma": "rate_limited",
+    }
+    assert "secret" not in store.status_path.read_text()
+
+
 def test_cycle_submits_through_service_and_records_event_order(tmp_path, monkeypatch):
     service = _Service()
     runner, store = _runner(tmp_path, monkeypatch, service=service)

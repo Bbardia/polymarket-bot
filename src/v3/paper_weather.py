@@ -421,10 +421,12 @@ class ForecastUnavailableError(RuntimeError):
         *,
         provider_global: bool = False,
         provider_covered: bool = True,
+        provider_failures: tuple[tuple[str, str], ...] = (),
     ) -> None:
         super().__init__(message)
         self.provider_global = provider_global
         self.provider_covered = provider_covered
+        self.provider_failures = provider_failures
 
 
 @dataclass(frozen=True)
@@ -1758,6 +1760,7 @@ class JMAForecast:
                 if not isinstance(payload, list):
                     raise ValueError("JMA response must be a JSON list")
                 values: list[float] = []
+                available_dates: set[str] = set()
                 for report in payload:
                     if not isinstance(report, dict):
                         continue
@@ -1773,31 +1776,47 @@ class JMAForecast:
                                 continue
                             temperatures = area.get("temps")
                             if isinstance(temperatures, list):
+                                # JMA's ``temps`` are point temperatures, not
+                                # daily highs. They establish a valid forecast
+                                # response but must NEVER price a high contract.
                                 for raw_time, raw_temperature in zip(times, temperatures):
-                                    if (
-                                        isinstance(raw_time, str)
-                                        and raw_time[:10] == contract.target_date
-                                        and raw_temperature not in (None, "")
-                                    ):
-                                        value = float(raw_temperature)
+                                    if isinstance(raw_time, str) and raw_temperature not in (None, ""):
+                                        try:
+                                            value = float(raw_temperature)
+                                        except (TypeError, ValueError):
+                                            continue
                                         if math.isfinite(value):
-                                            values.append(value)
+                                            available_dates.add(raw_time[:10])
                             maxima = area.get("tempsMax")
                             if not isinstance(maxima, list):
                                 continue
                             for index, raw_time in enumerate(times):
                                 if (
                                     isinstance(raw_time, str)
-                                    and raw_time[:10] == contract.target_date
                                     and index < len(maxima)
                                     and maxima[index] not in (None, "")
                                 ):
-                                    value = float(maxima[index])
+                                    if raw_time[:10] != contract.target_date:
+                                        try:
+                                            value = float(maxima[index])
+                                        except (TypeError, ValueError):
+                                            continue
+                                    else:
+                                        value = float(maxima[index])
                                     if math.isfinite(value):
-                                        values.append(value)
+                                        available_dates.add(raw_time[:10])
+                                        if raw_time[:10] == contract.target_date:
+                                            values.append(value)
                 if not values:
-                    raise ValueError("JMA response has no target-date maximum temperature")
+                    if available_dates:
+                        raise ForecastUnavailableError(
+                            f"JMA has no target-date maximum temperature for {contract.event_key}",
+                            provider_covered=False,
+                        )
+                    raise ValueError("JMA response has no usable maximum temperatures")
                 maximum = max(values)
+            except ForecastUnavailableError:
+                raise
             except Exception as exc:
                 detail = f"{type(exc).__name__}: {exc}"
                 raise ForecastUnavailableError(
@@ -2185,6 +2204,11 @@ class ResilientForecastEnsemble:
         )
         for provider in self.providers:
             name = str(getattr(provider, "name", type(provider).__name__.lower()))
+            covered_cities = getattr(provider, "covered_cities", None)
+            if covered_cities is not None and contract.city not in covered_cities:
+                # Coverage must be checked before provider-wide failure backoff;
+                # otherwise a Tokyo outage degrades unrelated cities.
+                continue
             if name == "seven-timer" and any(
                 existing_name == "open-meteo"
                 for existing_name, _result in successful
@@ -2221,6 +2245,7 @@ class ResilientForecastEnsemble:
             raise ForecastUnavailableError(
                 f"all forecast providers unavailable for {contract.event_key}: {detail}",
                 provider_global=True,
+                provider_failures=tuple(failures),
             )
 
         values: list[tuple[str, EnsembleForecast, Decimal, Decimal]] = []
@@ -2789,6 +2814,7 @@ async def evaluate_weather_universe(
                 point_forecast = await forecast.forecast(contract, now=now)
             except ForecastUnavailableError as exc:
                 markets_forecast_unavailable += 1
+                provider_failures.update(exc.provider_failures)
                 error_key = "provider-global" if exc.provider_global else contract.event_key
                 if error_key not in forecast_error_keys:
                     forecast_error_keys.add(error_key)
