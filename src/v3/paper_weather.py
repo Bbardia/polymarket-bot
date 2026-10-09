@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
+from polymarket.errors import RateLimitError, TransportError, UnexpectedResponseError
 from polymarket.models.gamma.market import Market
 
 from .market_context import MarketContext
@@ -2693,6 +2694,13 @@ def _preferred_weather_side(options: tuple[WeatherEvaluation, ...]) -> WeatherEv
     return max(options, key=lambda item: (item.paper_tradeable, item.decision.net_edge))
 
 
+def _checked_weather_books(token_ids: list[str], books: Sequence[Any]) -> dict[str, Any]:
+    returned = [str(book.token_id) for book in books]
+    if len(returned) != len(set(returned)) or set(returned) != set(token_ids):
+        raise ValueError("weather book batch omitted, duplicated, or added outcome tokens")
+    return dict(zip(returned, books))
+
+
 async def evaluate_weather_universe(
     *,
     client: WeatherPublicClient,
@@ -2771,8 +2779,12 @@ async def evaluate_weather_universe(
     markets_side_evaluable = 0
     provider_names: set[str] = set()
     provider_failures: dict[str, str] = {}
-    for market, contract, station_id in markets:
-        try:
+    book_api_blocked = False
+    for offset in range(0, len(markets), 5):
+        # Within each bounded group, forecast first: a provider outage must not trigger unnecessary book calls.
+        # Keep forecasts serial so provider-local caches/backoff retain their ordering.
+        prepared: list[tuple[Any, HighTemperatureContract, str, EnsembleForecast]] = []
+        for market, contract, station_id in markets[offset:offset + 5]:
             try:
                 point_forecast = await forecast.forecast(contract, now=now)
             except ForecastUnavailableError as exc:
@@ -2808,114 +2820,173 @@ async def evaluate_weather_universe(
             provider_names.update(point_forecast.provider_names)
             provider_failures.update(dict(point_forecast.provider_failures))
             markets_modeled += 1
-            same_day_contract = _same_day_at_resolver(contract, now)
-            observation = ObservationBoundResult(
-                point_forecast.raw_probability,
-                False,
-                None,
-            )
-            observation_error: str | None = None
-            observation_status = "not_applicable"
-            trade_block_reason: str | None = None
-            if same_day_contract:
-                if not policy.observations_enabled:
-                    observation_status = "disabled"
-                    trade_block_reason = "same-day station observations are disabled"
-                elif observation_provider is None:
-                    observation_status = "provider_unavailable"
-                    trade_block_reason = (
-                        "same-day station observation provider unavailable"
-                    )
-                else:
-                    try:
-                        observation = await observation_provider.adjust_probability(
-                            contract,
-                            point_forecast.raw_probability,
-                            station_id=station_id,
-                        )
-                    except Exception as exc:
-                        observation_errors += 1
-                        observation_status = "error"
-                        observation_error = f"{type(exc).__name__}: {exc}"
-                        errors.append(
-                            f"{getattr(market, 'id', '')}: observation error: "
-                            f"{observation_error}"
-                        )
-                        trade_block_reason = "same-day station observation error"
-                    else:
-                        if observation.same_day_observation_available:
-                            observation_status = "available"
-                            observations_available += 1
-                        else:
-                            observation_status = "unavailable"
-                            trade_block_reason = (
-                                "required same-day station observation unavailable"
-                            )
+            prepared.append((market, contract, station_id, point_forecast))
 
-            yes_token = str(market.outcomes.yes.token_id)
-            no_token = str(market.outcomes.no.token_id)
-            books = await client.get_order_books(token_ids=[yes_token, no_token])
-            by_token = {str(book.token_id): book for book in books}
-            if yes_token not in by_token or no_token not in by_token:
-                raise ValueError("weather book response omitted an outcome token")
-            yes_context = MarketContext.from_sdk(market, by_token[yes_token])
-            no_context = MarketContext.from_sdk(market, by_token[no_token])
-            if not yes_context.negative_risk or not no_context.negative_risk:
-                continue
-            if (
-                yes_context.accepting_orders
-                and no_context.accepting_orders
-                and yes_context.rules_verified
-                and no_context.rules_verified
-                and yes_context.fee_rate is not None
-                and no_context.fee_rate is not None
-            ):
-                components[str(market.id)] = _SurfaceComponent(
-                    market=market,
-                    contract=contract,
-                    forecast=point_forecast,
-                    yes_book=by_token[yes_token],
-                    context=yes_context,
+        # SDK /books accepts multiple tokens. Small bounded batches cut request
+        # count without parallelizing provider calls or bypassing per-market checks.
+        books_by_token: dict[str, Any] = {}
+        failed_book_tokens: set[str] = set()
+        if prepared and book_api_blocked:
+            failed_book_tokens.update(
+                str(outcome.token_id)
+                for market, _contract, _station, _forecast in prepared
+                for outcome in (market.outcomes.yes, market.outcomes.no)
+            )
+        if prepared and not book_api_blocked:
+            chunk = prepared
+            token_ids = list(dict.fromkeys(
+                str(outcome.token_id)
+                for market, _contract, _station, _forecast in chunk
+                for outcome in (market.outcomes.yes, market.outcomes.no)
+            ))
+            try:
+                batch = await client.get_order_books(token_ids=token_ids)
+                books_by_token.update(_checked_weather_books(token_ids, batch))
+            except (UnexpectedResponseError, ValueError) as exc:
+                # One malformed/omitted book can poison the entire SDK response.
+                # Retry only this bounded group as individual two-token requests;
+                # a rate limit or transport outage must never trigger a retry storm.
+                errors.append(f"weather book batch invalid: {type(exc).__name__}: {exc}")
+                for index, (market, _contract, _station, _forecast) in enumerate(chunk):
+                    pair = [str(market.outcomes.yes.token_id), str(market.outcomes.no.token_id)]
+                    try:
+                        single = await client.get_order_books(token_ids=pair)
+                        books_by_token.update(_checked_weather_books(pair, single))
+                    except (RateLimitError, TransportError) as single_exc:
+                        book_api_blocked = True
+                        for remaining, *_rest in chunk[index:]:
+                            failed_book_tokens.update((
+                                str(remaining.outcomes.yes.token_id),
+                                str(remaining.outcomes.no.token_id),
+                            ))
+                        errors.append(f"weather book fallback stopped: {type(single_exc).__name__}: {single_exc}")
+                        break
+                    except Exception as single_exc:
+                        failed_book_tokens.update(pair)
+                        errors.append(
+                            f"{getattr(market, 'id', '')}: weather book unavailable: "
+                            f"{type(single_exc).__name__}: {single_exc}"
+                        )
+            except (RateLimitError, TransportError) as exc:
+                book_api_blocked = True
+                failed_book_tokens.update(token_ids)
+                errors.append(f"weather book provider unavailable: {type(exc).__name__}: {exc}")
+            except Exception as exc:
+                failed_book_tokens.update(token_ids)
+                errors.append(f"weather book batch unavailable: {type(exc).__name__}: {exc}")
+
+        for market, contract, station_id, point_forecast in prepared:
+            try:
+                same_day_contract = _same_day_at_resolver(contract, now)
+                observation = ObservationBoundResult(
+                    point_forecast.raw_probability,
+                    False,
+                    None,
                 )
-            options = tuple(filter(None, (
-                _side_evaluation(
-                    market=market,
-                    contract=contract,
-                    forecast=point_forecast,
-                    yes_probability=observation.probability,
-                    side="YES",
-                    book=by_token[yes_token],
-                    context=yes_context,
-                    policy=policy,
-                    same_day_contract=same_day_contract,
-                    observation=observation,
-                    observation_error=observation_error,
-                    observation_status=observation_status,
-                    trade_block_reason=trade_block_reason,
-                    decision_timestamp=now,
-                ),
-                _side_evaluation(
-                    market=market,
-                    contract=contract,
-                    forecast=point_forecast,
-                    yes_probability=observation.probability,
-                    side="NO",
-                    book=by_token[no_token],
-                    context=no_context,
-                    policy=policy,
-                    same_day_contract=same_day_contract,
-                    observation=observation,
-                    observation_error=observation_error,
-                    observation_status=observation_status,
-                    trade_block_reason=trade_block_reason,
-                    decision_timestamp=now,
-                ),
-            )))
-            if options:
-                markets_side_evaluable += 1
-                evaluations.append(_preferred_weather_side(options))
-        except Exception as exc:
-            errors.append(f"{getattr(market, 'id', '')}: {type(exc).__name__}: {exc}")
+                observation_error: str | None = None
+                observation_status = "not_applicable"
+                trade_block_reason: str | None = None
+                if same_day_contract:
+                    if not policy.observations_enabled:
+                        observation_status = "disabled"
+                        trade_block_reason = "same-day station observations are disabled"
+                    elif observation_provider is None:
+                        observation_status = "provider_unavailable"
+                        trade_block_reason = (
+                            "same-day station observation provider unavailable"
+                        )
+                    else:
+                        try:
+                            observation = await observation_provider.adjust_probability(
+                                contract,
+                                point_forecast.raw_probability,
+                                station_id=station_id,
+                            )
+                        except Exception as exc:
+                            observation_errors += 1
+                            observation_status = "error"
+                            observation_error = f"{type(exc).__name__}: {exc}"
+                            errors.append(
+                                f"{getattr(market, 'id', '')}: observation error: "
+                                f"{observation_error}"
+                            )
+                            trade_block_reason = "same-day station observation error"
+                        else:
+                            if observation.same_day_observation_available:
+                                observation_status = "available"
+                                observations_available += 1
+                            else:
+                                observation_status = "unavailable"
+                                trade_block_reason = (
+                                    "required same-day station observation unavailable"
+                                )
+
+                yes_token = str(market.outcomes.yes.token_id)
+                no_token = str(market.outcomes.no.token_id)
+                if yes_token in failed_book_tokens or no_token in failed_book_tokens:
+                    continue
+                if yes_token not in books_by_token or no_token not in books_by_token:
+                    raise ValueError("weather book response omitted an outcome token")
+                yes_book = books_by_token[yes_token]
+                no_book = books_by_token[no_token]
+                yes_context = MarketContext.from_sdk(market, yes_book)
+                no_context = MarketContext.from_sdk(market, no_book)
+                if not yes_context.negative_risk or not no_context.negative_risk:
+                    continue
+                if (
+                    yes_context.accepting_orders
+                    and no_context.accepting_orders
+                    and yes_context.rules_verified
+                    and no_context.rules_verified
+                    and yes_context.fee_rate is not None
+                    and no_context.fee_rate is not None
+                ):
+                    components[str(market.id)] = _SurfaceComponent(
+                        market=market,
+                        contract=contract,
+                        forecast=point_forecast,
+                        yes_book=yes_book,
+                        context=yes_context,
+                    )
+                options = tuple(filter(None, (
+                    _side_evaluation(
+                        market=market,
+                        contract=contract,
+                        forecast=point_forecast,
+                        yes_probability=observation.probability,
+                        side="YES",
+                        book=yes_book,
+                        context=yes_context,
+                        policy=policy,
+                        same_day_contract=same_day_contract,
+                        observation=observation,
+                        observation_error=observation_error,
+                        observation_status=observation_status,
+                        trade_block_reason=trade_block_reason,
+                        decision_timestamp=now,
+                    ),
+                    _side_evaluation(
+                        market=market,
+                        contract=contract,
+                        forecast=point_forecast,
+                        yes_probability=observation.probability,
+                        side="NO",
+                        book=no_book,
+                        context=no_context,
+                        policy=policy,
+                        same_day_contract=same_day_contract,
+                        observation=observation,
+                        observation_error=observation_error,
+                        observation_status=observation_status,
+                        trade_block_reason=trade_block_reason,
+                        decision_timestamp=now,
+                    ),
+                )))
+                if options:
+                    markets_side_evaluable += 1
+                    evaluations.append(_preferred_weather_side(options))
+            except Exception as exc:
+                errors.append(f"{getattr(market, 'id', '')}: {type(exc).__name__}: {exc}")
 
     if not markets:
         forecast_status = "not_requested"

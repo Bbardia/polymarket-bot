@@ -180,6 +180,219 @@ def test_exact_high_parser_accepts_celsius_and_rejects_uncalibrated_structures()
     ) is None
 
 
+def test_weather_books_are_batched_after_successful_forecasts():
+    markets = [weather_market(market_id=f"weather-{i}") for i in range(3)]
+    books = [
+        book(f"{side}-weather-{i}", bid=bid, ask=ask,
+             condition_id=f"condition-weather-{i}")
+        for i in range(3)
+        for side, bid, ask in (("yes", "0.09", "0.10"), ("no", "0.89", "0.90"))
+    ]
+
+    class RecordingClient(FakePublicClient):
+        def __init__(self, markets, books):
+            super().__init__(markets, books)
+            self.calls = []
+
+        async def get_order_books(self, *, token_ids):
+            self.calls.append(tuple(token_ids))
+            return await super().get_order_books(token_ids=token_ids)
+
+    client = RecordingClient(markets, books)
+    result = asyncio.run(evaluate_weather_universe(
+        client=client, forecast=FakeForecast(), policy=WeatherPaperPolicy(),
+        now=datetime(2026, 8, 24, tzinfo=timezone.utc),
+    ))
+    assert result.markets_evaluated == 3
+    assert len(client.calls) == 1
+    assert set(client.calls[0]) == {f"{side}-weather-{i}" for i in range(3) for side in ("yes", "no")}
+
+
+def test_weather_batches_interleave_books_before_later_forecasts():
+    markets = [weather_market(market_id=f"weather-{i}") for i in range(6)]
+    books = [
+        book(f"{side}-weather-{i}", bid=bid, ask=ask,
+             condition_id=f"condition-weather-{i}")
+        for i in range(6)
+        for side, bid, ask in (("yes", "0.09", "0.10"), ("no", "0.89", "0.90"))
+    ]
+    events = []
+
+    class OrderedClient(FakePublicClient):
+        async def get_order_books(self, *, token_ids):
+            events.append("books")
+            return await super().get_order_books(token_ids=token_ids)
+
+    class OrderedForecast(FakeForecast):
+        async def forecast(self, contract, *, now=None):
+            events.append("forecast")
+            return await super().forecast(contract, now=now)
+
+    asyncio.run(evaluate_weather_universe(
+        client=OrderedClient(markets, books), forecast=OrderedForecast(),
+        policy=WeatherPaperPolicy(), now=datetime(2026, 8, 24, tzinfo=timezone.utc),
+    ))
+    assert events == ["forecast"] * 5 + ["books", "forecast", "books"]
+
+
+def test_weather_batch_failure_is_bounded_and_later_markets_still_evaluate():
+    markets = [weather_market(market_id=f"weather-{i}") for i in range(6)]
+    books = [
+        book(f"{side}-weather-{i}", bid=bid, ask=ask,
+             condition_id=f"condition-weather-{i}")
+        for i in range(6)
+        for side, bid, ask in (("yes", "0.09", "0.10"), ("no", "0.89", "0.90"))
+    ]
+
+    class FailingFirstBatch(FakePublicClient):
+        calls = 0
+
+        async def get_order_books(self, *, token_ids):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("book provider unavailable")
+            return await super().get_order_books(token_ids=token_ids)
+
+    client = FailingFirstBatch(markets, books)
+    result = asyncio.run(evaluate_weather_universe(
+        client=client, forecast=FakeForecast(), policy=WeatherPaperPolicy(),
+        now=datetime(2026, 8, 24, tzinfo=timezone.utc),
+    ))
+    assert client.calls == 2
+    assert len(result.errors) == 1
+    assert "book provider unavailable" in result.errors[0]
+    assert {row.condition_id for row in result.evaluations} == {"condition-weather-5"}
+
+
+def test_malformed_batch_falls_back_to_isolated_market_books():
+    from polymarket.errors import UnexpectedResponseError
+
+    markets = [weather_market(market_id=f"weather-{i}") for i in range(5)]
+    books = [
+        book(f"{side}-weather-{i}", bid=bid, ask=ask,
+             condition_id=f"condition-weather-{i}")
+        for i in range(5)
+        for side, bid, ask in (("yes", "0.09", "0.10"), ("no", "0.89", "0.90"))
+    ]
+
+    class MalformedOne(FakePublicClient):
+        calls = 0
+
+        async def get_order_books(self, *, token_ids):
+            self.calls += 1
+            if len(token_ids) > 2 or "yes-weather-0" in token_ids:
+                raise UnexpectedResponseError("malformed book")
+            return await super().get_order_books(token_ids=token_ids)
+
+    client = MalformedOne(markets, books)
+    result = asyncio.run(evaluate_weather_universe(
+        client=client, forecast=FakeForecast(), policy=WeatherPaperPolicy(),
+        now=datetime(2026, 8, 24, tzinfo=timezone.utc),
+    ))
+    assert client.calls == 6
+    assert {row.condition_id for row in result.evaluations} == {
+        f"condition-weather-{i}" for i in range(1, 5)
+    }
+    assert len(result.errors) == 2
+
+
+def test_weather_rate_limited_batch_does_not_query_later_groups():
+    from polymarket.errors import RateLimitError
+
+    markets = [weather_market(market_id=f"weather-{i}") for i in range(6)]
+    books = [
+        book(f"{side}-weather-{i}", bid=bid, ask=ask,
+             condition_id=f"condition-weather-{i}")
+        for i in range(6)
+        for side, bid, ask in (("yes", "0.09", "0.10"), ("no", "0.89", "0.90"))
+    ]
+
+    class LimitedClient(FakePublicClient):
+        calls = 0
+
+        async def get_order_books(self, *, token_ids):
+            self.calls += 1
+            raise RateLimitError("429")
+
+    client = LimitedClient(markets, books)
+    result = asyncio.run(evaluate_weather_universe(
+        client=client, forecast=FakeForecast(), policy=WeatherPaperPolicy(),
+        now=datetime(2026, 8, 24, tzinfo=timezone.utc),
+    ))
+    assert client.calls == 1
+    assert result.evaluations == ()
+    assert any("provider unavailable" in error for error in result.errors)
+
+
+def test_weather_batch_fallback_stops_on_rate_limit():
+    from polymarket.errors import RateLimitError, UnexpectedResponseError
+
+    markets = [weather_market(market_id=f"weather-{i}") for i in range(3)]
+    books = [
+        book(f"{side}-weather-{i}", bid=bid, ask=ask,
+             condition_id=f"condition-weather-{i}")
+        for i in range(3)
+        for side, bid, ask in (("yes", "0.09", "0.10"), ("no", "0.89", "0.90"))
+    ]
+
+    class LimitedClient(FakePublicClient):
+        calls = 0
+
+        async def get_order_books(self, *, token_ids):
+            self.calls += 1
+            if self.calls == 1:
+                raise UnexpectedResponseError("invalid batch")
+            raise RateLimitError("429")
+
+    client = LimitedClient(markets, books)
+    result = asyncio.run(evaluate_weather_universe(
+        client=client, forecast=FakeForecast(), policy=WeatherPaperPolicy(),
+        now=datetime(2026, 8, 24, tzinfo=timezone.utc),
+    ))
+    assert client.calls == 2
+    assert result.evaluations == ()
+    assert any("fallback stopped" in error for error in result.errors)
+
+
+def test_weather_batch_omits_only_the_missing_market_and_provider_outage_skips_books():
+    markets = [weather_market(market_id=f"weather-{i}") for i in range(2)]
+    books = [
+        book(f"{side}-weather-{i}", bid=bid, ask=ask,
+             condition_id=f"condition-weather-{i}")
+        for i in range(2)
+        for side, bid, ask in (("yes", "0.09", "0.10"), ("no", "0.89", "0.90"))
+    ]
+
+    class PartialClient(FakePublicClient):
+        calls = 0
+
+        async def get_order_books(self, *, token_ids):
+            self.calls += 1
+            return tuple(self.books[token] for token in token_ids if token != "no-weather-0")
+
+    client = PartialClient(markets, books)
+    result = asyncio.run(evaluate_weather_universe(
+        client=client, forecast=FakeForecast(), policy=WeatherPaperPolicy(),
+        now=datetime(2026, 8, 24, tzinfo=timezone.utc),
+    ))
+    assert client.calls == 3  # one incomplete batch, two bounded singleton retries
+    assert {row.condition_id for row in result.evaluations} == {"condition-weather-1"}
+    assert any("omitted, duplicated, or added" in error for error in result.errors)
+
+    class UnavailableForecast:
+        async def forecast(self, contract, *, now=None):
+            raise ForecastUnavailableError("provider down", provider_global=True)
+
+    unavailable_client = PartialClient(markets, books)
+    unavailable = asyncio.run(evaluate_weather_universe(
+        client=unavailable_client, forecast=UnavailableForecast(), policy=WeatherPaperPolicy(),
+        now=datetime(2026, 8, 24, tzinfo=timezone.utc),
+    ))
+    assert unavailable_client.calls == 0
+    assert unavailable.forecast_status == "unavailable"
+    assert unavailable.evaluations == ()
+
+
 def test_weather_discovery_rejects_a_resolution_station_mismatch():
     market = weather_market()
     market.resolution.source = "https://www.weather.gov/wrh/timeseries?site=wrong"
