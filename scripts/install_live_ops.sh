@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Idempotently install the live-ops user units (alerts, log rotation, backups)
+# Idempotently install the live-ops user units (log rotation, backups)
 # and the repo copy of polymarket-v7-live.service into ~/.config/systemd/user.
 #
 # It NEVER starts, stops or restarts polymarket-v7-live. The new logging and
@@ -9,7 +9,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_SRC="$ROOT_DIR/deploy/systemd"
 UNIT_DST="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-TIMERS=(polymarket-health-check.timer polymarket-logrotate.timer polymarket-ledger-backup.timer)
+TIMERS=(polymarket-logrotate.timer polymarket-ledger-backup.timer)
 
 command -v logrotate >/dev/null || [ -x /usr/sbin/logrotate ] || {
   echo "logrotate is not installed (apt install logrotate)" >&2; exit 1; }
@@ -17,12 +17,7 @@ command -v logrotate >/dev/null || [ -x /usr/sbin/logrotate ] || {
 # StandardOutput=append: needs the directory to exist before the unit starts.
 mkdir -p "$ROOT_DIR/logs/live" "$ROOT_DIR/data/backups/live-v7"
 chmod 700 "$ROOT_DIR/data/backups" "$ROOT_DIR/data/backups/live-v7"
-chmod +x "$ROOT_DIR/scripts/backup_live_ledger.sh" "$ROOT_DIR/scripts/live_health_check.py"
-
-if [ ! -f "$ROOT_DIR/.env.alerts" ]; then
-  echo "WARNING: $ROOT_DIR/.env.alerts is missing; alerts will fail until you create it:"
-  echo "  cp $ROOT_DIR/config/templates/env.alerts.template $ROOT_DIR/.env.alerts && chmod 600 $ROOT_DIR/.env.alerts"
-fi
+chmod +x "$ROOT_DIR/scripts/backup_live_ledger.sh"
 
 mkdir -p "$UNIT_DST"
 for unit in "$UNIT_SRC"/*.service "$UNIT_SRC"/*.timer; do
