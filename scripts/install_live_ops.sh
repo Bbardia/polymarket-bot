@@ -20,6 +20,13 @@ chmod 700 "$ROOT_DIR/data/backups" "$ROOT_DIR/data/backups/live-v7"
 chmod +x "$ROOT_DIR/scripts/backup_live_ledger.sh"
 
 mkdir -p "$UNIT_DST"
+# Retire older installations before enabling the remaining ops timers.
+if [ -e "$UNIT_DST/polymarket-health-check.timer" ] || \
+   [ -L "$UNIT_DST/timers.target.wants/polymarket-health-check.timer" ]; then
+  systemctl --user disable --now polymarket-health-check.timer
+fi
+rm -f "$UNIT_DST/polymarket-health-check.timer" "$UNIT_DST/polymarket-health-check.service"
+systemctl --user reset-failed polymarket-health-check.service 2>/dev/null || true
 for unit in "$UNIT_SRC"/*.service "$UNIT_SRC"/*.timer; do
   name="$(basename "$unit")"
   if [ "$name" = "polymarket-v7-live.service" ] && [ -f "$UNIT_DST/$name" ] \
