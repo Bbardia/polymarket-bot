@@ -1,0 +1,30 @@
+{
+  "evidence": {
+    "gamma": {
+      "event_id": "1169503",
+      "event_sha256": "0d7345ed8ee8c664ba377a05a935c7c6bc93f6d22a16a6c776958b535e91e575",
+      "event_sha256_scope": "canonical JSON event (sorted keys, compact separators, UTF-8) as fetched; original raw event omitted",
+      "event_slug": "highest-temperature-in-nyc-on-october-13-2026",
+      "fetched_at": "2026-10-14T14:27:23.947792+00:00",
+      "market_count": 11,
+      "selected_market": {
+        "acceptingOrders": false,
+        "active": true,
+        "closed": true,
+        "conditionId": "0xe505f4dbabe7e0390d479f885bc9e5e2eb17aa3d810b958b1a208d4c99e26e35",
+        "endDate": "2026-10-13T12:00:00Z",
+        "id": "5540790",
+        "slug": "highest-temperature-in-nyc-on-october-13-2026-61forbelow"
+      },
+      "url": "https://gamma-api.polymarket.com/events/slug/highest-temperature-in-nyc-on-october-13-2026"
+    }
+  },
+  "provenance": "public Gamma only; market not verified open",
+  "result": {
+    "decision_at": "2026-10-14T14:27:23.947792+00:00",
+    "market_id": "5540790",
+    "paper_only": true,
+    "reason": "exact unique open market not available",
+    "status": "rejected"
+  }
+}
