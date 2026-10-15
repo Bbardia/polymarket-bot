@@ -6,6 +6,7 @@ that field or supply a remaining-day model.
 """
 import argparse
 import json
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,6 +22,12 @@ GAMMA_LIMIT = 1_000_000
 METAR_LIMIT = 256_000
 BOOK_LIMIT = 512_000
 
+class ResponseInterrupted(requests.RequestException):
+    """A response was obtained, but its body could not be fully read."""
+
+class PublicHTTPError(ValueError):
+    """The provider returned a non-success HTTP status (details redacted)."""
+
 
 def _public_json(session, url: str, *, limit: int, params: dict | None = None):
     with session.get(url, params=params, timeout=(5, 15), stream=True,
@@ -28,7 +35,10 @@ def _public_json(session, url: str, *, limit: int, params: dict | None = None):
         try:
             if 300 <= response.status_code < 400:
                 raise ValueError('public API redirect refused')
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                raise PublicHTTPError('public API HTTP error') from exc
             length = response.headers.get('Content-Length')
             if length is not None and (not length.isdecimal() or int(length) > limit):
                 raise ValueError('public API response exceeds byte limit')
@@ -39,7 +49,7 @@ def _public_json(session, url: str, *, limit: int, params: dict | None = None):
                 chunks.extend(chunk)
             return json.loads(chunks), response.url
         except requests.RequestException as exc:
-            raise ValueError('public API response interrupted') from exc
+            raise ResponseInterrupted('public API response interrupted') from exc
 
 
 def _normalize_book(raw: object, *, condition_id: str, token_id: str, fetched_at: str) -> dict:
@@ -79,7 +89,8 @@ def _select_market(markets: object, market_id: str) -> dict:
 
 def _save_capture(path: Path, capture: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open('x') as f:
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as f:
         json.dump(capture, f, indent=2, sort_keys=True)
         f.write('\n')
 
@@ -97,8 +108,10 @@ def main():
     if not a.market_id.isascii() or not a.market_id.isdecimal() or len(a.market_id) > 32:
         p.error('exact bounded numeric market ID required')
     session = requests.Session()
+    session.trust_env = False
     session.headers['User-Agent'] = 'paper-late-observation-research/1.0'
     evidence: dict[str, dict] = {}
+    health = {'gamma': 'not_requested', 'metar': 'not_requested', 'clob': 'not_requested'}
     evidence['gamma'] = dict(url=event_url, fetched_at=datetime.now(timezone.utc).isoformat())
     def reject(reason: str, *, no_response: bool = False) -> None:
         # No raw provider data, exception text, or replayable input on invalid records.
@@ -109,17 +122,28 @@ def main():
                       reason=reason, decision_at=gamma_at)
         _save_capture(a.output, dict(provenance=('Gamma request failed; no provider response'
                                                if no_response else 'public Gamma only; market not verified'),
-                                     evidence=evidence, result=result))
+                                     evidence=evidence, provider_health=health, result=result))
         print(json.dumps(result, sort_keys=True))
     gamma_at = evidence['gamma']['fetched_at']
     try:
         gamma, _ = _public_json(session, event_url, limit=GAMMA_LIMIT)
+    except ResponseInterrupted:
+        health['gamma'] = 'interrupted'
+        reject('Gamma response interrupted')
+        return
+    except PublicHTTPError:
+        health['gamma'] = 'http_error'
+        reject('Gamma HTTP status error')
+        return
     except requests.RequestException:
+        health['gamma'] = 'no_response'
         reject('Gamma request failed without a response', no_response=True)
         return
     except (ValueError, TypeError, UnicodeError):
+        health['gamma'] = 'malformed'
         reject('malformed, redirected or oversized Gamma response')
         return
+    health['gamma'] = 'ok'
     evidence['gamma']['fetched_at'] = datetime.now(timezone.utc).isoformat()
     try:
         if not isinstance(gamma, dict) or not isinstance(gamma.get('markets'), list):
@@ -156,16 +180,28 @@ def main():
         # METAR is retained as ancillary evidence, never as resolver Hourly Temp.
         if not isinstance(metar, list) or any(not isinstance(row, dict) for row in metar):
             raise ValueError('METAR reports must be an array of objects')
+        health['metar'] = 'ok'
         evidence['metar'] = dict(url=metar_url, fetched_at=datetime.now(timezone.utc).isoformat(), data=metar)
         book, book_url = _public_json(session, 'https://clob.polymarket.com/book',
                                      params={'token_id': token}, limit=BOOK_LIMIT)
         evidence['book'] = dict(url=book_url, fetched_at=datetime.now(timezone.utc).isoformat(), data=book)
         normalized_book = _normalize_book(book, condition_id=entry.condition_id,
                                           token_id=token, fetched_at=evidence['book']['fetched_at'])
+        health['clob'] = 'ok'
+    except ResponseInterrupted:
+        health['clob' if health['metar'] == 'ok' else 'metar'] = 'interrupted'
+        reject('public ancillary response interrupted')
+        return
+    except PublicHTTPError:
+        health['clob' if health['metar'] == 'ok' else 'metar'] = 'http_error'
+        reject('public ancillary HTTP status error')
+        return
     except requests.RequestException:
+        health['clob' if health['metar'] == 'ok' else 'metar'] = 'no_response'
         reject('public ancillary request failed without a response')
         return
     except (ValueError, TypeError, UnicodeError):
+        health['clob' if health['metar'] == 'ok' else 'metar'] = 'malformed'
         reject('malformed or oversized public ancillary response')
         return
     at = datetime.now(timezone.utc).isoformat()
@@ -179,7 +215,7 @@ def main():
                    book=normalized_book)
     result = evaluate(payload)
     _save_capture(a.output, dict(provenance='public read-only; METAR not resolver Hourly Temp; no publication timestamp or model',
-                                 evidence=evidence, input=payload, result=result))
+                                 evidence=evidence, provider_health=health, input=payload, result=result))
     print(json.dumps(dict(market_id=entry.market_id, station=station,
                           metar_reports=len(evidence['metar']['data']),
                           book_asks=len(evidence['book']['data'].get('asks', [])),

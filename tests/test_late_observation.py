@@ -41,6 +41,31 @@ def test_public_json_rejects_redirect_and_oversized_stream():
     with pytest.raises(ValueError):
         _public_json(Session(response), response.url, limit=4)
 
+def test_public_json_distinguishes_transport_phase_and_http_status():
+    from src.v3.late_public_probe import ResponseInterrupted, PublicHTTPError
+    class Response:
+        url = 'https://example.org/json'
+        headers = {}
+        def __init__(self, failure): self.failure = failure; self.status_code = 503 if failure == 'http' else 200
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def raise_for_status(self):
+            if self.failure == 'http': raise requests.HTTPError('secret')
+        def iter_content(self, chunk_size):
+            yield b'{'
+            raise requests.Timeout('secret')
+    class Session:
+        def __init__(self, failure): self.failure = failure
+        def get(self, *args, **kwargs):
+            if self.failure == 'connect': raise requests.Timeout('secret')
+            return Response(self.failure)
+    for failure, expected in [('connect', requests.Timeout), ('stream', ResponseInterrupted),
+                              ('http', PublicHTTPError)]:
+        with pytest.raises(expected) as caught:
+            _public_json(Session(failure), 'https://example.org/json', limit=100)
+        if failure != 'connect':
+            assert 'secret' not in str(caught.value)
+
 @pytest.mark.parametrize('failure', [b'\xff', b'{"markets":', requests.Timeout('secret-token'),
                                    ('stream', requests.Timeout('secret-token'))])
 def test_probe_malformed_bytes_or_no_response_audited(tmp_path, monkeypatch, failure):
@@ -72,9 +97,13 @@ def test_probe_malformed_bytes_or_no_response_audited(tmp_path, monkeypatch, fai
     assert len(calls) == 1 and len(output.read_bytes()) < 1024
     assert 'input' not in capture and 'secret-token' not in output.read_text()
     assert capture['result']['status'] == 'rejected'
-    if isinstance(failure, Exception):
+    if isinstance(failure, tuple):
+        assert capture['result']['reason'] == 'Gamma response interrupted'
+        assert capture['provider_health']['gamma'] == 'interrupted'
+    elif isinstance(failure, Exception):
         assert capture['result']['reason'] == 'Gamma request failed without a response'
         assert 'gamma' not in capture['evidence']
+        assert capture['provider_health']['gamma'] == 'no_response'
     else:
         assert capture['result']['reason'] == 'malformed, redirected or oversized Gamma response'
         assert 'gamma' in capture['evidence']
@@ -350,7 +379,8 @@ def test_probe_accepts_timezone_aware_gamma_end_date(tmp_path, monkeypatch, end_
     assert capture['evidence']['book']['data']['timestamp'] == '1791820000123'
     assert capture['evidence']['metar']['data'] == [{'icaoId': 'KLGA'}]
 
-@pytest.mark.parametrize('book_failure', [None, requests.Timeout('secret-token'), b'\xff'])
+@pytest.mark.parametrize('book_failure', [None, requests.Timeout('secret-token'),
+                                         ('stream', requests.Timeout('secret-token')), b'\xff'])
 def test_probe_invalid_clob_payload_or_timeout_is_nonreplayable(tmp_path, monkeypatch, book_failure):
     import sys
     from src.v3 import late_public_probe, late_observation
@@ -363,7 +393,11 @@ def test_probe_invalid_clob_payload_or_timeout_is_nonreplayable(tmp_path, monkey
         def __enter__(self): return self
         def __exit__(self, *args): pass
         def raise_for_status(self): pass
-        def iter_content(self, chunk_size): yield self.body
+        def iter_content(self, chunk_size):
+            if isinstance(self.body, tuple):
+                yield b'{'
+                raise self.body[1]
+            yield self.body
     class Session:
         headers = {}
         def get(self, url, **kwargs):
@@ -371,7 +405,7 @@ def test_probe_invalid_clob_payload_or_timeout_is_nonreplayable(tmp_path, monkey
             if 'gamma-api' in url: return Response(url, json.dumps({'markets': [market]}).encode())
             if 'aviationweather' in url: return Response(url, b'[]')
             if isinstance(book_failure, Exception): raise book_failure
-            body = (book_failure if isinstance(book_failure, bytes) else json.dumps(dict(
+            body = (book_failure if isinstance(book_failure, (bytes, tuple)) else json.dumps(dict(
                 market='0xabc', asset_id='Y', timestamp='1791820000123', bids=None,
                 asks=None, tick_size='0.01', min_order_size='5')).encode())
             return Response(url, body)
@@ -385,8 +419,11 @@ def test_probe_invalid_clob_payload_or_timeout_is_nonreplayable(tmp_path, monkey
     assert capture['result']['status'] == 'rejected'
     assert 'input' not in capture and 'secret-token' not in output.read_text()
     assert len(output.read_bytes()) < 1024
-    assert capture['result']['reason'] == ('public ancillary request failed without a response'
-        if isinstance(book_failure, Exception) else 'malformed or oversized public ancillary response')
+    assert capture['result']['reason'] == ('public ancillary response interrupted' if isinstance(book_failure, tuple)
+        else 'public ancillary request failed without a response' if isinstance(book_failure, Exception)
+        else 'malformed or oversized public ancillary response')
+    assert capture['provider_health']['clob'] == ('interrupted' if isinstance(book_failure, tuple)
+        else 'no_response' if isinstance(book_failure, Exception) else 'malformed')
 
 @pytest.mark.parametrize('stage,shape', [
     (stage, shape) for stage in ('gamma', 'metar', 'clob')
