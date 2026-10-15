@@ -1,0 +1,2081 @@
+{
+  "evidence": {
+    "book": {
+      "data": {
+        "asks": [
+          {
+            "price": "0.999",
+            "size": "16515"
+          },
+          {
+            "price": "0.998",
+            "size": "1250"
+          },
+          {
+            "price": "0.997",
+            "size": "1499.99"
+          },
+          {
+            "price": "0.996",
+            "size": "125"
+          },
+          {
+            "price": "0.995",
+            "size": "100"
+          },
+          {
+            "price": "0.994",
+            "size": "1249.99"
+          },
+          {
+            "price": "0.993",
+            "size": "71.42"
+          },
+          {
+            "price": "0.992",
+            "size": "937.5"
+          },
+          {
+            "price": "0.991",
+            "size": "55.55"
+          },
+          {
+            "price": "0.99",
+            "size": "2800"
+          },
+          {
+            "price": "0.98",
+            "size": "2060"
+          },
+          {
+            "price": "0.97",
+            "size": "49.99"
+          },
+          {
+            "price": "0.96",
+            "size": "217"
+          },
+          {
+            "price": "0.95",
+            "size": "165"
+          },
+          {
+            "price": "0.94",
+            "size": "16.66"
+          },
+          {
+            "price": "0.93",
+            "size": "114.27"
+          },
+          {
+            "price": "0.92",
+            "size": "12.5"
+          },
+          {
+            "price": "0.91",
+            "size": "11.11"
+          },
+          {
+            "price": "0.909",
+            "size": "76.92"
+          },
+          {
+            "price": "0.9",
+            "size": "80"
+          },
+          {
+            "price": "0.89",
+            "size": "9.09"
+          },
+          {
+            "price": "0.88",
+            "size": "8.33"
+          },
+          {
+            "price": "0.86",
+            "size": "57.13"
+          },
+          {
+            "price": "0.85",
+            "size": "53.32"
+          },
+          {
+            "price": "0.84",
+            "size": "6.25"
+          },
+          {
+            "price": "0.82",
+            "size": "44.43"
+          },
+          {
+            "price": "0.8",
+            "size": "5"
+          },
+          {
+            "price": "0.79",
+            "size": "9.52"
+          },
+          {
+            "price": "0.78",
+            "size": "9.09"
+          },
+          {
+            "price": "0.779",
+            "size": "31.67"
+          },
+          {
+            "price": "0.77",
+            "size": "30.43"
+          },
+          {
+            "price": "0.76",
+            "size": "8.33"
+          },
+          {
+            "price": "0.75",
+            "size": "8"
+          },
+          {
+            "price": "0.74",
+            "size": "7.69"
+          },
+          {
+            "price": "0.72",
+            "size": "7.14"
+          },
+          {
+            "price": "0.7",
+            "size": "44.99"
+          },
+          {
+            "price": "0.68",
+            "size": "6.25"
+          },
+          {
+            "price": "0.67",
+            "size": "21.21"
+          },
+          {
+            "price": "0.66",
+            "size": "5.88"
+          },
+          {
+            "price": "0.65",
+            "size": "20"
+          },
+          {
+            "price": "0.64",
+            "size": "5.55"
+          },
+          {
+            "price": "0.62",
+            "size": "5.26"
+          },
+          {
+            "price": "0.6",
+            "size": "10"
+          },
+          {
+            "price": "0.58",
+            "size": "7.14"
+          },
+          {
+            "price": "0.57",
+            "size": "16.27"
+          },
+          {
+            "price": "0.56",
+            "size": "6.81"
+          },
+          {
+            "price": "0.55",
+            "size": "15.55"
+          },
+          {
+            "price": "0.54",
+            "size": "6.52"
+          },
+          {
+            "price": "0.52",
+            "size": "6.25"
+          },
+          {
+            "price": "0.5",
+            "size": "20"
+          },
+          {
+            "price": "0.499",
+            "size": "50"
+          },
+          {
+            "price": "0.497",
+            "size": "13.91"
+          },
+          {
+            "price": "0.37",
+            "size": "5"
+          },
+          {
+            "price": "0.369",
+            "size": "30"
+          },
+          {
+            "price": "0.34",
+            "size": "30"
+          },
+          {
+            "price": "0.2",
+            "size": "20"
+          },
+          {
+            "price": "0.199",
+            "size": "60"
+          },
+          {
+            "price": "0.198",
+            "size": "370"
+          },
+          {
+            "price": "0.14",
+            "size": "30"
+          },
+          {
+            "price": "0.139",
+            "size": "10"
+          },
+          {
+            "price": "0.138",
+            "size": "30"
+          },
+          {
+            "price": "0.1",
+            "size": "120"
+          },
+          {
+            "price": "0.04",
+            "size": "32"
+          },
+          {
+            "price": "0.02",
+            "size": "125"
+          },
+          {
+            "price": "0.019",
+            "size": "60.5"
+          },
+          {
+            "price": "0.012",
+            "size": "5"
+          },
+          {
+            "price": "0.011",
+            "size": "5.09"
+          },
+          {
+            "price": "0.001",
+            "size": "65.77"
+          }
+        ],
+        "asset_id": "94107367991540006504083956530228741659859027357286584369013410605485870611275",
+        "bids": [],
+        "hash": "b2f033ebbd37ab34409b6edbae6e11b7e01cebfa",
+        "last_trade_price": "0.999",
+        "market": "0xaae5da314e023883facfd1072101517843c200cdd6c62ead92ff15974d374fc3",
+        "min_order_size": "5",
+        "neg_risk": true,
+        "tick_size": "0.001",
+        "timestamp": "1791880347474"
+      },
+      "fetched_at": "2026-10-13T08:33:23.361920+00:00",
+      "url": "https://clob.polymarket.com/book?token_id=94107367991540006504083956530228741659859027357286584369013410605485870611275"
+    },
+    "gamma": {
+      "data": {
+        "$schema": "https://gamma-api.polymarket.com/schemas/Event.json",
+        "active": true,
+        "archived": false,
+        "automaticallyActive": true,
+        "closed": false,
+        "commentCount": 0,
+        "competitive": 0.9919650828290844,
+        "createdAt": "2026-10-11T07:55:54.835301Z",
+        "creationDate": "2026-10-11T07:58:12.301592Z",
+        "cyom": false,
+        "deploying": false,
+        "deployingTimestamp": "2026-10-11T07:55:56.657924Z",
+        "description": "This market will resolve to the temperature range that contains the highest temperature recorded by NOAA at the LaGuardia Airport Station in degrees Fahrenheit on 13 Oct '26.\n\nThe resolution source for this market will be information from NOAA, specifically the highest reading under the \"Temp\" column for all times on this day, available here: https://www.weather.gov/wrh/timeseries?site=klga\n\nThis market will resolve off of the Hourly Data provided using the \"Show Hourly Data\" button.\n\nIf NOAA data for the observation date is unavailable by 11:59 PM ET on the day following the observation date, the Weather Underground Daily Observations table will be used as the resolution source.\n\nIn the event that there is no data for the observation date by 11:59 PM ET on the day following the observation date, this market will resolve to the lowest bracket.\n\nTo toggle between Fahrenheit and Celsius, click the \"Switch to US Units w/ kts\" button until the relevant table displays \u00b0F.\n\nThis market will resolve once the first data point for the following date has been published on the resolution source, or by 11:59 PM ET on the day following the observation date, whichever comes first.\n\nThe resolution source for this market measures temperatures to whole degrees Fahrenheit (eg, 21\u00b0F). Thus, this is the level of precision that will be used when resolving the market.\n\nIn the case that the Resolution Source publishes data, sufficient to settle a Market, that is clearly erroneous and the result of technical or operational error, or of unauthorized interference with the Resolution Source or its data, the Market may remain open for a period of up to seven (7) calendar days (ET) from the time of the original release, in anticipation of a correction by the Resolution Source. If the Resolution Source publishes a corrected value within that period, that value will be eligible for resolution. If no corrected value is published within that period, Polymarket will issue a Clarification to determine whether the originally published value may be eligible for resolution, or whether other action is required to preserve the orderly functioning of the Market.\n\nRevisions to temperatures recorded within this market's timeframe will be considered until the first datapoint for the following date has been published, after which any alterations will not be considered.",
+        "enableNegRisk": true,
+        "enableOrderBook": true,
+        "endDate": "2026-10-13T12:00:00Z",
+        "eventDate": "2026-10-13",
+        "eventMetadata": {
+          "context_requires_regen": false
+        },
+        "featured": false,
+        "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+        "id": "1169503",
+        "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+        "liquidity": 36618.3212,
+        "liquidityClob": 36618.3212,
+        "markets": [
+          {
+            "acceptingOrders": true,
+            "acceptingOrdersTimestamp": "2026-10-11T07:56:12Z",
+            "active": true,
+            "approved": true,
+            "archived": false,
+            "automaticallyActive": true,
+            "bestAsk": 0.001,
+            "clearBookOnStart": false,
+            "clobTokenIds": "[\"33301537492559355909545826343082258374121641375865956486239247780427873853720\", \"53584865816828981960869818752262181729130784918748066744047101819252350329475\"]",
+            "closed": false,
+            "comboStatus": "disabled",
+            "competitive": 0.8003199679231757,
+            "conditionId": "0xe505f4dbabe7e0390d479f885bc9e5e2eb17aa3d810b958b1a208d4c99e26e35",
+            "createdAt": "2026-10-11T07:55:54.953551Z",
+            "customLiveness": 900,
+            "cyom": false,
+            "deploying": false,
+            "deployingTimestamp": "2026-10-11T07:55:56.667083Z",
+            "description": "This market will resolve to the temperature range that contains the highest temperature recorded by NOAA at the LaGuardia Airport Station in degrees Fahrenheit on 13 Oct '26.\n\nThe resolution source for this market will be information from NOAA, specifically the highest reading under the \"Temp\" column for all times on this day, available here: https://www.weather.gov/wrh/timeseries?site=klga\n\nThis market will resolve off of the Hourly Data provided using the \"Show Hourly Data\" button.\n\nIf NOAA data for the observation date is unavailable by 11:59 PM ET on the day following the observation date, the Weather Underground Daily Observations table will be used as the resolution source.\n\nIn the event that there is no data for the observation date by 11:59 PM ET on the day following the observation date, this market will resolve to the lowest bracket.\n\nTo toggle between Fahrenheit and Celsius, click the \"Switch to US Units w/ kts\" button until the relevant table displays \u00b0F.\n\nThis market will resolve once the first data point for the following date has been published on the resolution source, or by 11:59 PM ET on the day following the observation date, whichever comes first.\n\nThe resolution source for this market measures temperatures to whole degrees Fahrenheit (eg, 21\u00b0F). Thus, this is the level of precision that will be used when resolving the market.\n\nIn the case that the Resolution Source publishes data, sufficient to settle a Market, that is clearly erroneous and the result of technical or operational error, or of unauthorized interference with the Resolution Source or its data, the Market may remain open for a period of up to seven (7) calendar days (ET) from the time of the original release, in anticipation of a correction by the Resolution Source. If the Resolution Source publishes a corrected value within that period, that value will be eligible for resolution. If no corrected value is published within that period, Polymarket will issue a Clarification to determine whether the originally published value may be eligible for resolution, or whether other action is required to preserve the orderly functioning of the Market.\n\nRevisions to temperatures recorded within this market's timeframe will be considered until the first datapoint for the following date has been published, after which any alterations will not be considered.",
+            "enableOrderBook": true,
+            "endDate": "2026-10-13T12:00:00Z",
+            "endDateIso": "2026-10-13",
+            "featured": false,
+            "feeSchedule": {
+              "exponent": 1,
+              "rate": 0.05,
+              "rebateRate": 0.25,
+              "takerOnly": true
+            },
+            "feeType": "weather_fees",
+            "feesEnabled": true,
+            "funded": false,
+            "gameStartTime": "2026-10-13 04:00:00+00",
+            "groupItemThreshold": "0",
+            "groupItemTitle": "61\u00b0F or below",
+            "hasReviewedDates": true,
+            "holdingRewardsEnabled": false,
+            "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "id": "5540790",
+            "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "lastTradePrice": 0.002,
+            "liquidity": "14391.85406",
+            "liquidityClob": 14391.85406,
+            "liquidityNum": 14391.85406,
+            "makerBaseFee": 1000,
+            "manualActivation": false,
+            "marketMakerAddress": "",
+            "negRisk": true,
+            "negRiskMarketID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696000",
+            "negRiskOther": false,
+            "negRiskRequestID": "0x75de0cbd8c5b1620287735170e5ce9dfff208b978cd2ce9791f3cd598757c663",
+            "new": false,
+            "oneDayPriceChange": -0.0015,
+            "orderMinSize": 5,
+            "orderPriceMinTickSize": 0.001,
+            "outcomePrices": "[\"0.0005\", \"0.9995\"]",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "pendingDeployment": false,
+            "question": "Will the highest temperature in New York City be 61\u00b0F or below on October 13?",
+            "questionID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696000",
+            "ready": false,
+            "resolutionSource": "https://www.weather.gov/wrh/timeseries?site=klga",
+            "resolvedBy": "0x69c47De9D4D3Dad79590d61b9e05918E03775f24",
+            "restricted": true,
+            "rewardsMaxSpread": 4.5,
+            "rewardsMinSize": 20,
+            "rfqEnabled": false,
+            "secondsDelay": 0,
+            "slug": "highest-temperature-in-nyc-on-october-13-2026-61forbelow",
+            "spread": 0.001,
+            "startDate": "2026-10-11T07:56:12Z",
+            "startDateIso": "2026-10-11",
+            "submitted_by": "0xAC9930b2AE455a671b62dE86876A7e8587825294",
+            "takerBaseFee": 1000,
+            "umaBond": "250",
+            "umaResolutionStatuses": "[]",
+            "umaReward": "0.6",
+            "updatedAt": "2026-10-13T08:32:14.085309Z",
+            "version": "v1",
+            "volume": "211.12400000000002",
+            "volume1mo": 211.12400000000005,
+            "volume1moClob": 211.12400000000005,
+            "volume1wk": 211.12400000000005,
+            "volume1wkClob": 211.12400000000005,
+            "volume1yr": 211.12400000000005,
+            "volume1yrClob": 211.12400000000005,
+            "volume24hr": 32.753,
+            "volume24hrClob": 32.753,
+            "volumeClob": 211.12400000000002,
+            "volumeNum": 211.12400000000002
+          },
+          {
+            "acceptingOrders": true,
+            "acceptingOrdersTimestamp": "2026-10-11T07:56:12Z",
+            "active": true,
+            "approved": true,
+            "archived": false,
+            "automaticallyActive": true,
+            "bestAsk": 0.001,
+            "clearBookOnStart": false,
+            "clobTokenIds": "[\"70987400490702464249680450595921532559347218804038292137192086997620975420942\", \"91178983399109079957954684757310087013136361472425261955463297557676210230851\"]",
+            "closed": false,
+            "comboStatus": "disabled",
+            "competitive": 0.8003199679231757,
+            "conditionId": "0xc0ca2b3afec780de66d8a372028011148109b07dd76aab50315b02bf13002d5a",
+            "createdAt": "2026-10-11T07:55:55.093734Z",
+            "customLiveness": 900,
+            "cyom": false,
+            "deploying": false,
+            "deployingTimestamp": "2026-10-11T07:55:56.667083Z",
+            "description": "This market will resolve to the temperature range that contains the highest temperature recorded by NOAA at the LaGuardia Airport Station in degrees Fahrenheit on 13 Oct '26.\n\nThe resolution source for this market will be information from NOAA, specifically the highest reading under the \"Temp\" column for all times on this day, available here: https://www.weather.gov/wrh/timeseries?site=klga\n\nThis market will resolve off of the Hourly Data provided using the \"Show Hourly Data\" button.\n\nIf NOAA data for the observation date is unavailable by 11:59 PM ET on the day following the observation date, the Weather Underground Daily Observations table will be used as the resolution source.\n\nIn the event that there is no data for the observation date by 11:59 PM ET on the day following the observation date, this market will resolve to the lowest bracket.\n\nTo toggle between Fahrenheit and Celsius, click the \"Switch to US Units w/ kts\" button until the relevant table displays \u00b0F.\n\nThis market will resolve once the first data point for the following date has been published on the resolution source, or by 11:59 PM ET on the day following the observation date, whichever comes first.\n\nThe resolution source for this market measures temperatures to whole degrees Fahrenheit (eg, 21\u00b0F). Thus, this is the level of precision that will be used when resolving the market.\n\nIn the case that the Resolution Source publishes data, sufficient to settle a Market, that is clearly erroneous and the result of technical or operational error, or of unauthorized interference with the Resolution Source or its data, the Market may remain open for a period of up to seven (7) calendar days (ET) from the time of the original release, in anticipation of a correction by the Resolution Source. If the Resolution Source publishes a corrected value within that period, that value will be eligible for resolution. If no corrected value is published within that period, Polymarket will issue a Clarification to determine whether the originally published value may be eligible for resolution, or whether other action is required to preserve the orderly functioning of the Market.\n\nRevisions to temperatures recorded within this market's timeframe will be considered until the first datapoint for the following date has been published, after which any alterations will not be considered.",
+            "enableOrderBook": true,
+            "endDate": "2026-10-13T12:00:00Z",
+            "endDateIso": "2026-10-13",
+            "featured": false,
+            "feeSchedule": {
+              "exponent": 1,
+              "rate": 0.05,
+              "rebateRate": 0.25,
+              "takerOnly": true
+            },
+            "feeType": "weather_fees",
+            "feesEnabled": true,
+            "funded": false,
+            "gameStartTime": "2026-10-13 04:00:00+00",
+            "groupItemThreshold": "1",
+            "groupItemTitle": "62-63\u00b0F",
+            "hasReviewedDates": true,
+            "holdingRewardsEnabled": false,
+            "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "id": "5540791",
+            "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "liquidity": "1969.7112",
+            "liquidityClob": 1969.7112,
+            "liquidityNum": 1969.7112,
+            "makerBaseFee": 1000,
+            "manualActivation": false,
+            "marketMakerAddress": "",
+            "negRisk": true,
+            "negRiskMarketID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696000",
+            "negRiskOther": false,
+            "negRiskRequestID": "0x7242ff2702a16450bfe8a5589e90b4b6dc56da0feca17bb5d9c51adc32b8025d",
+            "new": false,
+            "orderMinSize": 5,
+            "orderPriceMinTickSize": 0.001,
+            "outcomePrices": "[\"0.0005\", \"0.9995\"]",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "pendingDeployment": false,
+            "question": "Will the highest temperature in New York City be between 62-63\u00b0F on October 13?",
+            "questionID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696001",
+            "ready": false,
+            "resolutionSource": "https://www.weather.gov/wrh/timeseries?site=klga",
+            "resolvedBy": "0x69c47De9D4D3Dad79590d61b9e05918E03775f24",
+            "restricted": true,
+            "rewardsMaxSpread": 4.5,
+            "rewardsMinSize": 20,
+            "rfqEnabled": false,
+            "secondsDelay": 0,
+            "slug": "highest-temperature-in-nyc-on-october-13-2026-62-63f",
+            "spread": 0.001,
+            "startDate": "2026-10-11T07:56:12Z",
+            "startDateIso": "2026-10-11",
+            "submitted_by": "0xAC9930b2AE455a671b62dE86876A7e8587825294",
+            "takerBaseFee": 1000,
+            "umaBond": "250",
+            "umaResolutionStatuses": "[]",
+            "umaReward": "0.6",
+            "updatedAt": "2026-10-13T08:32:14.085309Z",
+            "version": "v1",
+            "volume": "70",
+            "volumeClob": 70,
+            "volumeNum": 70
+          },
+          {
+            "acceptingOrders": true,
+            "acceptingOrdersTimestamp": "2026-10-11T07:56:12Z",
+            "active": true,
+            "approved": true,
+            "archived": false,
+            "automaticallyActive": true,
+            "bestAsk": 0.001,
+            "clearBookOnStart": false,
+            "clobTokenIds": "[\"94107367991540006504083956530228741659859027357286584369013410605485870611275\", \"19055690330102646552037765600497354508230187432379666680095273660995775911802\"]",
+            "closed": false,
+            "comboStatus": "disabled",
+            "competitive": 0.8003199679231757,
+            "conditionId": "0xaae5da314e023883facfd1072101517843c200cdd6c62ead92ff15974d374fc3",
+            "createdAt": "2026-10-11T07:55:55.23729Z",
+            "customLiveness": 900,
+            "cyom": false,
+            "deploying": false,
+            "deployingTimestamp": "2026-10-11T07:55:56.667083Z",
+            "description": "This market will resolve to the temperature range that contains the highest temperature recorded by NOAA at the LaGuardia Airport Station in degrees Fahrenheit on 13 Oct '26.\n\nThe resolution source for this market will be information from NOAA, specifically the highest reading under the \"Temp\" column for all times on this day, available here: https://www.weather.gov/wrh/timeseries?site=klga\n\nThis market will resolve off of the Hourly Data provided using the \"Show Hourly Data\" button.\n\nIf NOAA data for the observation date is unavailable by 11:59 PM ET on the day following the observation date, the Weather Underground Daily Observations table will be used as the resolution source.\n\nIn the event that there is no data for the observation date by 11:59 PM ET on the day following the observation date, this market will resolve to the lowest bracket.\n\nTo toggle between Fahrenheit and Celsius, click the \"Switch to US Units w/ kts\" button until the relevant table displays \u00b0F.\n\nThis market will resolve once the first data point for the following date has been published on the resolution source, or by 11:59 PM ET on the day following the observation date, whichever comes first.\n\nThe resolution source for this market measures temperatures to whole degrees Fahrenheit (eg, 21\u00b0F). Thus, this is the level of precision that will be used when resolving the market.\n\nIn the case that the Resolution Source publishes data, sufficient to settle a Market, that is clearly erroneous and the result of technical or operational error, or of unauthorized interference with the Resolution Source or its data, the Market may remain open for a period of up to seven (7) calendar days (ET) from the time of the original release, in anticipation of a correction by the Resolution Source. If the Resolution Source publishes a corrected value within that period, that value will be eligible for resolution. If no corrected value is published within that period, Polymarket will issue a Clarification to determine whether the originally published value may be eligible for resolution, or whether other action is required to preserve the orderly functioning of the Market.\n\nRevisions to temperatures recorded within this market's timeframe will be considered until the first datapoint for the following date has been published, after which any alterations will not be considered.",
+            "enableOrderBook": true,
+            "endDate": "2026-10-13T12:00:00Z",
+            "endDateIso": "2026-10-13",
+            "featured": false,
+            "feeSchedule": {
+              "exponent": 1,
+              "rate": 0.05,
+              "rebateRate": 0.25,
+              "takerOnly": true
+            },
+            "feeType": "weather_fees",
+            "feesEnabled": true,
+            "funded": false,
+            "gameStartTime": "2026-10-13 04:00:00+00",
+            "groupItemThreshold": "2",
+            "groupItemTitle": "64-65\u00b0F",
+            "hasReviewedDates": true,
+            "holdingRewardsEnabled": false,
+            "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "id": "5540792",
+            "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "lastTradePrice": 0.008,
+            "liquidity": "1218.00626",
+            "liquidityClob": 1218.00626,
+            "liquidityNum": 1218.00626,
+            "makerBaseFee": 1000,
+            "manualActivation": false,
+            "marketMakerAddress": "",
+            "negRisk": true,
+            "negRiskMarketID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696000",
+            "negRiskOther": false,
+            "negRiskRequestID": "0x09dd52120227c91143edfb3f1d041d355cc3323cc0303fab0057bdd7727e5e41",
+            "new": false,
+            "oneDayPriceChange": -0.001,
+            "orderMinSize": 5,
+            "orderPriceMinTickSize": 0.001,
+            "outcomePrices": "[\"0.0005\", \"0.9995\"]",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "pendingDeployment": false,
+            "question": "Will the highest temperature in New York City be between 64-65\u00b0F on October 13?",
+            "questionID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696002",
+            "ready": false,
+            "resolutionSource": "https://www.weather.gov/wrh/timeseries?site=klga",
+            "resolvedBy": "0x69c47De9D4D3Dad79590d61b9e05918E03775f24",
+            "restricted": true,
+            "rewardsMaxSpread": 4.5,
+            "rewardsMinSize": 20,
+            "rfqEnabled": false,
+            "secondsDelay": 0,
+            "slug": "highest-temperature-in-nyc-on-october-13-2026-64-65f",
+            "spread": 0.001,
+            "startDate": "2026-10-11T07:56:12Z",
+            "startDateIso": "2026-10-11",
+            "submitted_by": "0xAC9930b2AE455a671b62dE86876A7e8587825294",
+            "takerBaseFee": 1000,
+            "umaBond": "250",
+            "umaResolutionStatuses": "[]",
+            "umaReward": "0.6",
+            "updatedAt": "2026-10-13T08:30:15.500806Z",
+            "version": "v1",
+            "volume": "290.081",
+            "volume1mo": 290.081,
+            "volume1moClob": 290.081,
+            "volume1wk": 290.081,
+            "volume1wkClob": 290.081,
+            "volume1yr": 290.081,
+            "volume1yrClob": 290.081,
+            "volume24hr": 146.71,
+            "volume24hrClob": 146.71,
+            "volumeClob": 290.081,
+            "volumeNum": 290.081
+          },
+          {
+            "acceptingOrders": true,
+            "acceptingOrdersTimestamp": "2026-10-11T07:56:12Z",
+            "active": true,
+            "approved": true,
+            "archived": false,
+            "automaticallyActive": true,
+            "bestAsk": 0.009,
+            "bestBid": 0.006,
+            "clearBookOnStart": false,
+            "clobTokenIds": "[\"14703588796859998892117498634912943272342392198130408826212997930739062830179\", \"101074691455457695483157099877291105702839493897156093871781709552860305444656\"]",
+            "closed": false,
+            "comboStatus": "disabled",
+            "competitive": 0.8047925395731582,
+            "conditionId": "0x124e6d0cae553227b7d948e4fffbf5eabe0ec43daf6fdeaaf8c87c22f8d8b2e9",
+            "createdAt": "2026-10-11T07:55:55.377007Z",
+            "customLiveness": 900,
+            "cyom": false,
+            "deploying": false,
+            "deployingTimestamp": "2026-10-11T07:55:56.667083Z",
+            "description": "This market will resolve to the temperature range that contains the highest temperature recorded by NOAA at the LaGuardia Airport Station in degrees Fahrenheit on 13 Oct '26.\n\nThe resolution source for this market will be information from NOAA, specifically the highest reading under the \"Temp\" column for all times on this day, available here: https://www.weather.gov/wrh/timeseries?site=klga\n\nThis market will resolve off of the Hourly Data provided using the \"Show Hourly Data\" button.\n\nIf NOAA data for the observation date is unavailable by 11:59 PM ET on the day following the observation date, the Weather Underground Daily Observations table will be used as the resolution source.\n\nIn the event that there is no data for the observation date by 11:59 PM ET on the day following the observation date, this market will resolve to the lowest bracket.\n\nTo toggle between Fahrenheit and Celsius, click the \"Switch to US Units w/ kts\" button until the relevant table displays \u00b0F.\n\nThis market will resolve once the first data point for the following date has been published on the resolution source, or by 11:59 PM ET on the day following the observation date, whichever comes first.\n\nThe resolution source for this market measures temperatures to whole degrees Fahrenheit (eg, 21\u00b0F). Thus, this is the level of precision that will be used when resolving the market.\n\nIn the case that the Resolution Source publishes data, sufficient to settle a Market, that is clearly erroneous and the result of technical or operational error, or of unauthorized interference with the Resolution Source or its data, the Market may remain open for a period of up to seven (7) calendar days (ET) from the time of the original release, in anticipation of a correction by the Resolution Source. If the Resolution Source publishes a corrected value within that period, that value will be eligible for resolution. If no corrected value is published within that period, Polymarket will issue a Clarification to determine whether the originally published value may be eligible for resolution, or whether other action is required to preserve the orderly functioning of the Market.\n\nRevisions to temperatures recorded within this market's timeframe will be considered until the first datapoint for the following date has been published, after which any alterations will not be considered.",
+            "enableOrderBook": true,
+            "endDate": "2026-10-13T12:00:00Z",
+            "endDateIso": "2026-10-13",
+            "featured": false,
+            "feeSchedule": {
+              "exponent": 1,
+              "rate": 0.05,
+              "rebateRate": 0.25,
+              "takerOnly": true
+            },
+            "feeType": "weather_fees",
+            "feesEnabled": true,
+            "funded": false,
+            "gameStartTime": "2026-10-13 04:00:00+00",
+            "groupItemThreshold": "3",
+            "groupItemTitle": "66-67\u00b0F",
+            "hasReviewedDates": true,
+            "holdingRewardsEnabled": false,
+            "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "id": "5540793",
+            "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "lastTradePrice": 0.036,
+            "liquidity": "1391.34674",
+            "liquidityClob": 1391.34674,
+            "liquidityNum": 1391.34674,
+            "makerBaseFee": 1000,
+            "manualActivation": false,
+            "marketMakerAddress": "",
+            "negRisk": true,
+            "negRiskMarketID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696000",
+            "negRiskOther": false,
+            "negRiskRequestID": "0xc4e5982e4608ffa2c8b5381cf6b0e735cbd0fabb85f7a05788869f675b144a0a",
+            "new": false,
+            "oneDayPriceChange": 0.004,
+            "oneHourPriceChange": 0.0005,
+            "orderMinSize": 5,
+            "orderPriceMinTickSize": 0.001,
+            "outcomePrices": "[\"0.0075\", \"0.9925\"]",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "pendingDeployment": false,
+            "question": "Will the highest temperature in New York City be between 66-67\u00b0F on October 13?",
+            "questionID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696003",
+            "ready": false,
+            "resolutionSource": "https://www.weather.gov/wrh/timeseries?site=klga",
+            "resolvedBy": "0x69c47De9D4D3Dad79590d61b9e05918E03775f24",
+            "restricted": true,
+            "rewardsMaxSpread": 4.5,
+            "rewardsMinSize": 20,
+            "rfqEnabled": false,
+            "secondsDelay": 0,
+            "slug": "highest-temperature-in-nyc-on-october-13-2026-66-67f",
+            "spread": 0.003,
+            "startDate": "2026-10-11T07:56:12Z",
+            "startDateIso": "2026-10-11",
+            "submitted_by": "0xAC9930b2AE455a671b62dE86876A7e8587825294",
+            "takerBaseFee": 1000,
+            "umaBond": "250",
+            "umaResolutionStatuses": "[]",
+            "umaReward": "0.6",
+            "updatedAt": "2026-10-13T08:32:14.085309Z",
+            "version": "v1",
+            "volume": "726.2564659999999",
+            "volume1mo": 726.256466,
+            "volume1moClob": 726.256466,
+            "volume1wk": 726.256466,
+            "volume1wkClob": 726.256466,
+            "volume1yr": 726.256466,
+            "volume1yrClob": 726.256466,
+            "volume24hr": 592.649,
+            "volume24hrClob": 592.649,
+            "volumeClob": 726.2564659999999,
+            "volumeNum": 726.2564659999999
+          },
+          {
+            "acceptingOrders": true,
+            "acceptingOrdersTimestamp": "2026-10-11T07:56:12Z",
+            "active": true,
+            "approved": true,
+            "archived": false,
+            "automaticallyActive": true,
+            "bestAsk": 0.06,
+            "bestBid": 0.035,
+            "clearBookOnStart": false,
+            "clobTokenIds": "[\"89422351813609858735765630993394604845642765754701917513348526617296071928574\", \"90965282605900307559184550733175319036532241321162559627041502866461364598402\"]",
+            "closed": false,
+            "comboStatus": "disabled",
+            "competitive": 0.8300434216464949,
+            "conditionId": "0x8340ff7f537ab255a0fa5ae1c9609eab4b69b1efb01d2d1f66c3c5e979aa882b",
+            "createdAt": "2026-10-11T07:55:55.513282Z",
+            "customLiveness": 900,
+            "cyom": false,
+            "deploying": false,
+            "deployingTimestamp": "2026-10-11T07:55:56.667083Z",
+            "description": "This market will resolve to the temperature range that contains the highest temperature recorded by NOAA at the LaGuardia Airport Station in degrees Fahrenheit on 13 Oct '26.\n\nThe resolution source for this market will be information from NOAA, specifically the highest reading under the \"Temp\" column for all times on this day, available here: https://www.weather.gov/wrh/timeseries?site=klga\n\nThis market will resolve off of the Hourly Data provided using the \"Show Hourly Data\" button.\n\nIf NOAA data for the observation date is unavailable by 11:59 PM ET on the day following the observation date, the Weather Underground Daily Observations table will be used as the resolution source.\n\nIn the event that there is no data for the observation date by 11:59 PM ET on the day following the observation date, this market will resolve to the lowest bracket.\n\nTo toggle between Fahrenheit and Celsius, click the \"Switch to US Units w/ kts\" button until the relevant table displays \u00b0F.\n\nThis market will resolve once the first data point for the following date has been published on the resolution source, or by 11:59 PM ET on the day following the observation date, whichever comes first.\n\nThe resolution source for this market measures temperatures to whole degrees Fahrenheit (eg, 21\u00b0F). Thus, this is the level of precision that will be used when resolving the market.\n\nIn the case that the Resolution Source publishes data, sufficient to settle a Market, that is clearly erroneous and the result of technical or operational error, or of unauthorized interference with the Resolution Source or its data, the Market may remain open for a period of up to seven (7) calendar days (ET) from the time of the original release, in anticipation of a correction by the Resolution Source. If the Resolution Source publishes a corrected value within that period, that value will be eligible for resolution. If no corrected value is published within that period, Polymarket will issue a Clarification to determine whether the originally published value may be eligible for resolution, or whether other action is required to preserve the orderly functioning of the Market.\n\nRevisions to temperatures recorded within this market's timeframe will be considered until the first datapoint for the following date has been published, after which any alterations will not be considered.",
+            "enableOrderBook": true,
+            "endDate": "2026-10-13T12:00:00Z",
+            "endDateIso": "2026-10-13",
+            "featured": false,
+            "feeSchedule": {
+              "exponent": 1,
+              "rate": 0.05,
+              "rebateRate": 0.25,
+              "takerOnly": true
+            },
+            "feeType": "weather_fees",
+            "feesEnabled": true,
+            "funded": false,
+            "gameStartTime": "2026-10-13 04:00:00+00",
+            "groupItemThreshold": "4",
+            "groupItemTitle": "68-69\u00b0F",
+            "hasReviewedDates": true,
+            "holdingRewardsEnabled": false,
+            "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "id": "5540794",
+            "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "lastTradePrice": 0.057,
+            "liquidity": "1263.99523",
+            "liquidityClob": 1263.99523,
+            "liquidityNum": 1263.99523,
+            "makerBaseFee": 1000,
+            "manualActivation": false,
+            "marketMakerAddress": "",
+            "negRisk": true,
+            "negRiskMarketID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696000",
+            "negRiskOther": false,
+            "negRiskRequestID": "0xda0760cf58c7fce2547aafaa1dadc3f7165ab42fa1bdff3bfd216e5d3f65eb7a",
+            "new": false,
+            "oneDayPriceChange": -0.0975,
+            "oneHourPriceChange": -0.0055,
+            "orderMinSize": 5,
+            "orderPriceMinTickSize": 0.001,
+            "outcomePrices": "[\"0.0475\", \"0.9525\"]",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "pendingDeployment": false,
+            "question": "Will the highest temperature in New York City be between 68-69\u00b0F on October 13?",
+            "questionID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696004",
+            "ready": false,
+            "resolutionSource": "https://www.weather.gov/wrh/timeseries?site=klga",
+            "resolvedBy": "0x69c47De9D4D3Dad79590d61b9e05918E03775f24",
+            "restricted": true,
+            "rewardsMaxSpread": 4.5,
+            "rewardsMinSize": 20,
+            "rfqEnabled": false,
+            "secondsDelay": 0,
+            "slug": "highest-temperature-in-nyc-on-october-13-2026-68-69f",
+            "spread": 0.025,
+            "startDate": "2026-10-11T07:56:12Z",
+            "startDateIso": "2026-10-11",
+            "submitted_by": "0xAC9930b2AE455a671b62dE86876A7e8587825294",
+            "takerBaseFee": 1000,
+            "umaBond": "250",
+            "umaResolutionStatuses": "[]",
+            "umaReward": "0.6",
+            "updatedAt": "2026-10-13T08:32:14.085309Z",
+            "version": "v1",
+            "volume": "2920.133677",
+            "volume1mo": 2920.1336770000003,
+            "volume1moClob": 2920.1336770000003,
+            "volume1wk": 2920.1336770000003,
+            "volume1wkClob": 2920.1336770000003,
+            "volume1yr": 2920.1336770000003,
+            "volume1yrClob": 2920.1336770000003,
+            "volume24hr": 2585.7507140000002,
+            "volume24hrClob": 2585.7507140000002,
+            "volumeClob": 2920.133677,
+            "volumeNum": 2920.133677
+          },
+          {
+            "acceptingOrders": true,
+            "acceptingOrdersTimestamp": "2026-10-11T07:56:12Z",
+            "active": true,
+            "approved": true,
+            "archived": false,
+            "automaticallyActive": true,
+            "bestAsk": 0.41,
+            "bestBid": 0.4,
+            "clearBookOnStart": false,
+            "clobRewards": [
+              {
+                "assetAddress": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+                "conditionId": "0x9c05efe2e3d5a26c81db5d8025f0b460d644f85edffa74bb30f49d002020c024",
+                "endDate": "2500-12-31",
+                "id": "3517970",
+                "rewardsAmount": 0,
+                "rewardsDailyRate": 162,
+                "startDate": "2026-10-13"
+              }
+            ],
+            "clobTokenIds": "[\"95591987137885803859440778528124135816716862273610693186421327990127123502490\", \"35252395109581934743510856788069994393082350785552221127659822116633751256899\"]",
+            "closed": false,
+            "comboStatus": "disabled",
+            "competitive": 0.9910557221079755,
+            "conditionId": "0x9c05efe2e3d5a26c81db5d8025f0b460d644f85edffa74bb30f49d002020c024",
+            "createdAt": "2026-10-11T07:55:55.652418Z",
+            "customLiveness": 900,
+            "cyom": false,
+            "deploying": false,
+            "deployingTimestamp": "2026-10-11T07:55:56.667083Z",
+            "description": "This market will resolve to the temperature range that contains the highest temperature recorded by NOAA at the LaGuardia Airport Station in degrees Fahrenheit on 13 Oct '26.\n\nThe resolution source for this market will be information from NOAA, specifically the highest reading under the \"Temp\" column for all times on this day, available here: https://www.weather.gov/wrh/timeseries?site=klga\n\nThis market will resolve off of the Hourly Data provided using the \"Show Hourly Data\" button.\n\nIf NOAA data for the observation date is unavailable by 11:59 PM ET on the day following the observation date, the Weather Underground Daily Observations table will be used as the resolution source.\n\nIn the event that there is no data for the observation date by 11:59 PM ET on the day following the observation date, this market will resolve to the lowest bracket.\n\nTo toggle between Fahrenheit and Celsius, click the \"Switch to US Units w/ kts\" button until the relevant table displays \u00b0F.\n\nThis market will resolve once the first data point for the following date has been published on the resolution source, or by 11:59 PM ET on the day following the observation date, whichever comes first.\n\nThe resolution source for this market measures temperatures to whole degrees Fahrenheit (eg, 21\u00b0F). Thus, this is the level of precision that will be used when resolving the market.\n\nIn the case that the Resolution Source publishes data, sufficient to settle a Market, that is clearly erroneous and the result of technical or operational error, or of unauthorized interference with the Resolution Source or its data, the Market may remain open for a period of up to seven (7) calendar days (ET) from the time of the original release, in anticipation of a correction by the Resolution Source. If the Resolution Source publishes a corrected value within that period, that value will be eligible for resolution. If no corrected value is published within that period, Polymarket will issue a Clarification to determine whether the originally published value may be eligible for resolution, or whether other action is required to preserve the orderly functioning of the Market.\n\nRevisions to temperatures recorded within this market's timeframe will be considered until the first datapoint for the following date has been published, after which any alterations will not be considered.",
+            "enableOrderBook": true,
+            "endDate": "2026-10-13T12:00:00Z",
+            "endDateIso": "2026-10-13",
+            "featured": false,
+            "feeSchedule": {
+              "exponent": 1,
+              "rate": 0.05,
+              "rebateRate": 0.25,
+              "takerOnly": true
+            },
+            "feeType": "weather_fees",
+            "feesEnabled": true,
+            "funded": false,
+            "gameStartTime": "2026-10-13 04:00:00+00",
+            "groupItemThreshold": "5",
+            "groupItemTitle": "70-71\u00b0F",
+            "hasReviewedDates": true,
+            "holdingRewardsEnabled": false,
+            "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "id": "5540795",
+            "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "lastTradePrice": 0.42,
+            "liquidity": "9543.7229",
+            "liquidityClob": 9543.7229,
+            "liquidityNum": 9543.7229,
+            "makerBaseFee": 1000,
+            "manualActivation": false,
+            "marketMakerAddress": "",
+            "negRisk": true,
+            "negRiskMarketID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696000",
+            "negRiskOther": false,
+            "negRiskRequestID": "0x9096a8cf39b79ee98f9005f930c477b0f8d057a3758852873ef09dd90d628525",
+            "new": false,
+            "oneDayPriceChange": 0.055,
+            "oneHourPriceChange": 0.015,
+            "orderMinSize": 5,
+            "orderPriceMinTickSize": 0.01,
+            "outcomePrices": "[\"0.405\", \"0.595\"]",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "pendingDeployment": false,
+            "question": "Will the highest temperature in New York City be between 70-71\u00b0F on October 13?",
+            "questionID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696005",
+            "ready": false,
+            "resolutionSource": "https://www.weather.gov/wrh/timeseries?site=klga",
+            "resolvedBy": "0x69c47De9D4D3Dad79590d61b9e05918E03775f24",
+            "restricted": true,
+            "rewardsMaxSpread": 4.5,
+            "rewardsMinSize": 100,
+            "rfqEnabled": false,
+            "secondsDelay": 0,
+            "slug": "highest-temperature-in-nyc-on-october-13-2026-70-71f",
+            "spread": 0.01,
+            "startDate": "2026-10-11T07:56:12Z",
+            "startDateIso": "2026-10-11",
+            "submitted_by": "0xAC9930b2AE455a671b62dE86876A7e8587825294",
+            "takerBaseFee": 1000,
+            "umaBond": "250",
+            "umaResolutionStatuses": "[]",
+            "umaReward": "0.6",
+            "updatedAt": "2026-10-13T08:32:14.085309Z",
+            "version": "v1",
+            "volume": "4017.696735000001",
+            "volume1mo": 4017.696735,
+            "volume1moClob": 4017.696735,
+            "volume1wk": 4017.696735,
+            "volume1wkClob": 4017.696735,
+            "volume1yr": 4017.696735,
+            "volume1yrClob": 4017.696735,
+            "volume24hr": 1810.623493,
+            "volume24hrClob": 1810.623493,
+            "volumeClob": 4017.696735000001,
+            "volumeNum": 4017.696735000001
+          },
+          {
+            "acceptingOrders": true,
+            "acceptingOrdersTimestamp": "2026-10-11T07:56:12Z",
+            "active": true,
+            "approved": true,
+            "archived": false,
+            "automaticallyActive": true,
+            "bestAsk": 0.42,
+            "bestBid": 0.4,
+            "clearBookOnStart": false,
+            "clobRewards": [
+              {
+                "assetAddress": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+                "conditionId": "0x3b13226502dd8a444dad281adf58a98fb3d8b1d1c47e8ff07f78dca24b88b2b0",
+                "endDate": "2500-12-31",
+                "id": "3517986",
+                "rewardsAmount": 0,
+                "rewardsDailyRate": 195,
+                "startDate": "2026-10-13"
+              }
+            ],
+            "clobTokenIds": "[\"3473701043311483778923875082254683675395570150430787476275826825768782755897\", \"39703127876529428841854626556000112915655486223269749340423744700402224424187\"]",
+            "closed": false,
+            "comboStatus": "disabled",
+            "competitive": 0.9919650828290844,
+            "conditionId": "0x3b13226502dd8a444dad281adf58a98fb3d8b1d1c47e8ff07f78dca24b88b2b0",
+            "createdAt": "2026-10-11T07:55:55.7935Z",
+            "customLiveness": 900,
+            "cyom": false,
+            "deploying": false,
+            "deployingTimestamp": "2026-10-11T07:55:56.667083Z",
+            "description": "This market will resolve to the temperature range that contains the highest temperature recorded by NOAA at the LaGuardia Airport Station in degrees Fahrenheit on 13 Oct '26.\n\nThe resolution source for this market will be information from NOAA, specifically the highest reading under the \"Temp\" column for all times on this day, available here: https://www.weather.gov/wrh/timeseries?site=klga\n\nThis market will resolve off of the Hourly Data provided using the \"Show Hourly Data\" button.\n\nIf NOAA data for the observation date is unavailable by 11:59 PM ET on the day following the observation date, the Weather Underground Daily Observations table will be used as the resolution source.\n\nIn the event that there is no data for the observation date by 11:59 PM ET on the day following the observation date, this market will resolve to the lowest bracket.\n\nTo toggle between Fahrenheit and Celsius, click the \"Switch to US Units w/ kts\" button until the relevant table displays \u00b0F.\n\nThis market will resolve once the first data point for the following date has been published on the resolution source, or by 11:59 PM ET on the day following the observation date, whichever comes first.\n\nThe resolution source for this market measures temperatures to whole degrees Fahrenheit (eg, 21\u00b0F). Thus, this is the level of precision that will be used when resolving the market.\n\nIn the case that the Resolution Source publishes data, sufficient to settle a Market, that is clearly erroneous and the result of technical or operational error, or of unauthorized interference with the Resolution Source or its data, the Market may remain open for a period of up to seven (7) calendar days (ET) from the time of the original release, in anticipation of a correction by the Resolution Source. If the Resolution Source publishes a corrected value within that period, that value will be eligible for resolution. If no corrected value is published within that period, Polymarket will issue a Clarification to determine whether the originally published value may be eligible for resolution, or whether other action is required to preserve the orderly functioning of the Market.\n\nRevisions to temperatures recorded within this market's timeframe will be considered until the first datapoint for the following date has been published, after which any alterations will not be considered.",
+            "enableOrderBook": true,
+            "endDate": "2026-10-13T12:00:00Z",
+            "endDateIso": "2026-10-13",
+            "featured": false,
+            "feeSchedule": {
+              "exponent": 1,
+              "rate": 0.05,
+              "rebateRate": 0.25,
+              "takerOnly": true
+            },
+            "feeType": "weather_fees",
+            "feesEnabled": true,
+            "funded": false,
+            "gameStartTime": "2026-10-13 04:00:00+00",
+            "groupItemThreshold": "6",
+            "groupItemTitle": "72-73\u00b0F",
+            "hasReviewedDates": true,
+            "holdingRewardsEnabled": false,
+            "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "id": "5540796",
+            "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "lastTradePrice": 0.42,
+            "liquidity": "1794.2619",
+            "liquidityClob": 1794.2619,
+            "liquidityNum": 1794.2619,
+            "makerBaseFee": 1000,
+            "manualActivation": false,
+            "marketMakerAddress": "",
+            "negRisk": true,
+            "negRiskMarketID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696000",
+            "negRiskOther": false,
+            "negRiskRequestID": "0xc61b70f19760d9145ec5208c2a5f1eec997e2079e7be71a1290fa55cb3a9838e",
+            "new": false,
+            "oneDayPriceChange": 0.08,
+            "oneHourPriceChange": -0.045,
+            "orderMinSize": 5,
+            "orderPriceMinTickSize": 0.01,
+            "outcomePrices": "[\"0.41\", \"0.59\"]",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "pendingDeployment": false,
+            "question": "Will the highest temperature in New York City be between 72-73\u00b0F on October 13?",
+            "questionID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696006",
+            "ready": false,
+            "resolutionSource": "https://www.weather.gov/wrh/timeseries?site=klga",
+            "resolvedBy": "0x69c47De9D4D3Dad79590d61b9e05918E03775f24",
+            "restricted": true,
+            "rewardsMaxSpread": 4.5,
+            "rewardsMinSize": 100,
+            "rfqEnabled": false,
+            "secondsDelay": 0,
+            "slug": "highest-temperature-in-nyc-on-october-13-2026-72-73f",
+            "spread": 0.02,
+            "startDate": "2026-10-11T07:56:12Z",
+            "startDateIso": "2026-10-11",
+            "submitted_by": "0xAC9930b2AE455a671b62dE86876A7e8587825294",
+            "takerBaseFee": 1000,
+            "umaBond": "250",
+            "umaResolutionStatuses": "[]",
+            "umaReward": "0.6",
+            "updatedAt": "2026-10-13T08:32:14.085309Z",
+            "version": "v1",
+            "volume": "4872.538384",
+            "volume1mo": 4872.538384,
+            "volume1moClob": 4872.538384,
+            "volume1wk": 4872.538384,
+            "volume1wkClob": 4872.538384,
+            "volume1yr": 4872.538384,
+            "volume1yrClob": 4872.538384,
+            "volume24hr": 1594.249049,
+            "volume24hrClob": 1594.249049,
+            "volumeClob": 4872.538384,
+            "volumeNum": 4872.538384
+          },
+          {
+            "acceptingOrders": true,
+            "acceptingOrdersTimestamp": "2026-10-11T07:56:12Z",
+            "active": true,
+            "approved": true,
+            "archived": false,
+            "automaticallyActive": true,
+            "bestAsk": 0.14,
+            "bestBid": 0.13,
+            "clearBookOnStart": false,
+            "clobRewards": [
+              {
+                "assetAddress": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+                "conditionId": "0x02b0a1ae72270e4b0c081fc19334d5bf07cd68a6241ed297f6b802891f14e3ae",
+                "endDate": "2500-12-31",
+                "id": "3517993",
+                "rewardsAmount": 0,
+                "rewardsDailyRate": 43,
+                "startDate": "2026-10-13"
+              }
+            ],
+            "clobTokenIds": "[\"25881574876061959819562479964254006211832123693521474245567164011557292296478\", \"63702029635833858266578519827180171103631394739145168439579218573726819951350\"]",
+            "closed": false,
+            "comboStatus": "disabled",
+            "competitive": 0.8824372917999515,
+            "conditionId": "0x02b0a1ae72270e4b0c081fc19334d5bf07cd68a6241ed297f6b802891f14e3ae",
+            "createdAt": "2026-10-11T07:55:55.932479Z",
+            "customLiveness": 900,
+            "cyom": false,
+            "deploying": false,
+            "deployingTimestamp": "2026-10-11T07:55:56.667083Z",
+            "description": "This market will resolve to the temperature range that contains the highest temperature recorded by NOAA at the LaGuardia Airport Station in degrees Fahrenheit on 13 Oct '26.\n\nThe resolution source for this market will be information from NOAA, specifically the highest reading under the \"Temp\" column for all times on this day, available here: https://www.weather.gov/wrh/timeseries?site=klga\n\nThis market will resolve off of the Hourly Data provided using the \"Show Hourly Data\" button.\n\nIf NOAA data for the observation date is unavailable by 11:59 PM ET on the day following the observation date, the Weather Underground Daily Observations table will be used as the resolution source.\n\nIn the event that there is no data for the observation date by 11:59 PM ET on the day following the observation date, this market will resolve to the lowest bracket.\n\nTo toggle between Fahrenheit and Celsius, click the \"Switch to US Units w/ kts\" button until the relevant table displays \u00b0F.\n\nThis market will resolve once the first data point for the following date has been published on the resolution source, or by 11:59 PM ET on the day following the observation date, whichever comes first.\n\nThe resolution source for this market measures temperatures to whole degrees Fahrenheit (eg, 21\u00b0F). Thus, this is the level of precision that will be used when resolving the market.\n\nIn the case that the Resolution Source publishes data, sufficient to settle a Market, that is clearly erroneous and the result of technical or operational error, or of unauthorized interference with the Resolution Source or its data, the Market may remain open for a period of up to seven (7) calendar days (ET) from the time of the original release, in anticipation of a correction by the Resolution Source. If the Resolution Source publishes a corrected value within that period, that value will be eligible for resolution. If no corrected value is published within that period, Polymarket will issue a Clarification to determine whether the originally published value may be eligible for resolution, or whether other action is required to preserve the orderly functioning of the Market.\n\nRevisions to temperatures recorded within this market's timeframe will be considered until the first datapoint for the following date has been published, after which any alterations will not be considered.",
+            "enableOrderBook": true,
+            "endDate": "2026-10-13T12:00:00Z",
+            "endDateIso": "2026-10-13",
+            "featured": false,
+            "feeSchedule": {
+              "exponent": 1,
+              "rate": 0.05,
+              "rebateRate": 0.25,
+              "takerOnly": true
+            },
+            "feeType": "weather_fees",
+            "feesEnabled": true,
+            "funded": false,
+            "gameStartTime": "2026-10-13 04:00:00+00",
+            "groupItemThreshold": "7",
+            "groupItemTitle": "74-75\u00b0F",
+            "hasReviewedDates": true,
+            "holdingRewardsEnabled": false,
+            "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "id": "5540797",
+            "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "lastTradePrice": 0.15,
+            "liquidity": "1333.0748",
+            "liquidityClob": 1333.0748,
+            "liquidityNum": 1333.0748,
+            "makerBaseFee": 1000,
+            "manualActivation": false,
+            "marketMakerAddress": "",
+            "negRisk": true,
+            "negRiskMarketID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696000",
+            "negRiskOther": false,
+            "negRiskRequestID": "0x8b591a52a5e4e3c592ca17dcc489638b7f24c08bc82f678472f789a81fa474ba",
+            "new": false,
+            "oneDayPriceChange": -0.02,
+            "oneHourPriceChange": 0.025,
+            "orderMinSize": 5,
+            "orderPriceMinTickSize": 0.01,
+            "outcomePrices": "[\"0.135\", \"0.865\"]",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "pendingDeployment": false,
+            "question": "Will the highest temperature in New York City be between 74-75\u00b0F on October 13?",
+            "questionID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696007",
+            "ready": false,
+            "resolutionSource": "https://www.weather.gov/wrh/timeseries?site=klga",
+            "resolvedBy": "0x69c47De9D4D3Dad79590d61b9e05918E03775f24",
+            "restricted": true,
+            "rewardsMaxSpread": 4.5,
+            "rewardsMinSize": 100,
+            "rfqEnabled": false,
+            "secondsDelay": 0,
+            "slug": "highest-temperature-in-nyc-on-october-13-2026-74-75f",
+            "spread": 0.01,
+            "startDate": "2026-10-11T07:56:12Z",
+            "startDateIso": "2026-10-11",
+            "submitted_by": "0xAC9930b2AE455a671b62dE86876A7e8587825294",
+            "takerBaseFee": 1000,
+            "umaBond": "250",
+            "umaResolutionStatuses": "[]",
+            "umaReward": "0.6",
+            "updatedAt": "2026-10-13T08:32:14.085309Z",
+            "version": "v1",
+            "volume": "4836.749911000001",
+            "volume1mo": 4836.749911,
+            "volume1moClob": 4836.749911,
+            "volume1wk": 4836.749911,
+            "volume1wkClob": 4836.749911,
+            "volume1yr": 4836.749911,
+            "volume1yrClob": 4836.749911,
+            "volume24hr": 2193.5224319999998,
+            "volume24hrClob": 2193.5224319999998,
+            "volumeClob": 4836.749911000001,
+            "volumeNum": 4836.749911000001
+          },
+          {
+            "acceptingOrders": true,
+            "acceptingOrdersTimestamp": "2026-10-11T07:56:12Z",
+            "active": true,
+            "approved": true,
+            "archived": false,
+            "automaticallyActive": true,
+            "bestAsk": 0.025,
+            "bestBid": 0.016,
+            "clearBookOnStart": false,
+            "clobTokenIds": "[\"98362089070916596967985665636831858124550094727987691717040213533719619179366\", \"96337368312080448379620093741518916522069664304269902988726531957503920318450\"]",
+            "closed": false,
+            "comboStatus": "disabled",
+            "competitive": 0.8130608468313291,
+            "conditionId": "0x021ee7d599b949eee30fb6df04dced75b4e1d48b0efdbd00db98b4b903a49fa7",
+            "createdAt": "2026-10-11T07:55:56.068692Z",
+            "customLiveness": 900,
+            "cyom": false,
+            "deploying": false,
+            "deployingTimestamp": "2026-10-11T07:55:56.667083Z",
+            "description": "This market will resolve to the temperature range that contains the highest temperature recorded by NOAA at the LaGuardia Airport Station in degrees Fahrenheit on 13 Oct '26.\n\nThe resolution source for this market will be information from NOAA, specifically the highest reading under the \"Temp\" column for all times on this day, available here: https://www.weather.gov/wrh/timeseries?site=klga\n\nThis market will resolve off of the Hourly Data provided using the \"Show Hourly Data\" button.\n\nIf NOAA data for the observation date is unavailable by 11:59 PM ET on the day following the observation date, the Weather Underground Daily Observations table will be used as the resolution source.\n\nIn the event that there is no data for the observation date by 11:59 PM ET on the day following the observation date, this market will resolve to the lowest bracket.\n\nTo toggle between Fahrenheit and Celsius, click the \"Switch to US Units w/ kts\" button until the relevant table displays \u00b0F.\n\nThis market will resolve once the first data point for the following date has been published on the resolution source, or by 11:59 PM ET on the day following the observation date, whichever comes first.\n\nThe resolution source for this market measures temperatures to whole degrees Fahrenheit (eg, 21\u00b0F). Thus, this is the level of precision that will be used when resolving the market.\n\nIn the case that the Resolution Source publishes data, sufficient to settle a Market, that is clearly erroneous and the result of technical or operational error, or of unauthorized interference with the Resolution Source or its data, the Market may remain open for a period of up to seven (7) calendar days (ET) from the time of the original release, in anticipation of a correction by the Resolution Source. If the Resolution Source publishes a corrected value within that period, that value will be eligible for resolution. If no corrected value is published within that period, Polymarket will issue a Clarification to determine whether the originally published value may be eligible for resolution, or whether other action is required to preserve the orderly functioning of the Market.\n\nRevisions to temperatures recorded within this market's timeframe will be considered until the first datapoint for the following date has been published, after which any alterations will not be considered.",
+            "enableOrderBook": true,
+            "endDate": "2026-10-13T12:00:00Z",
+            "endDateIso": "2026-10-13",
+            "featured": false,
+            "feeSchedule": {
+              "exponent": 1,
+              "rate": 0.05,
+              "rebateRate": 0.25,
+              "takerOnly": true
+            },
+            "feeType": "weather_fees",
+            "feesEnabled": true,
+            "funded": false,
+            "gameStartTime": "2026-10-13 04:00:00+00",
+            "groupItemThreshold": "8",
+            "groupItemTitle": "76-77\u00b0F",
+            "hasReviewedDates": true,
+            "holdingRewardsEnabled": false,
+            "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "id": "5540798",
+            "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "lastTradePrice": 0.015,
+            "liquidity": "1534.99294",
+            "liquidityClob": 1534.99294,
+            "liquidityNum": 1534.99294,
+            "makerBaseFee": 1000,
+            "manualActivation": false,
+            "marketMakerAddress": "",
+            "negRisk": true,
+            "negRiskMarketID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696000",
+            "negRiskOther": false,
+            "negRiskRequestID": "0x5f7ecfee5df8fda2a9c8e1491513aac7edb0545bb59824cb5fcc742505dd04b9",
+            "new": false,
+            "oneDayPriceChange": -0.0095,
+            "oneHourPriceChange": 0.007,
+            "orderMinSize": 5,
+            "orderPriceMinTickSize": 0.001,
+            "outcomePrices": "[\"0.0205\", \"0.9795\"]",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "pendingDeployment": false,
+            "question": "Will the highest temperature in New York City be between 76-77\u00b0F on October 13?",
+            "questionID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696008",
+            "ready": false,
+            "resolutionSource": "https://www.weather.gov/wrh/timeseries?site=klga",
+            "resolvedBy": "0x69c47De9D4D3Dad79590d61b9e05918E03775f24",
+            "restricted": true,
+            "rewardsMaxSpread": 4.5,
+            "rewardsMinSize": 20,
+            "rfqEnabled": false,
+            "secondsDelay": 0,
+            "slug": "highest-temperature-in-nyc-on-october-13-2026-76-77f",
+            "spread": 0.009,
+            "startDate": "2026-10-11T07:56:12Z",
+            "startDateIso": "2026-10-11",
+            "submitted_by": "0xAC9930b2AE455a671b62dE86876A7e8587825294",
+            "takerBaseFee": 1000,
+            "umaBond": "250",
+            "umaResolutionStatuses": "[]",
+            "umaReward": "0.6",
+            "updatedAt": "2026-10-13T08:32:14.085309Z",
+            "version": "v1",
+            "volume": "1222.4490450000003",
+            "volume1mo": 1222.449045,
+            "volume1moClob": 1222.449045,
+            "volume1wk": 1222.449045,
+            "volume1wkClob": 1222.449045,
+            "volume1yr": 1222.449045,
+            "volume1yrClob": 1222.449045,
+            "volume24hr": 809.0652890000001,
+            "volume24hrClob": 809.0652890000001,
+            "volumeClob": 1222.4490450000003,
+            "volumeNum": 1222.4490450000003
+          },
+          {
+            "acceptingOrders": true,
+            "acceptingOrdersTimestamp": "2026-10-11T07:56:12Z",
+            "active": true,
+            "approved": true,
+            "archived": false,
+            "automaticallyActive": true,
+            "bestAsk": 0.002,
+            "bestBid": 0.001,
+            "clearBookOnStart": false,
+            "clobTokenIds": "[\"59342854181895976495474700638607364296382855178189263133462005192482638750100\", \"2773516137644299521989574257025121721198845011428956281586846027533668980661\"]",
+            "closed": false,
+            "comboStatus": "disabled",
+            "competitive": 0.8009597099244316,
+            "conditionId": "0xb7ba6958b3fee037779cf59d720ba45f4476fb47d1f5854e873a8eec1d5e1462",
+            "createdAt": "2026-10-11T07:55:56.20299Z",
+            "customLiveness": 900,
+            "cyom": false,
+            "deploying": false,
+            "deployingTimestamp": "2026-10-11T07:55:56.667083Z",
+            "description": "This market will resolve to the temperature range that contains the highest temperature recorded by NOAA at the LaGuardia Airport Station in degrees Fahrenheit on 13 Oct '26.\n\nThe resolution source for this market will be information from NOAA, specifically the highest reading under the \"Temp\" column for all times on this day, available here: https://www.weather.gov/wrh/timeseries?site=klga\n\nThis market will resolve off of the Hourly Data provided using the \"Show Hourly Data\" button.\n\nIf NOAA data for the observation date is unavailable by 11:59 PM ET on the day following the observation date, the Weather Underground Daily Observations table will be used as the resolution source.\n\nIn the event that there is no data for the observation date by 11:59 PM ET on the day following the observation date, this market will resolve to the lowest bracket.\n\nTo toggle between Fahrenheit and Celsius, click the \"Switch to US Units w/ kts\" button until the relevant table displays \u00b0F.\n\nThis market will resolve once the first data point for the following date has been published on the resolution source, or by 11:59 PM ET on the day following the observation date, whichever comes first.\n\nThe resolution source for this market measures temperatures to whole degrees Fahrenheit (eg, 21\u00b0F). Thus, this is the level of precision that will be used when resolving the market.\n\nIn the case that the Resolution Source publishes data, sufficient to settle a Market, that is clearly erroneous and the result of technical or operational error, or of unauthorized interference with the Resolution Source or its data, the Market may remain open for a period of up to seven (7) calendar days (ET) from the time of the original release, in anticipation of a correction by the Resolution Source. If the Resolution Source publishes a corrected value within that period, that value will be eligible for resolution. If no corrected value is published within that period, Polymarket will issue a Clarification to determine whether the originally published value may be eligible for resolution, or whether other action is required to preserve the orderly functioning of the Market.\n\nRevisions to temperatures recorded within this market's timeframe will be considered until the first datapoint for the following date has been published, after which any alterations will not be considered.",
+            "enableOrderBook": true,
+            "endDate": "2026-10-13T12:00:00Z",
+            "endDateIso": "2026-10-13",
+            "featured": false,
+            "feeSchedule": {
+              "exponent": 1,
+              "rate": 0.05,
+              "rebateRate": 0.25,
+              "takerOnly": true
+            },
+            "feeType": "weather_fees",
+            "feesEnabled": true,
+            "funded": false,
+            "gameStartTime": "2026-10-13 04:00:00+00",
+            "groupItemThreshold": "9",
+            "groupItemTitle": "78-79\u00b0F",
+            "hasReviewedDates": true,
+            "holdingRewardsEnabled": false,
+            "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "id": "5540799",
+            "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "lastTradePrice": 0.003,
+            "liquidity": "1669.75658",
+            "liquidityClob": 1669.75658,
+            "liquidityNum": 1669.75658,
+            "makerBaseFee": 1000,
+            "manualActivation": false,
+            "marketMakerAddress": "",
+            "negRisk": true,
+            "negRiskMarketID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696000",
+            "negRiskOther": false,
+            "negRiskRequestID": "0x5bf5b94d98044dadb20299e177970aec537c4cb99fba26cb8a783987acbf4b91",
+            "new": false,
+            "oneDayPriceChange": -0.0025,
+            "oneHourPriceChange": -0.0005,
+            "orderMinSize": 5,
+            "orderPriceMinTickSize": 0.001,
+            "outcomePrices": "[\"0.0015\", \"0.9985\"]",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "pendingDeployment": false,
+            "question": "Will the highest temperature in New York City be between 78-79\u00b0F on October 13?",
+            "questionID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696009",
+            "ready": false,
+            "resolutionSource": "https://www.weather.gov/wrh/timeseries?site=klga",
+            "resolvedBy": "0x69c47De9D4D3Dad79590d61b9e05918E03775f24",
+            "restricted": true,
+            "rewardsMaxSpread": 4.5,
+            "rewardsMinSize": 20,
+            "rfqEnabled": false,
+            "secondsDelay": 0,
+            "slug": "highest-temperature-in-nyc-on-october-13-2026-78-79f",
+            "spread": 0.001,
+            "startDate": "2026-10-11T07:56:12Z",
+            "startDateIso": "2026-10-11",
+            "submitted_by": "0xAC9930b2AE455a671b62dE86876A7e8587825294",
+            "takerBaseFee": 1000,
+            "umaBond": "250",
+            "umaResolutionStatuses": "[]",
+            "umaReward": "0.6",
+            "updatedAt": "2026-10-13T08:32:14.085309Z",
+            "version": "v1",
+            "volume": "202.67033299999997",
+            "volume1mo": 202.670333,
+            "volume1moClob": 202.670333,
+            "volume1wk": 202.670333,
+            "volume1wkClob": 202.670333,
+            "volume1yr": 202.670333,
+            "volume1yrClob": 202.670333,
+            "volume24hr": 122.263,
+            "volume24hrClob": 122.263,
+            "volumeClob": 202.67033299999997,
+            "volumeNum": 202.67033299999997
+          },
+          {
+            "acceptingOrders": true,
+            "acceptingOrdersTimestamp": "2026-10-11T07:56:12Z",
+            "active": true,
+            "approved": true,
+            "archived": false,
+            "automaticallyActive": true,
+            "bestAsk": 0.001,
+            "clearBookOnStart": false,
+            "clobTokenIds": "[\"31599723257402137889353284338234371865591308633655888087692862886607733583302\", \"12802284711022012821751019594248913630500243819035814109010157964042058435609\"]",
+            "closed": false,
+            "comboStatus": "disabled",
+            "competitive": 0.8003199679231757,
+            "conditionId": "0x40e6bc88be2a9134a19555b78209232c964deb0ffb68fa373d68b7ac917ac68e",
+            "createdAt": "2026-10-11T07:55:56.340263Z",
+            "customLiveness": 900,
+            "cyom": false,
+            "deploying": false,
+            "deployingTimestamp": "2026-10-11T07:55:56.667083Z",
+            "description": "This market will resolve to the temperature range that contains the highest temperature recorded by NOAA at the LaGuardia Airport Station in degrees Fahrenheit on 13 Oct '26.\n\nThe resolution source for this market will be information from NOAA, specifically the highest reading under the \"Temp\" column for all times on this day, available here: https://www.weather.gov/wrh/timeseries?site=klga\n\nThis market will resolve off of the Hourly Data provided using the \"Show Hourly Data\" button.\n\nIf NOAA data for the observation date is unavailable by 11:59 PM ET on the day following the observation date, the Weather Underground Daily Observations table will be used as the resolution source.\n\nIn the event that there is no data for the observation date by 11:59 PM ET on the day following the observation date, this market will resolve to the lowest bracket.\n\nTo toggle between Fahrenheit and Celsius, click the \"Switch to US Units w/ kts\" button until the relevant table displays \u00b0F.\n\nThis market will resolve once the first data point for the following date has been published on the resolution source, or by 11:59 PM ET on the day following the observation date, whichever comes first.\n\nThe resolution source for this market measures temperatures to whole degrees Fahrenheit (eg, 21\u00b0F). Thus, this is the level of precision that will be used when resolving the market.\n\nIn the case that the Resolution Source publishes data, sufficient to settle a Market, that is clearly erroneous and the result of technical or operational error, or of unauthorized interference with the Resolution Source or its data, the Market may remain open for a period of up to seven (7) calendar days (ET) from the time of the original release, in anticipation of a correction by the Resolution Source. If the Resolution Source publishes a corrected value within that period, that value will be eligible for resolution. If no corrected value is published within that period, Polymarket will issue a Clarification to determine whether the originally published value may be eligible for resolution, or whether other action is required to preserve the orderly functioning of the Market.\n\nRevisions to temperatures recorded within this market's timeframe will be considered until the first datapoint for the following date has been published, after which any alterations will not be considered.",
+            "enableOrderBook": true,
+            "endDate": "2026-10-13T12:00:00Z",
+            "endDateIso": "2026-10-13",
+            "featured": false,
+            "feeSchedule": {
+              "exponent": 1,
+              "rate": 0.05,
+              "rebateRate": 0.25,
+              "takerOnly": true
+            },
+            "feeType": "weather_fees",
+            "feesEnabled": true,
+            "funded": false,
+            "gameStartTime": "2026-10-13 04:00:00+00",
+            "groupItemThreshold": "10",
+            "groupItemTitle": "80\u00b0F or higher",
+            "hasReviewedDates": true,
+            "holdingRewardsEnabled": false,
+            "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "id": "5540800",
+            "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+            "lastTradePrice": 0.009,
+            "liquidity": "1409.33759",
+            "liquidityClob": 1409.33759,
+            "liquidityNum": 1409.33759,
+            "makerBaseFee": 1000,
+            "manualActivation": false,
+            "marketMakerAddress": "",
+            "negRisk": true,
+            "negRiskMarketID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696000",
+            "negRiskOther": false,
+            "negRiskRequestID": "0x01838a936895c9c4b30fd892b2738f2e0b82712f087168349ff20d9f27848ca3",
+            "new": false,
+            "oneDayPriceChange": -0.0015,
+            "orderMinSize": 5,
+            "orderPriceMinTickSize": 0.001,
+            "outcomePrices": "[\"0.0005\", \"0.9995\"]",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "pendingDeployment": false,
+            "question": "Will the highest temperature in New York City be 80\u00b0F or higher on October 13?",
+            "questionID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc3469600a",
+            "ready": false,
+            "resolutionSource": "https://www.weather.gov/wrh/timeseries?site=klga",
+            "resolvedBy": "0x69c47De9D4D3Dad79590d61b9e05918E03775f24",
+            "restricted": true,
+            "rewardsMaxSpread": 4.5,
+            "rewardsMinSize": 20,
+            "rfqEnabled": false,
+            "secondsDelay": 0,
+            "slug": "highest-temperature-in-nyc-on-october-13-2026-80forhigher",
+            "spread": 0.001,
+            "startDate": "2026-10-11T07:56:12Z",
+            "startDateIso": "2026-10-11",
+            "submitted_by": "0xAC9930b2AE455a671b62dE86876A7e8587825294",
+            "takerBaseFee": 1000,
+            "umaBond": "250",
+            "umaResolutionStatuses": "[]",
+            "umaReward": "0.6",
+            "updatedAt": "2026-10-13T08:32:14.085309Z",
+            "version": "v1",
+            "volume": "267.2708",
+            "volume1mo": 256.12080000000003,
+            "volume1moClob": 256.12080000000003,
+            "volume1wk": 256.12080000000003,
+            "volume1wkClob": 256.12080000000003,
+            "volume1yr": 256.12080000000003,
+            "volume1yrClob": 256.12080000000003,
+            "volume24hr": 54.77,
+            "volume24hrClob": 54.77,
+            "volumeClob": 267.2708,
+            "volumeNum": 267.2708
+          }
+        ],
+        "negRisk": true,
+        "negRiskAugmented": false,
+        "negRiskMarketID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696000",
+        "new": false,
+        "openInterest": 10240.094901999999,
+        "pendingDeployment": false,
+        "resolutionSource": "https://www.weather.gov/wrh/timeseries?site=klga",
+        "restricted": true,
+        "series": [
+          {
+            "active": true,
+            "archived": false,
+            "closed": false,
+            "commentCount": 4456,
+            "createdAt": "2025-01-21T17:04:00.621433Z",
+            "featured": false,
+            "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/highest-temperature-in-nyc-on-jan-22-OStjLs0cRhiV.jpg",
+            "id": "10005",
+            "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/highest-temperature-in-nyc-on-jan-22-OStjLs0cRhiV.jpg",
+            "liquidity": 77624.6221,
+            "recurrence": "daily",
+            "restricted": true,
+            "seriesType": "single",
+            "slug": "nyc-daily-weather",
+            "ticker": "nyc-daily-weather",
+            "title": "NYC Daily Weather",
+            "updatedAt": "2026-10-13T08:30:45.228299Z",
+            "volume": 25593.19079,
+            "volume24hr": 40022.097901
+          }
+        ],
+        "seriesSlug": "nyc-daily-weather",
+        "showAllOutcomes": true,
+        "showMarketImages": false,
+        "slug": "highest-temperature-in-nyc-on-october-13-2026",
+        "startDate": "2026-10-11T07:56:12Z",
+        "startTime": "2026-10-11T07:55:54.546Z",
+        "tags": [
+          {
+            "createdAt": "2023-11-02T21:17:34.814Z",
+            "forceShow": false,
+            "id": "84",
+            "label": "Weather",
+            "publishedAt": "2023-11-02 21:17:34.81+00",
+            "slug": "weather",
+            "updatedAt": "2026-03-09T22:33:58.564774Z"
+          },
+          {
+            "createdAt": "2025-02-01T00:45:26.493838Z",
+            "forceShow": false,
+            "id": "101757",
+            "label": "Recurring",
+            "slug": "recurring",
+            "updatedAt": "2026-04-17T17:25:43.117249Z"
+          },
+          {
+            "createdAt": "2025-05-23T18:47:07.430147Z",
+            "forceShow": false,
+            "id": "102169",
+            "isCarousel": false,
+            "label": "Hide From New",
+            "slug": "hide-from-new",
+            "updatedAt": "2026-04-17T20:28:28.912197Z"
+          },
+          {
+            "id": "100091",
+            "label": "New York City",
+            "slug": "new-york-city",
+            "updatedAt": "2026-04-15T20:48:58.769206Z"
+          },
+          {
+            "createdAt": "2025-12-31T06:10:27.471939Z",
+            "forceShow": false,
+            "id": "103040",
+            "isCarousel": false,
+            "label": "Daily Temperature",
+            "slug": "daily-temperature",
+            "updatedAt": "2026-04-17T20:53:11.600562Z"
+          },
+          {
+            "createdAt": "2026-04-14T17:30:54.763291Z",
+            "forceShow": false,
+            "id": "104596",
+            "isCarousel": false,
+            "label": "Highest temperature",
+            "slug": "highest-temperature",
+            "updatedAt": "2026-04-17T20:53:51.670468Z"
+          }
+        ],
+        "ticker": "highest-temperature-in-nyc-on-october-13-2026",
+        "title": "Highest temperature in NYC on October 13?",
+        "updatedAt": "2026-10-13T08:32:39.648657Z",
+        "version": "v1",
+        "volume": 19636.970351000004,
+        "volume1mo": 19555.820351,
+        "volume1wk": 19555.820351,
+        "volume1yr": 19555.820351,
+        "volume24hr": 9942.355977000001
+      },
+      "fetched_at": "2026-10-13T08:33:23.214715+00:00",
+      "url": "https://gamma-api.polymarket.com/events/slug/highest-temperature-in-nyc-on-october-13-2026"
+    },
+    "metar": {
+      "data": [
+        {
+          "altim": 1013.6,
+          "clouds": [
+            {
+              "base": 25000,
+              "cover": "SCT"
+            }
+          ],
+          "cover": "SCT",
+          "dewp": 13.9,
+          "elev": 9,
+          "fltCat": "VFR",
+          "icaoId": "KLGA",
+          "lat": 40.7794,
+          "lon": -73.8803,
+          "metarType": "METAR",
+          "name": "New York/La Guardia Arpt, NY, US",
+          "obsTime": 1791877860,
+          "qcField": 12,
+          "rawOb": "METAR KLGA 130751Z 00000KT 10SM SCT250 16/14 A2993 RMK AO2 SLP135 T01610139 $",
+          "receiptTime": "2026-10-13T07:54:09.695Z",
+          "reportTime": "2026-10-13T08:00:00.000Z",
+          "slp": 1013.5,
+          "temp": 16.1,
+          "visib": "10+",
+          "wdir": 0,
+          "wspd": 0
+        },
+        {
+          "altim": 1013.6,
+          "clouds": [
+            {
+              "base": 25000,
+              "cover": "SCT"
+            }
+          ],
+          "cover": "SCT",
+          "dewp": 13.9,
+          "elev": 9,
+          "fltCat": "VFR",
+          "icaoId": "KLGA",
+          "lat": 40.7794,
+          "lon": -73.8803,
+          "metarType": "METAR",
+          "name": "New York/La Guardia Arpt, NY, US",
+          "obsTime": 1791874260,
+          "qcField": 12,
+          "rawOb": "METAR KLGA 130651Z 00000KT 10SM SCT250 16/14 A2993 RMK AO2 SLP134 T01610139 $",
+          "receiptTime": "2026-10-13T06:54:08.560Z",
+          "reportTime": "2026-10-13T07:00:00.000Z",
+          "slp": 1013.4,
+          "temp": 16.1,
+          "visib": "10+",
+          "wdir": 0,
+          "wspd": 0
+        },
+        {
+          "altim": 1013.3,
+          "clouds": [
+            {
+              "base": 25000,
+              "cover": "SCT"
+            }
+          ],
+          "cover": "SCT",
+          "dewp": 14.4,
+          "elev": 9,
+          "fltCat": "VFR",
+          "icaoId": "KLGA",
+          "lat": 40.7794,
+          "lon": -73.8803,
+          "maxT": 19.4,
+          "metarType": "METAR",
+          "minT": 16.7,
+          "name": "New York/La Guardia Arpt, NY, US",
+          "obsTime": 1791870660,
+          "presTend": 0.7,
+          "qcField": 12,
+          "rawOb": "METAR KLGA 130551Z 10003KT 10SM SCT250 17/14 A2992 RMK AO2 SLP131 T01670144 10194 20167 53007 $",
+          "receiptTime": "2026-10-13T05:54:09.533Z",
+          "reportTime": "2026-10-13T06:00:00.000Z",
+          "slp": 1013.1,
+          "temp": 16.7,
+          "visib": "10+",
+          "wdir": 100,
+          "wspd": 3
+        },
+        {
+          "altim": 1013,
+          "clouds": [
+            {
+              "base": 20000,
+              "cover": "FEW"
+            },
+            {
+              "base": 25000,
+              "cover": "BKN"
+            }
+          ],
+          "cover": "BKN",
+          "dewp": 13.9,
+          "elev": 9,
+          "fltCat": "VFR",
+          "icaoId": "KLGA",
+          "lat": 40.7794,
+          "lon": -73.8803,
+          "maxT24": 22.2,
+          "metarType": "METAR",
+          "minT24": 12.8,
+          "name": "New York/La Guardia Arpt, NY, US",
+          "obsTime": 1791867060,
+          "qcField": 12,
+          "rawOb": "METAR KLGA 130451Z 35004KT 10SM FEW200 BKN250 17/14 A2991 RMK AO2 SLP127 T01720139 402220128 $",
+          "receiptTime": "2026-10-13T04:54:06.242Z",
+          "reportTime": "2026-10-13T05:00:00.000Z",
+          "slp": 1012.7,
+          "temp": 17.2,
+          "visib": "10+",
+          "wdir": 350,
+          "wspd": 4
+        },
+        {
+          "altim": 1012.6,
+          "clouds": [
+            {
+              "base": 20000,
+              "cover": "FEW"
+            },
+            {
+              "base": 25000,
+              "cover": "BKN"
+            }
+          ],
+          "cover": "BKN",
+          "dewp": 13.9,
+          "elev": 9,
+          "fltCat": "VFR",
+          "icaoId": "KLGA",
+          "lat": 40.7794,
+          "lon": -73.8803,
+          "metarType": "METAR",
+          "name": "New York/La Guardia Arpt, NY, US",
+          "obsTime": 1791863460,
+          "qcField": 12,
+          "rawOb": "METAR KLGA 130351Z 33004KT 10SM FEW200 BKN250 18/14 A2990 RMK AO2 SLP124 T01780139 $",
+          "receiptTime": "2026-10-13T03:54:06.431Z",
+          "reportTime": "2026-10-13T04:00:00.000Z",
+          "slp": 1012.4,
+          "temp": 17.8,
+          "visib": "10+",
+          "wdir": 330,
+          "wspd": 4
+        },
+        {
+          "altim": 1012.6,
+          "clouds": [
+            {
+              "base": 20000,
+              "cover": "FEW"
+            },
+            {
+              "base": 25000,
+              "cover": "BKN"
+            }
+          ],
+          "cover": "BKN",
+          "dewp": 13.9,
+          "elev": 9,
+          "fltCat": "VFR",
+          "icaoId": "KLGA",
+          "lat": 40.7794,
+          "lon": -73.8803,
+          "metarType": "METAR",
+          "name": "New York/La Guardia Arpt, NY, US",
+          "obsTime": 1791859860,
+          "presTend": 1.6,
+          "qcField": 12,
+          "rawOb": "METAR KLGA 130251Z 36003KT 10SM FEW200 BKN250 18/14 A2990 RMK AO2 SLP124 T01830139 53016 $",
+          "receiptTime": "2026-10-13T02:54:15.860Z",
+          "reportTime": "2026-10-13T03:00:00.000Z",
+          "slp": 1012.4,
+          "temp": 18.3,
+          "visib": "10+",
+          "wdir": 360,
+          "wspd": 3
+        }
+      ],
+      "fetched_at": "2026-10-13T08:33:23.286969+00:00",
+      "url": "https://aviationweather.gov/api/data/metar?ids=KLGA&format=json&hours=6"
+    }
+  },
+  "input": {
+    "book": {
+      "asks": [
+        {
+          "price": "0.999",
+          "size": "16515"
+        },
+        {
+          "price": "0.998",
+          "size": "1250"
+        },
+        {
+          "price": "0.997",
+          "size": "1499.99"
+        },
+        {
+          "price": "0.996",
+          "size": "125"
+        },
+        {
+          "price": "0.995",
+          "size": "100"
+        },
+        {
+          "price": "0.994",
+          "size": "1249.99"
+        },
+        {
+          "price": "0.993",
+          "size": "71.42"
+        },
+        {
+          "price": "0.992",
+          "size": "937.5"
+        },
+        {
+          "price": "0.991",
+          "size": "55.55"
+        },
+        {
+          "price": "0.99",
+          "size": "2800"
+        },
+        {
+          "price": "0.98",
+          "size": "2060"
+        },
+        {
+          "price": "0.97",
+          "size": "49.99"
+        },
+        {
+          "price": "0.96",
+          "size": "217"
+        },
+        {
+          "price": "0.95",
+          "size": "165"
+        },
+        {
+          "price": "0.94",
+          "size": "16.66"
+        },
+        {
+          "price": "0.93",
+          "size": "114.27"
+        },
+        {
+          "price": "0.92",
+          "size": "12.5"
+        },
+        {
+          "price": "0.91",
+          "size": "11.11"
+        },
+        {
+          "price": "0.909",
+          "size": "76.92"
+        },
+        {
+          "price": "0.9",
+          "size": "80"
+        },
+        {
+          "price": "0.89",
+          "size": "9.09"
+        },
+        {
+          "price": "0.88",
+          "size": "8.33"
+        },
+        {
+          "price": "0.86",
+          "size": "57.13"
+        },
+        {
+          "price": "0.85",
+          "size": "53.32"
+        },
+        {
+          "price": "0.84",
+          "size": "6.25"
+        },
+        {
+          "price": "0.82",
+          "size": "44.43"
+        },
+        {
+          "price": "0.8",
+          "size": "5"
+        },
+        {
+          "price": "0.79",
+          "size": "9.52"
+        },
+        {
+          "price": "0.78",
+          "size": "9.09"
+        },
+        {
+          "price": "0.779",
+          "size": "31.67"
+        },
+        {
+          "price": "0.77",
+          "size": "30.43"
+        },
+        {
+          "price": "0.76",
+          "size": "8.33"
+        },
+        {
+          "price": "0.75",
+          "size": "8"
+        },
+        {
+          "price": "0.74",
+          "size": "7.69"
+        },
+        {
+          "price": "0.72",
+          "size": "7.14"
+        },
+        {
+          "price": "0.7",
+          "size": "44.99"
+        },
+        {
+          "price": "0.68",
+          "size": "6.25"
+        },
+        {
+          "price": "0.67",
+          "size": "21.21"
+        },
+        {
+          "price": "0.66",
+          "size": "5.88"
+        },
+        {
+          "price": "0.65",
+          "size": "20"
+        },
+        {
+          "price": "0.64",
+          "size": "5.55"
+        },
+        {
+          "price": "0.62",
+          "size": "5.26"
+        },
+        {
+          "price": "0.6",
+          "size": "10"
+        },
+        {
+          "price": "0.58",
+          "size": "7.14"
+        },
+        {
+          "price": "0.57",
+          "size": "16.27"
+        },
+        {
+          "price": "0.56",
+          "size": "6.81"
+        },
+        {
+          "price": "0.55",
+          "size": "15.55"
+        },
+        {
+          "price": "0.54",
+          "size": "6.52"
+        },
+        {
+          "price": "0.52",
+          "size": "6.25"
+        },
+        {
+          "price": "0.5",
+          "size": "20"
+        },
+        {
+          "price": "0.499",
+          "size": "50"
+        },
+        {
+          "price": "0.497",
+          "size": "13.91"
+        },
+        {
+          "price": "0.37",
+          "size": "5"
+        },
+        {
+          "price": "0.369",
+          "size": "30"
+        },
+        {
+          "price": "0.34",
+          "size": "30"
+        },
+        {
+          "price": "0.2",
+          "size": "20"
+        },
+        {
+          "price": "0.199",
+          "size": "60"
+        },
+        {
+          "price": "0.198",
+          "size": "370"
+        },
+        {
+          "price": "0.14",
+          "size": "30"
+        },
+        {
+          "price": "0.139",
+          "size": "10"
+        },
+        {
+          "price": "0.138",
+          "size": "30"
+        },
+        {
+          "price": "0.1",
+          "size": "120"
+        },
+        {
+          "price": "0.04",
+          "size": "32"
+        },
+        {
+          "price": "0.02",
+          "size": "125"
+        },
+        {
+          "price": "0.019",
+          "size": "60.5"
+        },
+        {
+          "price": "0.012",
+          "size": "5"
+        },
+        {
+          "price": "0.011",
+          "size": "5.09"
+        },
+        {
+          "price": "0.001",
+          "size": "65.77"
+        }
+      ],
+      "asset_id": "94107367991540006504083956530228741659859027357286584369013410605485870611275",
+      "bids": [],
+      "hash": "b2f033ebbd37ab34409b6edbae6e11b7e01cebfa",
+      "last_trade_price": "0.999",
+      "market": "0xaae5da314e023883facfd1072101517843c200cdd6c62ead92ff15974d374fc3",
+      "min_order_size": "5",
+      "neg_risk": true,
+      "tick_size": "0.001",
+      "timestamp": "1791880347474"
+    },
+    "condition_id": "0xaae5da314e023883facfd1072101517843c200cdd6c62ead92ff15974d374fc3",
+    "decision_at": "2026-10-13T08:33:23.361988+00:00",
+    "market": {
+      "acceptingOrders": true,
+      "acceptingOrdersTimestamp": "2026-10-11T07:56:12Z",
+      "active": true,
+      "approved": true,
+      "archived": false,
+      "automaticallyActive": true,
+      "bestAsk": 0.001,
+      "clearBookOnStart": false,
+      "clobTokenIds": "[\"94107367991540006504083956530228741659859027357286584369013410605485870611275\", \"19055690330102646552037765600497354508230187432379666680095273660995775911802\"]",
+      "closed": false,
+      "comboStatus": "disabled",
+      "competitive": 0.8003199679231757,
+      "conditionId": "0xaae5da314e023883facfd1072101517843c200cdd6c62ead92ff15974d374fc3",
+      "createdAt": "2026-10-11T07:55:55.23729Z",
+      "customLiveness": 900,
+      "cyom": false,
+      "deploying": false,
+      "deployingTimestamp": "2026-10-11T07:55:56.667083Z",
+      "description": "This market will resolve to the temperature range that contains the highest temperature recorded by NOAA at the LaGuardia Airport Station in degrees Fahrenheit on 13 Oct '26.\n\nThe resolution source for this market will be information from NOAA, specifically the highest reading under the \"Temp\" column for all times on this day, available here: https://www.weather.gov/wrh/timeseries?site=klga\n\nThis market will resolve off of the Hourly Data provided using the \"Show Hourly Data\" button.\n\nIf NOAA data for the observation date is unavailable by 11:59 PM ET on the day following the observation date, the Weather Underground Daily Observations table will be used as the resolution source.\n\nIn the event that there is no data for the observation date by 11:59 PM ET on the day following the observation date, this market will resolve to the lowest bracket.\n\nTo toggle between Fahrenheit and Celsius, click the \"Switch to US Units w/ kts\" button until the relevant table displays \u00b0F.\n\nThis market will resolve once the first data point for the following date has been published on the resolution source, or by 11:59 PM ET on the day following the observation date, whichever comes first.\n\nThe resolution source for this market measures temperatures to whole degrees Fahrenheit (eg, 21\u00b0F). Thus, this is the level of precision that will be used when resolving the market.\n\nIn the case that the Resolution Source publishes data, sufficient to settle a Market, that is clearly erroneous and the result of technical or operational error, or of unauthorized interference with the Resolution Source or its data, the Market may remain open for a period of up to seven (7) calendar days (ET) from the time of the original release, in anticipation of a correction by the Resolution Source. If the Resolution Source publishes a corrected value within that period, that value will be eligible for resolution. If no corrected value is published within that period, Polymarket will issue a Clarification to determine whether the originally published value may be eligible for resolution, or whether other action is required to preserve the orderly functioning of the Market.\n\nRevisions to temperatures recorded within this market's timeframe will be considered until the first datapoint for the following date has been published, after which any alterations will not be considered.",
+      "enableOrderBook": true,
+      "endDate": "2026-10-13T12:00:00Z",
+      "endDateIso": "2026-10-13",
+      "featured": false,
+      "feeSchedule": {
+        "exponent": 1,
+        "rate": 0.05,
+        "rebateRate": 0.25,
+        "takerOnly": true
+      },
+      "feeType": "weather_fees",
+      "feesEnabled": true,
+      "funded": false,
+      "gameStartTime": "2026-10-13 04:00:00+00",
+      "groupItemThreshold": "2",
+      "groupItemTitle": "64-65\u00b0F",
+      "hasReviewedDates": true,
+      "holdingRewardsEnabled": false,
+      "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+      "id": "5540792",
+      "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test-nyc-weather-pciture-cgUEW73XBkei.jpg",
+      "lastTradePrice": 0.008,
+      "liquidity": "1218.00626",
+      "liquidityClob": 1218.00626,
+      "liquidityNum": 1218.00626,
+      "makerBaseFee": 1000,
+      "manualActivation": false,
+      "marketMakerAddress": "",
+      "negRisk": true,
+      "negRiskMarketID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696000",
+      "negRiskOther": false,
+      "negRiskRequestID": "0x09dd52120227c91143edfb3f1d041d355cc3323cc0303fab0057bdd7727e5e41",
+      "new": false,
+      "oneDayPriceChange": -0.001,
+      "orderMinSize": 5,
+      "orderPriceMinTickSize": 0.001,
+      "outcomePrices": "[\"0.0005\", \"0.9995\"]",
+      "outcomes": "[\"Yes\", \"No\"]",
+      "pendingDeployment": false,
+      "question": "Will the highest temperature in New York City be between 64-65\u00b0F on October 13?",
+      "questionID": "0xd6e25a82135436c571ab3ccbad95a6437ac5b3584536453aeb1dd8fc34696002",
+      "ready": false,
+      "resolutionSource": "https://www.weather.gov/wrh/timeseries?site=klga",
+      "resolvedBy": "0x69c47De9D4D3Dad79590d61b9e05918E03775f24",
+      "restricted": true,
+      "rewardsMaxSpread": 4.5,
+      "rewardsMinSize": 20,
+      "rfqEnabled": false,
+      "secondsDelay": 0,
+      "slug": "highest-temperature-in-nyc-on-october-13-2026-64-65f",
+      "spread": 0.001,
+      "startDate": "2026-10-11T07:56:12Z",
+      "startDateIso": "2026-10-11",
+      "submitted_by": "0xAC9930b2AE455a671b62dE86876A7e8587825294",
+      "takerBaseFee": 1000,
+      "umaBond": "250",
+      "umaResolutionStatuses": "[]",
+      "umaReward": "0.6",
+      "updatedAt": "2026-10-13T08:30:15.500806Z",
+      "version": "v1",
+      "volume": "290.081",
+      "volume1mo": 290.081,
+      "volume1moClob": 290.081,
+      "volume1wk": 290.081,
+      "volume1wkClob": 290.081,
+      "volume1yr": 290.081,
+      "volume1yrClob": 290.081,
+      "volume24hr": 146.71,
+      "volume24hrClob": 146.71,
+      "volumeClob": 290.081,
+      "volumeNum": 290.081
+    },
+    "market_active": true,
+    "market_closed": false,
+    "market_fetched_at": "2026-10-13T08:33:23.214715+00:00",
+    "market_id": "5540792",
+    "observations": [],
+    "outcome": "Yes",
+    "primary_source_available": false,
+    "remaining_day_model": null,
+    "rule_kind": "hourly_temp_whole_degree",
+    "rule_sha256": "4a1d7b41544d55b61ec8e75242d628486054d3fc4c925246c31fcadf043ab698",
+    "station_id": "KLGA",
+    "target_date": "2026-10-13",
+    "target_end_date": "2026-10-13T12:00:00Z",
+    "token_id": "94107367991540006504083956530228741659859027357286584369013410605485870611275"
+  },
+  "provenance": "public read-only; METAR not resolver Hourly Temp; no publication timestamp or model",
+  "result": {
+    "condition_id": "0xaae5da314e023883facfd1072101517843c200cdd6c62ead92ff15974d374fc3",
+    "decision_at": "2026-10-13T08:33:23.361988+00:00",
+    "market_id": "5540792",
+    "market_sha256": "4a1d7b41544d55b61ec8e75242d628486054d3fc4c925246c31fcadf043ab698",
+    "market_source_url": "https://gamma-api.polymarket.com/markets/5540792",
+    "paper_only": true,
+    "reason": "ValueError: fallback resolver not ruled out",
+    "resolver": {
+      "authority": "weather.gov-timeseries",
+      "reason": "METAR station parsed",
+      "station": "KLGA",
+      "supported": true
+    },
+    "rule_source": "https://www.weather.gov/wrh/timeseries?site=klga",
+    "rule_text": "This market will resolve to the temperature range that contains the highest temperature recorded by NOAA at the LaGuardia Airport Station in degrees Fahrenheit on 13 Oct '26.\n\nThe resolution source for this market will be information from NOAA, specifically the highest reading under the \"Temp\" column for all times on this day, available here: https://www.weather.gov/wrh/timeseries?site=klga\n\nThis market will resolve off of the Hourly Data provided using the \"Show Hourly Data\" button.\n\nIf NOAA data for the observation date is unavailable by 11:59 PM ET on the day following the observation date, the Weather Underground Daily Observations table will be used as the resolution source.\n\nIn the event that there is no data for the observation date by 11:59 PM ET on the day following the observation date, this market will resolve to the lowest bracket.\n\nTo toggle between Fahrenheit and Celsius, click the \"Switch to US Units w/ kts\" button until the relevant table displays \u00b0F.\n\nThis market will resolve once the first data point for the following date has been published on the resolution source, or by 11:59 PM ET on the day following the observation date, whichever comes first.\n\nThe resolution source for this market measures temperatures to whole degrees Fahrenheit (eg, 21\u00b0F). Thus, this is the level of precision that will be used when resolving the market.\n\nIn the case that the Resolution Source publishes data, sufficient to settle a Market, that is clearly erroneous and the result of technical or operational error, or of unauthorized interference with the Resolution Source or its data, the Market may remain open for a period of up to seven (7) calendar days (ET) from the time of the original release, in anticipation of a correction by the Resolution Source. If the Resolution Source publishes a corrected value within that period, that value will be eligible for resolution. If no corrected value is published within that period, Polymarket will issue a Clarification to determine whether the originally published value may be eligible for resolution, or whether other action is required to preserve the orderly functioning of the Market.\n\nRevisions to temperatures recorded within this market's timeframe will be considered until the first datapoint for the following date has been published, after which any alterations will not be considered.",
+    "status": "rejected",
+    "token_id": null
+  }
+}
