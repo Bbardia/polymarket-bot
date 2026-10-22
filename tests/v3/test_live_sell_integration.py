@@ -39,6 +39,15 @@ class OfflineAuthenticatedAPI:
             D("85"), (RemotePosition(CONDITION, TOKEN, D("30"), D("24"), D("15")),), (),
         )
         self.context_override = {}
+        self.chain_balance: D | None = None
+        self.chain_reads = 0
+
+    async def fetch_ctf_balances(self, wallet, tokens):
+        assert wallet == self.settings.wallet_address and tokens == (TOKEN,)
+        self.chain_reads += 1
+        if self.chain_balance is None:
+            raise RuntimeError("offline chain proof unavailable")
+        return {TOKEN: self.chain_balance}
 
     async def initialize_secure_client(self):
         self.initialized = True
@@ -245,6 +254,7 @@ def _sub_quantum_fill_system(tmp_path):
         api.remote = RemoteSnapshot(
             D("84.99998"), (RemotePosition(CONDITION, TOKEN, D("30.0000"), D("24"), D("15")),), (),
         )
+        api.chain_balance = D("30.00004")
         return runner, api
     return build()
 
@@ -254,10 +264,27 @@ def test_sell_preflight_accepts_four_decimal_rounded_remote_size(tmp_path):
         runner, api = await _sub_quantum_fill_system(tmp_path)
         local = local_snapshot(StreamEventProcessor(runner.ledger), BASELINE)
         assert local.position_quantities == {TOKEN: D("30.00004")}
-        assert runner.reconciler.compare(local, api.remote).safe_to_trade
+        assert not runner.reconciler.compare(local, api.remote).safe_to_trade
+        assert (await runner.reconciler.compare_with_chain(local, api.remote, api)).safe_to_trade
         result = await _exit(runner, api)
         assert result[0]["outcome"] == "accepted", result
         assert len(api.created) == 1 and api.created[0]["size"] == D("22.50")
+        assert api.chain_reads >= 2  # direct comparison and fresh service preflight
+    asyncio.run(scenario())
+
+
+def test_sell_display_mismatch_blocks_when_chain_disagrees_or_fails(tmp_path):
+    async def scenario():
+        runner, api = await _sub_quantum_fill_system(tmp_path)
+        api.chain_balance = D("30.00003")
+        blocked = await _exit(runner, api)
+        assert blocked[0]["outcome"] != "accepted"
+        assert not api.created
+        api.chain_balance = None
+        blocked = await _exit(runner, api)
+        assert blocked[0]["outcome"] != "accepted"
+        assert not api.created
+        assert api.chain_reads >= 2
     asyncio.run(scenario())
 
 

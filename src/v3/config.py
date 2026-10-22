@@ -6,8 +6,10 @@ import os
 import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from typing import Literal
 
 LIVE_CONFIRMATION = "I_UNDERSTAND_REAL_MONEY"
+DISABLED_DRAWDOWN: Literal["disabled"] = "disabled"
 
 
 def _env_decimal(name: str, default: str) -> Decimal:
@@ -20,6 +22,15 @@ def _env_decimal(name: str, default: str) -> Decimal:
 
 def _env_bool(name: str, default: bool) -> bool:
     return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_drawdown_amount() -> Decimal | Literal["disabled"] | None:
+    raw = os.getenv("V3_MAX_DRAWDOWN_AMOUNT", "").strip()
+    if not raw:
+        return None
+    if raw == DISABLED_DRAWDOWN:
+        return DISABLED_DRAWDOWN
+    return _env_decimal("V3_MAX_DRAWDOWN_AMOUNT", "0")
 
 
 @dataclass(frozen=True)
@@ -38,7 +49,7 @@ class V3Settings:
     max_order_notional: Decimal = Decimal("2")
     reserve_fraction: Decimal = Decimal("0.25")
     max_daily_loss: Decimal | None = None
-    max_drawdown_amount: Decimal | None = None
+    max_drawdown_amount: Decimal | Literal["disabled"] | None = None
     max_drawdown_fraction: Decimal | None = None
 
     @classmethod
@@ -67,11 +78,7 @@ class V3Settings:
                 if os.getenv("V3_MAX_DAILY_LOSS", "").strip()
                 else None
             ),
-            max_drawdown_amount=(
-                _env_decimal("V3_MAX_DRAWDOWN_AMOUNT", "0")
-                if os.getenv("V3_MAX_DRAWDOWN_AMOUNT", "").strip()
-                else None
-            ),
+            max_drawdown_amount=_env_drawdown_amount(),
             max_drawdown_fraction=(
                 _env_decimal("V3_MAX_DRAWDOWN_FRACTION", "0")
                 if os.getenv("V3_MAX_DRAWDOWN_FRACTION", "").strip()
@@ -127,8 +134,9 @@ class V3Settings:
             errors.append("V3_MAX_DAILY_LOSS must be > 0 and <= V3_MAX_CAPITAL")
         if self.max_drawdown_amount is None:
             errors.append("V3_MAX_DRAWDOWN_AMOUNT must be explicitly set")
-        elif (
-            not self.max_drawdown_amount.is_finite()
+        elif self.max_drawdown_amount != DISABLED_DRAWDOWN and (
+            not isinstance(self.max_drawdown_amount, Decimal)
+            or not self.max_drawdown_amount.is_finite()
             or self.max_drawdown_amount <= 0
             or self.max_drawdown_amount > self.max_capital
         ):

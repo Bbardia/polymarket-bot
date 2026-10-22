@@ -8,6 +8,7 @@ from typing import Any
 
 from .ledger import EventLedger, LedgerEvent
 from .reconciliation import Reconciler, RemoteSnapshot
+from .live_redemption import proven_redemption_snapshot
 from .streaming import StreamEventProcessor
 
 ZERO = Decimal("0")
@@ -146,8 +147,11 @@ async def auto_redeem_one_managed_winner(
                 "reason": reason,
             })
 
+    from .live_runner import local_snapshot
+    local = local_snapshot(processor, baseline_cash)
+    comparison_remote = await proven_redemption_snapshot(local, remote, reconciler, api)
     candidates = managed_winning_candidates(
-        ledger, processor, baseline_cash, remote, reconciler, external_condition_ids,
+        ledger, processor, baseline_cash, comparison_remote, reconciler, external_condition_ids,
     )
     pending = pending_auto_redemption_tokens(ledger)
     if pending:
@@ -180,6 +184,19 @@ async def auto_redeem_one_managed_winner(
         if winner != candidate.token_id:
             skip(candidate, "skipped: resolved winner is a different token")
             continue
+        # Re-fetch account state and independently re-prove any display loss
+        # immediately before committing the durable submission intent. Earlier
+        # runner/candidate proof cannot authorize this later snapshot.
+        fresh_before = await api.fetch_remote_snapshot()
+        fresh_local = local_snapshot(processor, baseline_cash)
+        fresh_comparison = await proven_redemption_snapshot(
+            fresh_local, fresh_before, reconciler, api,
+        )
+        if candidate not in managed_winning_candidates(
+            ledger, processor, baseline_cash, fresh_comparison, reconciler,
+            external_condition_ids,
+        ):
+            raise ValueError("auto-redemption preflight lost exact account parity")
         # Persist before crossing the submission boundary. If submission times
         # out, this durable intent prevents a second transaction on restart.
         ledger.append(LedgerEvent.create("auto_redemption.submission_started", {

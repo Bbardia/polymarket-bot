@@ -288,6 +288,19 @@ def test_create_rejects_config_and_risk_engine_mismatch_before_client_init():
         ))
     assert not api.initialized
 
+@pytest.mark.parametrize("settings_amount,engine_amount", [
+    ("disabled", D("10")), (D("10"), "disabled"),
+])
+def test_create_rejects_drawdown_policy_mismatch_before_client_init(settings_amount, engine_amount):
+    settings = live_settings(max_drawdown_amount=settings_amount)
+    api = FakeAPI(remote_snapshot(), settings=settings)
+    with pytest.raises(ValueError, match="max_drawdown_amount"):
+        asyncio.run(LiveOrderService.create(
+            api=api, settings=settings, risk_engine=risk_engine(max_drawdown_amount=engine_amount),
+            ledger=EventLedger(":memory:"),
+        ))
+    assert not api.initialized
+
 
 def test_manual_constructor_cannot_submit_or_cancel_without_factory_gate(tmp_path):
     api = FakeAPI(remote_snapshot())

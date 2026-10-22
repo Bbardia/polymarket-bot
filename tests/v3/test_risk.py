@@ -1,4 +1,7 @@
+from dataclasses import replace
 from decimal import Decimal
+
+import pytest
 
 from src.v3.risk import AccountRiskState, OrderIntent, RiskEngine, RiskLimits
 
@@ -99,6 +102,22 @@ def test_legacy_fraction_can_only_tighten_absolute_drawdown():
     engine = RiskEngine(limits_with_fraction)
     assert not engine.evaluate(intent(), state(equity=D("225"), peak_equity=D("230"))).allowed
     assert engine.evaluate(intent(), state(equity=D("226"), peak_equity=D("230"))).allowed
+
+def test_disabled_amount_preserves_fraction_daily_and_other_guards():
+    engine = RiskEngine(replace(limits(), max_drawdown_amount="disabled"))
+    low = state(equity=D("219"), peak_equity=D("230"))
+    assert engine.evaluate(intent(), low).allowed
+    assert engine.evaluate(intent(), replace(low, daily_pnl=D("-10"))).reason == "daily loss limit reached"
+    assert engine.evaluate(intent(), replace(low, reconciled=False)).reason == "account state is not reconciled"
+    assert engine.evaluate(intent(), replace(low, open_positions=5)).reason == "maximum positions reached"
+    assert engine.evaluate(intent(), replace(low, total_exposure=D("75"))).reason.startswith("order exceeds deployable")
+    fractional = RiskEngine(replace(engine.limits, max_drawdown_fraction=D("0.04")))
+    assert fractional.evaluate(intent(), low).reason == "maximum drawdown reached"
+
+@pytest.mark.parametrize("amount", [None, D("0"), D("NaN"), "off", "DISABLED", 0])
+def test_risk_limits_reject_implicit_or_malformed_drawdown_disable(amount):
+    with pytest.raises(ValueError, match="drawdown|finite"):
+        replace(limits(), max_drawdown_amount=amount)
 
 
 def test_market_rules_default_to_unverified_and_fail_closed():

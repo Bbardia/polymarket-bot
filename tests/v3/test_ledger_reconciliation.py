@@ -139,13 +139,13 @@ def test_four_decimal_remote_display_can_truncate_exact_managed_quantity():
         positions=(RemotePosition("c1", "token-1", D("4.6666"), D("1"), D("1.1666")),),
         open_orders=(),
     )
-    assert Reconciler(cost_tolerance=D("0.01")).compare(local, remote).safe_to_trade
+    assert not Reconciler(cost_tolerance=D("0.01")).compare(local, remote).safe_to_trade
     rounded = RemoteSnapshot(
         cash=D("10"),
         positions=(RemotePosition("c1", "token-1", D("4.6667"), D("1"), D("1.1666")),),
         open_orders=(),
     )
-    assert Reconciler(cost_tolerance=D("0.01")).compare(local, rounded).safe_to_trade
+    assert not Reconciler(cost_tolerance=D("0.01")).compare(local, rounded).safe_to_trade
 
 
 def test_display_precision_does_not_mask_full_unit_drift_or_other_precision():

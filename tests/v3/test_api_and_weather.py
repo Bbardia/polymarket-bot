@@ -216,6 +216,28 @@ def test_live_client_rejects_invalid_drawdown_amount(amount):
     )
     assert "V3_MAX_DRAWDOWN_AMOUNT must be finite, > 0, and <= V3_MAX_CAPITAL" in settings.live_client_errors()
 
+def test_explicit_disabled_drawdown_environment_only_skips_amount(monkeypatch):
+    monkeypatch.setenv("V3_MAX_DRAWDOWN_AMOUNT", "disabled")
+    monkeypatch.setenv("V3_MAX_DAILY_LOSS", "10")
+    settings = V3Settings.from_env()
+    assert settings.max_drawdown_amount == "disabled"
+    assert not any("V3_MAX_DRAWDOWN_AMOUNT" in error for error in settings.live_client_errors())
+    assert settings.max_daily_loss == D("10")
+
+@pytest.mark.parametrize("raw", ["", "0", "off", "none", "false", "NaN", "Infinity", "-1"])
+def test_drawdown_not_implicitly_disabled_by_other_values(monkeypatch, raw):
+    monkeypatch.setenv("V3_MAX_DRAWDOWN_AMOUNT", raw)
+    if raw in {"off", "none", "false"}:
+        with pytest.raises(ValueError, match="V3_MAX_DRAWDOWN_AMOUNT"):
+            V3Settings.from_env()
+    else:
+        assert any("V3_MAX_DRAWDOWN_AMOUNT" in error for error in V3Settings.from_env().live_client_errors())
+
+@pytest.mark.parametrize("value", ["off", "DISABLED", 0, None])
+def test_direct_settings_do_not_accept_ambiguous_drawdown_disable(value):
+    assert any("V3_MAX_DRAWDOWN_AMOUNT" in error for error in
+               V3Settings(max_drawdown_amount=value).live_client_errors())
+
 
 def test_authenticated_snapshot_maps_pusd_positions_and_open_orders_without_actions():
     class AsyncPages:

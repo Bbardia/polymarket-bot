@@ -37,7 +37,7 @@ from polymarket.errors import (
 from polymarket.errors import TimeoutError as SDKTimeoutError
 
 from .api import UnifiedPolymarketAPI
-from .config import V3Settings, _env_bool
+from .config import DISABLED_DRAWDOWN, V3Settings, _env_bool
 from .ledger import EventLedger
 from .live_service import LiveOrderService, LiveRiskContext
 from .live_shadow import (
@@ -884,7 +884,7 @@ class LiveTradingRunner(LiveShadowRunner):
                     redeem_exit_block = "auto-redemption submission requires reconciliation"
 
         local = local_snapshot(processor, baseline_cash)
-        report = self.reconciler.compare(local, remote)
+        report = await self.reconciler.compare_with_chain(local, remote, self.api)
         exit_block = pre_redeem_block or redeem_exit_block
         if not report.safe_to_trade:
             exit_block = exit_block or "account reconciliation blocks exits"
@@ -893,7 +893,8 @@ class LiveTradingRunner(LiveShadowRunner):
         limits = self.risk.limits
         if entry_block is None and daily_pnl <= -limits.daily_loss_limit:
             entry_block = "daily loss limit reached"
-        if entry_block is None and peak - equity >= limits.max_drawdown_amount:
+        if (entry_block is None and limits.max_drawdown_amount != DISABLED_DRAWDOWN
+                and peak - equity >= limits.max_drawdown_amount):
             entry_block = "maximum drawdown reached"
         if entry_block is None and limits.max_drawdown_fraction is not None and peak > ZERO and (
             (peak - equity) / peak >= limits.max_drawdown_fraction
@@ -1019,7 +1020,7 @@ class LiveTradingRunner(LiveShadowRunner):
                 final_local = local_snapshot(
                     final_processor, Decimal(self.state["baseline_cash"]),
                 )
-                final_report = self.reconciler.compare(final_local, final_remote)
+                final_report = await self.reconciler.compare_with_chain(final_local, final_remote, self.api)
                 if final_report.invalid_snapshot:
                     raise ValueError("post-cycle account snapshot failed validation")
                 final_equity = final_remote.cash + sum(
@@ -1041,7 +1042,8 @@ class LiveTradingRunner(LiveShadowRunner):
                     entry_block = "account reconciliation blocked entries after submission"
                 if entry_block is None and final_daily_pnl <= -limits.daily_loss_limit:
                     entry_block = "daily loss limit reached after submission"
-                if entry_block is None and final_peak - final_equity >= limits.max_drawdown_amount:
+                if (entry_block is None and limits.max_drawdown_amount != DISABLED_DRAWDOWN
+                        and final_peak - final_equity >= limits.max_drawdown_amount):
                     entry_block = "maximum drawdown reached after submission"
                 if entry_block is None and limits.max_drawdown_fraction is not None and final_peak > ZERO and (
                     (final_peak - final_equity) / final_peak >= limits.max_drawdown_fraction
@@ -1204,7 +1206,7 @@ async def resolve_live_duplicate_batch(
             raise ValueError("authenticated managed maker fill differs from ledger")
     baseline_cash = Decimal(str(state["baseline_cash"]))
     before = local_snapshot(processor, baseline_cash)
-    report = policy.compare(before, remote)
+    report = await policy.compare_with_chain(before, remote, api)
     if not report.safe_to_trade or report.cash_delta != ZERO:
         raise ValueError("fresh authenticated account snapshot does not reconcile")
     assert_worker_stopped()

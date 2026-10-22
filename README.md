@@ -121,6 +121,15 @@ Every order is then capped by order notional, event exposure, total deployed
 capital, fresh-quote age, short GTD lifetime, daily loss, drawdown, open orders,
 and open positions.
 
+The live cumulative **amount** drawdown breaker requires a finite positive
+`V3_MAX_DRAWDOWN_AMOUNT` no greater than `V3_MAX_CAPITAL` by default. The explicit
+opt-in value `V3_MAX_DRAWDOWN_AMOUNT=disabled` skips only that amount threshold;
+status then reports `limits.max_drawdown_amount` as `disabled`. Missing, zero,
+nonfinite, or alternative spellings do not disable it. Any configured
+`V3_MAX_DRAWDOWN_FRACTION` still applies, as do daily loss, capital, order,
+position, market and reconciliation gates. This setting does not authorize
+live trading or change any funded profile automatically.
+
 ### Current fee math
 
 For `C` shares at price `p` in a category with fee coefficient `r`:

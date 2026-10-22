@@ -15,7 +15,7 @@ from src.v3.live_redemption import (
 )
 from src.v3.api import UnifiedPolymarketAPI
 from src.v3.reconciliation import LocalSnapshot, Reconciler, RemotePosition, RemoteSnapshot
-from src.v3.streaming import StreamEventProcessor
+from src.v3.streaming import StreamEventProcessor, remote_snapshot_sha256
 
 NOW = datetime(2026, 10, 5, 16, 38, 29, tzinfo=timezone.utc)
 TX = '0x' + 'a' * 64
@@ -187,7 +187,7 @@ def test_quantity_display_precision_is_narrow_and_cash_remains_strict():
     remote = RemoteSnapshot(D('98.344471'),
         (RemotePosition('cond', 'tok', D('5.1735'), D('2'), D('1.6555')),), ())
     reconciler = Reconciler(cost_tolerance=D('0.01'))
-    assert reconciler.compare(local, remote).safe_to_trade
+    assert not reconciler.compare(local, remote).safe_to_trade
     for changed in (
         replace(remote, cash=D('98.33')),
         replace(remote, positions=(replace(remote.positions[0], size=D('5.1736')),)),
@@ -288,3 +288,43 @@ def test_automatic_redemption_ignores_held_remote_token_without_activity_read():
         (RemotePosition('cond', 'tok', D('5.26'), D('5.26'), D('2.63')),), ())
     assert asyncio.run(auto_redeem(ledger, api, remote)) == ()
     assert not any(e.event_type == 'position.redeemed' for e in ledger.events())
+
+
+@pytest.mark.parametrize('chain', ['exact', 'wrong', 'provider', 'wrong_chain'])
+def test_verified_redemption_with_other_rounded_holding_requires_chain_proof(chain):
+    ledger = ledger_with_fill()
+    ledger.append(LedgerEvent.create('order.accepted', {
+        'client_order_id': 'c2', 'order_id': 'o2', 'status': 'live',
+        'condition_id': 'cond-2', 'token_id': '12345', 'side': 'BUY',
+        'price': '0.5', 'requested_size': '5.173528', 'post_only': True,
+    }))
+    ledger.append(LedgerEvent.create('user.trade', {
+        'id': 't2', 'taker_order_id': 'o2', 'market': 'cond-2',
+        'asset_id': '12345', 'side': 'BUY', 'size': '5.173528',
+        'price': '0.5', 'status': 'CONFIRMED', 'owner': 'wallet',
+        'fee_rate_bps': '0', 'timestamp': NOW.isoformat(),
+    }))
+    remote = RemoteSnapshot(D('100.043236'), (
+        RemotePosition('cond-2', '12345', D('5.173'), D('5.173'), D('2.586764')),
+    ), ())
+    api, _ = fake_api()
+    calls = []
+    async def balances(wallet, tokens):
+        calls.append((wallet, tokens))
+        if chain == 'provider':
+            raise TimeoutError('RPC timeout')
+        if chain == 'wrong_chain':
+            raise ValueError('CTF RPC wrong chain')
+        return {'12345': D('5.173528' if chain == 'exact' else '5.173527')}
+    api.fetch_ctf_balances = balances
+    before = tuple(ledger.events())
+    if chain == 'exact':
+        assert len(asyncio.run(auto_redeem(ledger, api, remote))) == 1
+        recorded = [event for event in ledger.events() if event.event_type == 'position.redeemed']
+        assert recorded[0].payload['account_snapshot_sha256'] == remote_snapshot_sha256(remote)
+        assert recorded[0].payload['quantity'] == '5.26'
+    else:
+        with pytest.raises(ValueError, match='reconciliation'):
+            asyncio.run(auto_redeem(ledger, api, remote))
+        assert tuple(ledger.events()) == before
+    assert calls == [(api.settings.wallet_address, ('12345',))]

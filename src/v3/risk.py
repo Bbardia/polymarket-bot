@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
+from typing import Literal
 
+from .config import DISABLED_DRAWDOWN
 from .math import is_tick_aligned
 
 ZERO = Decimal("0")
@@ -22,13 +24,13 @@ class RiskLimits:
     daily_loss_limit: Decimal
     max_quote_age_seconds: int
     max_order_ttl_seconds: int
-    max_drawdown_amount: Decimal = ZERO
+    max_drawdown_amount: Decimal | Literal["disabled"] = ZERO
     max_drawdown_fraction: Decimal | None = None
 
     def __post_init__(self) -> None:
         numeric = (
             self.max_capital, self.reserve_fraction, self.max_order_notional,
-            self.max_event_exposure, self.daily_loss_limit, self.max_drawdown_amount,
+            self.max_event_exposure, self.daily_loss_limit,
         )
         if any(not value.is_finite() for value in numeric):
             raise ValueError("risk limits must be finite")
@@ -36,8 +38,12 @@ class RiskLimits:
             raise ValueError("capital and order limits must be positive")
         if self.max_event_exposure <= ZERO or self.daily_loss_limit <= ZERO:
             raise ValueError("event exposure and daily loss limits must be positive")
-        if self.max_drawdown_amount <= ZERO:
-            raise ValueError("maximum drawdown amount must be positive")
+        if self.max_drawdown_amount != DISABLED_DRAWDOWN and (
+            not isinstance(self.max_drawdown_amount, Decimal)
+            or not self.max_drawdown_amount.is_finite()
+            or self.max_drawdown_amount <= ZERO
+        ):
+            raise ValueError("maximum drawdown amount must be finite and positive or explicitly disabled")
         if self.max_drawdown_fraction is not None and (
             not self.max_drawdown_fraction.is_finite()
             or not (ZERO < self.max_drawdown_fraction < ONE)
@@ -192,7 +198,8 @@ class RiskEngine:
             return reject("daily loss limit reached")
         if state.peak_equity > ZERO:
             drawdown_amount = state.peak_equity - state.equity
-            if drawdown_amount >= self.limits.max_drawdown_amount:
+            if (self.limits.max_drawdown_amount != DISABLED_DRAWDOWN
+                    and drawdown_amount >= self.limits.max_drawdown_amount):
                 return reject("maximum drawdown reached")
             if self.limits.max_drawdown_fraction is not None and (
                 drawdown_amount / state.peak_equity >= self.limits.max_drawdown_fraction
