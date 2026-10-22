@@ -500,7 +500,28 @@ def _validated_duplicate_replay_resolution(
         replay_local = local_snapshot(replay_processor, baseline_cash)
         if _local_snapshot_sha256(replay_local) != local_digest:
             return frozenset()
-        replay_report = expected_reconciler.compare(replay_local, RemoteSnapshot(cash, tuple(positions), ()))
+        # The immutable resolution was recorded under the then-current
+        # four-decimal positions-feed display policy. Revalidate that historical
+        # evidence with precisely that policy; this comparison never authorizes
+        # a current order (live preflight requires fresh exact chain inventory).
+        from .reconciliation import _display_compatible
+        replay_quantities = replay_local.position_quantities or {}
+        historical_positions = []
+        for position in positions:
+            quantity = replay_quantities.get(position.token_id)
+            if quantity is not None and quantity != position.size and (
+                position.size.as_tuple().exponent == -4
+                and _display_compatible(quantity, position.size)
+            ):
+                historical_positions.append(RemotePosition(
+                    position.condition_id, position.token_id, quantity,
+                    position.current_value, position.initial_value, position.redeemable,
+                ))
+            else:
+                historical_positions.append(position)
+        replay_report = expected_reconciler.compare(
+            replay_local, RemoteSnapshot(cash, tuple(historical_positions), ()),
+        )
         if not replay_report.safe_to_trade or replay_report.cash_delta != ZERO:
             return frozenset()
     except (ArithmeticError, KeyError, OSError, TypeError, ValueError):

@@ -1597,8 +1597,63 @@ def test_real_live_service_processes_every_candidate_but_honors_open_order_cap(
     assert status["reconciliation"]["safe_to_trade"] is True
     assert status["limits"]["max_open_orders"] == 2
 
+@pytest.mark.parametrize("amount,expected_orders", [("disabled", 1), (D("10"), 0)])
+def test_real_runner_restarts_with_explicit_amount_policy(tmp_path, monkeypatch, amount, expected_orders):
+    from src.v3.live_runner import _start
+    from src.v3 import live_runner
 
-def test_real_service_refreshes_daily_loss_before_each_candidate_submission(tmp_path, monkeypatch):
+    settings = V3Settings(
+        live_enabled=True, paper_trading=False, live_confirmation="I_UNDERSTAND_REAL_MONEY",
+        private_key="0x" + "1" * 64, wallet_address="0x" + "2" * 40,
+        max_daily_loss=D("10"), max_drawdown_amount=amount,
+    )
+    api = _SdkAPI(settings, RemoteSnapshot(D("100"), (), ()))
+    monkeypatch.setattr(live_runner, "UnifiedPolymarketAPI", lambda settings: api)
+    runner_settings = LiveRunnerSettings(shadow=LiveShadowSettings(data_dir=tmp_path / "live"))
+    store, _, _, _, _ = asyncio.run(_start(settings, runner_settings))
+    saved = json.loads(store.state_path.read_text())
+    saved["peak_equity"] = "111"
+    store.save_state(saved)
+    # Recreate the full service from durable state, not just an in-memory runner.
+    store, _, ledger, reconciler, service = asyncio.run(_start(settings, runner_settings))
+    runner, _ = _runner_with(tmp_path, monkeypatch, store, ledger, reconciler, service, api,
+                             settings, runner_settings)
+    status = asyncio.run(runner.run_cycle())
+    assert len(api.created) == expected_orders, status
+    assert status["limits"]["max_drawdown_amount"] == amount
+    assert status["drawdown"] == D("11")
+    assert status["entry_block_reason"] == (None if expected_orders else "maximum drawdown reached")
+
+def test_real_runner_disabled_amount_still_checks_post_submission_fraction_and_daily_loss(
+    tmp_path, monkeypatch,
+):
+    from src.v3.live_runner import _start
+    from src.v3 import live_runner
+
+    settings = V3Settings(
+        live_enabled=True, paper_trading=False, live_confirmation="I_UNDERSTAND_REAL_MONEY",
+        private_key="0x" + "1" * 64, wallet_address="0x" + "2" * 40,
+        max_daily_loss=D("10"), max_drawdown_amount="disabled",
+        max_drawdown_fraction=D("0.04"),
+    )
+    candidates = tuple(_evaluation(event_key=f"city-{i}:2026-10-04", condition=f"condition-{i}")
+                       for i in range(3))
+    external = RemotePosition("external-condition", "external-token", D("50"), D("10"), D("10"), True)
+    api = _SdkAPI(settings, RemoteSnapshot(D("90"), (external,), ()))
+    api.external_values_after_post = [D("5")]
+    monkeypatch.setattr(live_runner, "UnifiedPolymarketAPI", lambda settings: api)
+    runner_settings = LiveRunnerSettings(shadow=LiveShadowSettings(data_dir=tmp_path / "live"))
+    store, _, ledger, reconciler, service = asyncio.run(_start(settings, runner_settings))
+    runner, _ = _runner_with(tmp_path, monkeypatch, store, ledger, reconciler, service, api,
+                             settings, runner_settings, evaluations=candidates)
+    status = asyncio.run(runner.run_cycle())
+    assert len(api.created) == 1, status
+    assert status["entry_block_reason"] == "maximum drawdown reached after submission"
+    assert status["daily_pnl"] == D("-5")
+
+
+@pytest.mark.parametrize("amount", [D("100"), "disabled"])
+def test_real_service_refreshes_daily_loss_before_each_candidate_submission(tmp_path, monkeypatch, amount):
     from src.v3.live_runner import _start
     from src.v3 import live_runner
 
@@ -1610,7 +1665,7 @@ def test_real_service_refreshes_daily_loss_before_each_candidate_submission(tmp_
         live_enabled=True, paper_trading=False, live_confirmation="I_UNDERSTAND_REAL_MONEY",
         private_key="0x" + "1" * 64, wallet_address="0x" + "2" * 40,
         max_capital=D("100"), max_order_notional=D("2"), reserve_fraction=D("0.25"),
-        max_daily_loss=D("10"), max_drawdown_amount=D("100"),
+        max_daily_loss=D("10"), max_drawdown_amount=amount,
     )
     baseline_position = RemotePosition(
         "external-condition", "external-token", D("50"), D("10"), D("10"), True,

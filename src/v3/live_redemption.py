@@ -6,19 +6,37 @@ before any audit event is appended. Offline callers may supply the same evidence
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 import re
 from typing import Any, Iterable
 
 from .ledger import EventLedger, LedgerEvent
-from .reconciliation import Reconciler, RemoteSnapshot
+from .reconciliation import LocalSnapshot, Reconciler, RemoteSnapshot
 from .streaming import StreamEventProcessor, remote_snapshot_sha256
 
 ZERO = Decimal('0')
 _HASH = re.compile(r'0x[0-9a-fA-F]{64}\Z')
 _DIGEST = re.compile(r'[0-9a-f]{64}\Z')
+
+
+async def proven_redemption_snapshot(
+    local: LocalSnapshot, remote: RemoteSnapshot, reconciler: Reconciler, api: Any,
+) -> RemoteSnapshot:
+    """Return a comparison-only snapshot after fresh exact CTF proof.
+
+    The original feed snapshot must still be used for the audit digest. A
+    failed proof leaves the strict feed sizes untouched, never a tolerance.
+    """
+    report = await reconciler.compare_with_chain(local, remote, api)
+    if not report.safe_to_trade or local.position_quantities is None:
+        return remote
+    return replace(remote, positions=tuple(
+        replace(position, size=local.position_quantities[position.token_id])
+        if position.token_id in local.position_quantities else position
+        for position in remote.positions
+    ))
 
 
 @dataclass(frozen=True)
@@ -141,6 +159,18 @@ def record_verified_redemptions(
     remote: RemoteSnapshot, evidence: Iterable[RedemptionEvidence], *,
     reconciler: Reconciler | None = None,
 ) -> tuple[str, ...]:
+    """Record offline evidence only with strict, unmodified feed parity."""
+    return _record_verified_redemptions(
+        ledger, processor, baseline_cash, remote, evidence,
+        reconciler=reconciler, comparison_remote=remote,
+    )
+
+
+def _record_verified_redemptions(
+    ledger: EventLedger, processor: StreamEventProcessor, baseline_cash: Decimal,
+    remote: RemoteSnapshot, evidence: Iterable[RedemptionEvidence], *,
+    reconciler: Reconciler | None, comparison_remote: RemoteSnapshot,
+) -> tuple[str, ...]:
     """Atomic audit append after exact full-account parity.
 
     Caller must independently check that each wallet activity is for the account
@@ -171,7 +201,7 @@ def record_verified_redemptions(
             for key, value in r.payload(recorded[r.token_id]['account_snapshot_sha256']).items()
         ) for r in rows):
             comparator = reconciler or Reconciler(cash_tolerance=ZERO)
-            report = comparator.compare(current, remote)
+            report = comparator.compare(current, comparison_remote)
             if not report.safe_to_trade or report.cash_delta != ZERO:
                 raise ValueError('idempotent redemption retry has lost account parity')
             return ()
@@ -200,7 +230,7 @@ def record_verified_redemptions(
         position_quantities=quantities, position_cost_basis=costs,
     )
     comparator = reconciler or Reconciler(cash_tolerance=ZERO)
-    report = comparator.compare(candidate, remote)
+    report = comparator.compare(candidate, comparison_remote)
     if not report.safe_to_trade or report.cash_delta != ZERO:
         raise ValueError('full account cash, positions, or orders fail reconciliation')
     digest = remote_snapshot_sha256(remote)
@@ -300,6 +330,20 @@ async def recognize_remote_redemptions(
             redeemed_at=row.timestamp.astimezone(timezone.utc),
             activity_type='REDEEM', winning_token_id=winner,
         ))
-    return record_verified_redemptions(
+    # Receipt and payout prove the redeemed token; exact CTF proof is required
+    # independently for every *remaining* managed token whose feed size rounds.
+    quantities = dict(current.position_quantities)
+    costs = dict(current.position_cost_basis or {})
+    for row in evidence:
+        quantities.pop(row.token_id)
+        costs.pop(row.token_id)
+    candidate = LocalSnapshot(
+        cash=current.cash + sum((row.payout for row in evidence), ZERO),
+        position_tokens=frozenset(quantities), order_ids=current.order_ids,
+        position_quantities=quantities, position_cost_basis=costs,
+    )
+    comparison_remote = await proven_redemption_snapshot(candidate, remote, reconciler, api)
+    return _record_verified_redemptions(
         ledger, processor, baseline_cash, remote, evidence, reconciler=reconciler,
+        comparison_remote=comparison_remote,
     )

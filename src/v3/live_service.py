@@ -14,7 +14,7 @@ from .config import V3Settings
 from .execution import ExecutionResult, V3OrderExecutor
 from .ledger import EventLedger, LedgerEvent
 from .live_early_exit import book_quote_age_seconds
-from .reconciliation import LocalSnapshot, Reconciler, RemoteSnapshot, _quantity_matches
+from .reconciliation import LocalSnapshot, Reconciler, RemoteSnapshot
 from .risk import AccountRiskState, OrderIntent, RiskEngine
 from .streaming import StreamEventProcessor
 from .sdk_execution_adapter import SDKExecutionAdapter
@@ -424,7 +424,6 @@ class LiveOrderService:
                 or not isinstance(intent.shares, Decimal) or not intent.shares.is_finite()
                 or intent.shares <= ZERO or intent.shares > min(matches[0].size, quantity)
                 or len(matches) != 1 or matches[0].condition_id != intent.condition_id
-                or not _quantity_matches(quantity, matches[0].size)
                 or managed_conditions != {intent.condition_id}
                 or intent.condition_id in self._reconciler.external_condition_ids
                 or active_order_for_token
@@ -440,7 +439,7 @@ class LiveOrderService:
         local_snapshot = replace(
             local_snapshot, order_ids=processor.active_order_ids,
         )
-        report = self._reconciler.compare(local_snapshot, remote)
+        report = await self._reconciler.compare_with_chain(local_snapshot, remote, self._api)
         if not report.safe_to_trade:
             self._ledger.append(LedgerEvent.create("account.preflight.blocked", {
                 "cash_delta": str(report.cash_delta),

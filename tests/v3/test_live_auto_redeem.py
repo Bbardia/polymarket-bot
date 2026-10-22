@@ -69,6 +69,9 @@ class FakeAPI:
         )
         self.client = FakeAccount()
         self.after = after
+        self.before = _remote()
+        self.snapshot_calls = 0
+        self.balance: dict[str, Decimal] | Exception | None = None
 
     def _authenticated_client(self):
         return self.client
@@ -80,7 +83,13 @@ class FakeAPI:
         return "managed"
 
     async def fetch_remote_snapshot(self):
-        return self.after
+        self.snapshot_calls += 1
+        return self.before if self.snapshot_calls == 1 else self.after
+
+    async def fetch_ctf_balances(self, wallet, tokens) -> dict[str, Decimal] | None:
+        if isinstance(self.balance, Exception):
+            raise self.balance
+        return self.balance
 
     async def fetch_redemption_activity(self, **kwargs):
         return (NS(
@@ -358,3 +367,60 @@ def test_per_candidate_lookup_error_is_a_skip_not_an_exception(lookup):
     skipped = _run_with(api)
     assert len(skipped) == 1 and skipped[0]["token_id"] == "managed"
     assert skipped[0]["reason"].startswith("skipped: ") and "RuntimeError" in skipped[0]["reason"]
+
+
+@pytest.mark.parametrize("failure", [None, "wrong", "provider", "preflight", "preflight_provider"])
+def test_rounded_candidate_requires_fresh_exact_proof_before_intent(failure, monkeypatch):
+    ledger = _ledger(quantity="5.173528")
+    rounded = _remote(value="5.173", quantity="5.173", cash="97.413236")
+    rounded = RemoteSnapshot(rounded.cash, (
+        RemotePosition("weather-1", "managed", D("5.173"), D("5.173"), D("2.586764"), True),
+    ), ())
+    after = _remote(quantity=None, cash="102.586764")
+    api = FakeAPI(after)
+    api.before = rounded
+    api.balance = {"managed": D("5.173528")}
+    if failure == "wrong":
+        api.balance = {"managed": D("5.173527")}
+    if failure == "provider":
+        api.balance = RuntimeError("RPC unavailable")
+    if failure in {"preflight", "preflight_provider"}:
+        reads = 0
+        async def changing_balance(wallet, tokens):
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                if failure == "preflight_provider":
+                    raise RuntimeError("RPC unavailable")
+                return {"managed": D("5.173527")}
+            return {"managed": D("5.173528")}
+        api.fetch_ctf_balances = changing_balance
+    monkeypatch.setattr("src.v3.live_redemption_chain.verify_ctf_redemption_transaction", AsyncMock())
+    if failure is None:
+        # Recognition is separately tested with real evidence and exact parity.
+        async def recognize(*args, **kwargs):
+            return ("recorded",)
+        monkeypatch.setattr("src.v3.live_redemption.recognize_remote_redemptions", recognize)
+        result = asyncio.run(auto_redeem_one_managed_winner(
+            ledger=ledger, processor=_processor(ledger), baseline_cash=D("100"),
+            remote=rounded, api=api, reconciler=Reconciler(),
+            external_condition_ids=frozenset(), baseline_epoch=0, now=NOW,
+        ))
+        assert result[1] == ("recorded",)
+        assert len(api.client.calls) == 1 and api.snapshot_calls == 2
+    else:
+        if failure in {"preflight", "preflight_provider"}:
+            with pytest.raises(ValueError, match="preflight"):
+                asyncio.run(auto_redeem_one_managed_winner(
+                    ledger=ledger, processor=_processor(ledger), baseline_cash=D("100"),
+                    remote=rounded, api=api, reconciler=Reconciler(),
+                    external_condition_ids=frozenset(), baseline_epoch=0, now=NOW,
+                ))
+        else:
+            asyncio.run(auto_redeem_one_managed_winner(
+                ledger=ledger, processor=_processor(ledger), baseline_cash=D("100"),
+                remote=rounded, api=api, reconciler=Reconciler(),
+                external_condition_ids=frozenset(), baseline_epoch=0, now=NOW,
+            ))
+        assert api.client.calls == []
+        assert not any(e.event_type.startswith("auto_redemption.") for e in ledger.events())

@@ -107,6 +107,13 @@ class UnifiedPolymarketAPI:
         self._secure_client_factory = secure_client_factory or AsyncSecureClient.create
         self._secure_client: Any | None = None
 
+    async def fetch_ctf_balances(self, wallet: str, tokens: tuple[str, ...]) -> dict[str, Decimal]:
+        """Read-only independent Polygon RPC proof; no cached wallet inventory."""
+        from .ctf_balance import read_ctf_balances
+        if wallet != self.settings.wallet_address:
+            raise ValueError("CTF balance wallet differs from configured account")
+        return await read_ctf_balances(wallet, tokens)
+
     @property
     def sdk_version(self) -> str:
         return polymarket.__version__

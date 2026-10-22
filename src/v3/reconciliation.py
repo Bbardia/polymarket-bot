@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 import re
-from typing import Iterable
+from typing import Any, Iterable
 
 ZERO = Decimal("0")
 TRADE_STATUSES = frozenset({"MATCHED", "MATCHED_NOT_BROADCASTED", "MINED", "CONFIRMED", "RETRYING", "FAILED"})
@@ -114,23 +114,22 @@ def _validate_trade_economics(price: Decimal, size: Decimal, fee: Decimal | None
         raise ValueError("trade fee must be finite and nonnegative")
 
 
-def _quantity_matches(local: Decimal, remote: Decimal) -> bool:
-    """Match exact inventory or an observed four-decimal API display.
+def _display_compatible(local: Decimal, remote: Decimal) -> bool:
+    """Only identify a possible four/three-decimal display loss; never prove parity."""
+    if not local.is_finite() or not remote.is_finite() or local <= ZERO:
+        return False
+    for places in (3, 4):
+        quantum = Decimal(1).scaleb(-places)
+        if (remote.as_tuple().exponent == -places
+                and local.as_tuple().exponent < -places
+                and remote in (local.quantize(quantum), local.quantize(quantum, rounding=ROUND_DOWN))):
+            return True
+    return False
 
-    The positions API can truncate a higher-precision holding (4.666664 to
-    4.6666), while other rows round to nearest. These are display-compatible
-    values, NOT proof of exact ERC-1155 balance; independently check exact chain
-    inventory before activating live trading. Never widen the comparison by a
-    full display unit or accept a different reported precision.
-    """
-    quantum = Decimal('0.0001')
-    return local == remote or (
-        remote.as_tuple().exponent == -4
-        and isinstance(local.as_tuple().exponent, int)
-        and local.as_tuple().exponent < -4
-        and local > ZERO
-        and remote in (local.quantize(quantum), local.quantize(quantum, rounding=ROUND_DOWN))
-    )
+
+def _quantity_matches(local: Decimal, remote: Decimal) -> bool:
+    """Unproven API display is not a substitute for an exact wallet balance."""
+    return local == remote
 
 
 @dataclass(frozen=True)
@@ -235,6 +234,50 @@ class Reconciler:
         # Opt-in: unexplained cash *increases* (maker rebates, rewards, deposits)
         # do not block; any unexplained decrease beyond tolerance still does.
         self.allow_cash_inflows = allow_cash_inflows
+
+    async def compare_with_chain(self, local: LocalSnapshot, remote: RemoteSnapshot,
+                                 api: Any) -> ReconciliationReport:
+        """Require a fresh exact CTF read for every managed holding on display loss.
+
+        A failed read, malformed token or wallet, missing row, or any chain drift
+        leaves the ordinary strict comparison in force. Proof is never cached.
+        """
+        strict = self.compare(local, remote)
+        quantities = local.position_quantities if isinstance(local, LocalSnapshot) else None
+        if (not isinstance(quantities, dict) or not isinstance(remote, RemoteSnapshot)
+                or not isinstance(remote.positions, tuple)):
+            return strict
+        by_token = {p.token_id: p for p in remote.positions if isinstance(p, RemotePosition)}
+        try:
+            needs_proof = any(
+                token in by_token and isinstance(quantity, Decimal)
+                and isinstance(by_token[token].size, Decimal)
+                and quantity != by_token[token].size
+                and _display_compatible(quantity, by_token[token].size)
+                for token, quantity in quantities.items()
+            )
+            if not needs_proof:
+                return strict
+            if (not local.position_tokens or set(quantities) != local.position_tokens
+                    or not all(token in by_token for token in quantities)
+                    or any(quantity != by_token[token].size
+                           and not _display_compatible(quantity, by_token[token].size)
+                           for token, quantity in quantities.items())):
+                return strict
+            wallet = api.settings.wallet_address
+            balances = await api.fetch_ctf_balances(wallet, tuple(sorted(quantities)))
+            if (not isinstance(balances, dict) or set(balances) != set(quantities)
+                    or any(not isinstance(quantity, Decimal) or not quantity.is_finite()
+                           or quantity <= ZERO or balances[token] != quantity
+                           for token, quantity in quantities.items())):
+                return strict
+            proven = replace(remote, positions=tuple(
+                replace(p, size=quantities[p.token_id]) if p.token_id in quantities else p
+                for p in remote.positions
+            ))
+            return self.compare(local, proven)
+        except Exception:
+            return strict
 
     def compare(self, local: LocalSnapshot, remote: RemoteSnapshot) -> ReconciliationReport:
         valid_local = (
