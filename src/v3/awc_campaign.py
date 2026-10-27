@@ -18,6 +18,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -27,10 +28,11 @@ from zoneinfo import ZoneInfo
 
 from .awc_metar_observation import inspect_awc_source, parse_raw_observations
 
-MAX_CYCLES = 180  # 4/day for 45 days, independent hard disk bound
+MAX_CYCLES = 180  # independent hard disk bound; no recurrence is installed
 MAX_RESOLVED_DAYS = 30
 MAX_DAYS = 45
-LIMITS = {'gamma': 1_000_000, 'forecast': 300_000, 'book': 512_000, 'awc': 256_000}
+LIMITS = {'gamma': 1_000_000, 'forecast': 300_000, 'book': 512_000, 'awc': 256_000,
+          'tokens': 128_000, 'resolution': 128_000}
 APPROVED_OUTPUT_ROOT = Path(__file__).absolute().parents[2] / 'data' / 'awc-campaign'
 REQUEST_WALL_SECONDS = 12
 CYCLE_WALL_SECONDS = 60
@@ -229,6 +231,84 @@ def validate_event(config: Config, event: dict) -> dict:
     return {'market': market, 'token_id': tokens[0]}
 
 
+
+def discover_daily_manifest(event: dict, target_date: str, start_at: str,
+                            *, pinned: Config | None = None) -> Config:
+    """Discover the unique lower-tail rung; pin every identity before collection.
+
+    The first raw Gamma response may supply a candidate, not an operator-reviewed
+    30-day schedule. Subsequent reads must match the exact immutable candidate.
+    """
+    day = date.fromisoformat(target_date)
+    if day.isoformat() != target_date:
+        raise ValueError('invalid day')
+    slug = f'highest-temperature-in-karachi-on-{day.strftime("%B").lower()}-{day.day}-{day.year}'
+    if not isinstance(event, dict) or event.get('slug') != slug or event.get('eventDate') != target_date:
+        raise ValueError('daily event identity mismatch')
+    markets = event.get('markets')
+    if not isinstance(markets, list) or not 1 <= len(markets) <= 32 or any(not isinstance(m, dict) for m in markets):
+        raise ValueError('invalid daily markets')
+    ids = [str(m.get('id')) for m in markets]
+    if len(set(ids)) != len(ids) or any(not _ID.fullmatch(v) for v in ids):
+        raise ValueError('ambiguous daily market IDs')
+    question = re.compile(r'Will the highest temperature in Karachi be -?\d+°C or below on ' +
+                          re.escape(day.strftime('%B')) + r' ' + str(day.day) + r'\?')
+    rungs = [m for m in markets if isinstance(m.get('question'), str) and question.fullmatch(m['question'])]
+    if len(rungs) != 1:
+        raise ValueError('ambiguous daily lower-tail rung')
+    if not isinstance(event.get('description'), str):
+        raise ValueError('missing daily rule')
+    config = Config(slug=slug, event_id=str(event.get('id')), target_date=target_date,
+                    station='OPKC', zone='Asia/Karachi', latitude=24.9065, longitude=67.1608,
+                    market_id=str(rungs[0]['id']), start_at=start_at,
+                    rule_sha256=hashlib.sha256(event['description'].encode()).hexdigest())
+    validate_event(config, event)
+    if pinned is not None and config != pinned:
+        raise ValueError('daily manifest pin drift')
+    return config
+
+
+def crosscheck_resolution(config: Config, market: dict, gamma_label: dict,
+                          tokens: dict, resolution: dict) -> dict:
+    """Data API on-chain token payout and exact resolved condition must agree."""
+    failure = {'status': 'unverified', 'reason': 'Data API finality/identity mismatch'}
+    if gamma_label.get('status') != 'official_gamma_binary':
+        return failure
+    try:
+        expected = _array(market['clobTokenIds'])
+        rows = tokens['data']
+        settlements = resolution['data']
+        if (not isinstance(rows, list) or len(rows) != 2 or
+                not isinstance(settlements, list) or len(settlements) != 1 or
+                not isinstance(settlements[0], dict) or
+                settlements[0].get('condition_id') != market['conditionId'] or
+                settlements[0].get('status') != 'resolved'):
+            return failure
+        prices = []
+        for index, row in enumerate(rows):
+            if (not isinstance(row, dict) or row.get('token_id') != expected[index] or
+                    row.get('opposite_token_id') != expected[1-index] or
+                    row.get('condition_id') != market['conditionId'] or
+                    str(row.get('event_id')) != config.event_id or
+                    row.get('event_slug') != config.slug or row.get('module') != 'v1_ctf' or
+                    row.get('outcome_index') != index or row.get('outcome') != ('Yes', 'No')[index] or
+                    row.get('resolved') is not True or row.get('closed') is not True):
+                return failure
+            price = row.get('final_price')
+            if isinstance(price, bool) or not isinstance(price, (str, int, float)):
+                return failure
+            parsed = Decimal(str(price))
+            if parsed not in (Decimal(0), Decimal(1)):
+                return failure
+            prices.append(parsed)
+        if prices != ([Decimal(1), Decimal(0)] if gamma_label['winner'] == 'Yes'
+                      else [Decimal(0), Decimal(1)]):
+            return failure
+    except (KeyError, TypeError, ValueError, InvalidOperation):
+        return failure
+    return {'status': 'independent_final_binary', 'winner': gamma_label['winner'],
+            'basis': 'Gamma payout + Data API exact token final prices and resolved condition'}
+
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         raise ValueError('redirect refused')
@@ -239,7 +319,8 @@ def public_fetch(url: str, limit: int) -> tuple[bytes, dict]:
     from urllib.parse import urlsplit
     parts = urlsplit(url)
     if (parts.scheme != 'https' or parts.hostname not in
-            {'gamma-api.polymarket.com', 'clob.polymarket.com', 'aviationweather.gov', 'api.open-meteo.com'}
+            {'gamma-api.polymarket.com', 'clob.polymarket.com', 'data-api.polymarket.com',
+             'aviationweather.gov', 'api.open-meteo.com'}
             or parts.username or parts.password or parts.port or parts.fragment):
         raise ValueError('non-public endpoint')
     # Never inherit proxy configuration (which can contain credentials).
@@ -314,9 +395,9 @@ def _records(directory: Path) -> list[tuple[dict, str]]:
 
 def report(directory: Path) -> dict:
     rows = [row for row, _ in _records(directory)]
-    resolved = {(row['event_id'], row['target_date']) for row in rows if row.get('label', {}).get('status') == 'official_gamma_binary'}
+    resolved = {row['target_date'] for row in rows if row.get('label', {}).get('status') == 'independent_final_binary'}
     return {'cycles': len(rows), 'resolved_event_days': len(resolved), 'last_at': rows[-1]['captured_at'] if rows else None,
-            'pending_labels': sum(row.get('label', {}).get('status') != 'official_gamma_binary' for row in rows),
+            'pending_labels': sum(row.get('label', {}).get('status') != 'independent_final_binary' for row in rows),
             'stop_at_resolved_days': MAX_RESOLVED_DAYS, 'stop_after_calendar_days': MAX_DAYS,
             'paper_only': True, 'live_eligible': False}
 
@@ -361,7 +442,7 @@ class Campaign:
         with _wall_bound(CYCLE_WALL_SECONDS, ValueError('cycle wall budget exhausted')):
             return self._once()
 
-    def _once(self) -> dict:
+    def _once(self, *, gamma_response=None) -> dict:
         now = self.clock().astimezone(timezone.utc)
         rows = _records(self.directory)
         if rows and any(r.get('campaign_start_at') != self.config.start_at or
@@ -380,7 +461,8 @@ class Campaign:
         def get(kind, url):
             start = self.clock().astimezone(timezone.utc).isoformat()
             try:
-                body, headers = self.fetch(url, LIMITS[kind])
+                body, headers = (gamma_response if kind == 'gamma' and gamma_response is not None
+                                 else self.fetch(url, LIMITS[kind]))
             except TimeoutError:
                 if kind != 'awc':
                     raise
@@ -436,15 +518,41 @@ class Campaign:
                    'report_times': [o.observed_at.isoformat() for o in observations],
                    'correction_cutoff_proven': False, 'wu_fallback_proven': False}
         status = 'captured_partial' if awc_reason else 'captured'
+        gamma_label = _label(market, event=event, target_date=self.config.target_date,
+                             fetched_at=captures['gamma']['first_available_at'])
+        label = {'status': 'unverified', 'reason': 'AWC unavailable: ' + awc_reason} if awc_reason else {
+            'status': 'unverified', 'reason': 'independent finality unavailable'}
+        if not awc_reason and gamma_label['status'] == 'official_gamma_binary':
+            tokens = _array(market['clobTokenIds'])
+            checks = (
+                ('tokens', 'https://data-api.polymarket.com/v2/tokens?' +
+                 urlencode({'token_id': ','.join(tokens)})),
+                ('resolution', 'https://data-api.polymarket.com/v2/resolutions?' +
+                 urlencode({'condition': market['conditionId']})),
+            )
+            documents = {}
+            for kind, url in checks:
+                try:
+                    raw = get(kind, url)
+                    if raw is None:
+                        raise ValueError('missing Data API body')
+                    documents[kind] = json.loads(raw)
+                except (TimeoutError, ValueError, TypeError) as exc:
+                    failure_code = 'timeout' if isinstance(exc, TimeoutError) else 'invalid_or_unavailable'
+                    captures.setdefault(kind, {'url': url, 'request_at': self.clock().astimezone(timezone.utc).isoformat(),
+                                               'status': 'unavailable'})['failure_code'] = failure_code
+                    label = {'status': 'unverified', 'reason': 'Data API ' + kind + ' unavailable'}
+                    break
+            else:
+                label = crosscheck_resolution(self.config, market, gamma_label,
+                                              documents['tokens'], documents['resolution'])
         record = {'sequence': len(rows), 'previous_sha256': rows[-1][1] if rows else None,
                   'status': status, 'paper_only': True, 'live_eligible': False,
                   'event_id': self.config.event_id, 'market_id': self.config.market_id,
                   'target_date': self.config.target_date, 'station': self.config.station, 'zone': self.config.zone,
                   'campaign_start_at': self.config.start_at, 'rule_sha256': self.config.rule_sha256,
                   'captured_at': now.isoformat(), 'captures': captures, 'observation': obs,
-                  'label': {'status': 'unverified', 'reason': 'AWC unavailable: ' + awc_reason} if awc_reason else
-                           _label(market, event=event, target_date=self.config.target_date,
-                                  fetched_at=captures['gamma']['first_available_at'])}
+                  'gamma_label': gamma_label, 'label': label}
         # Publish only a complete, fsynced row; a signal during creation must
         # never leave a numbered entry that blocks the sequence permanently.
         body = _canonical(record)
@@ -483,15 +591,73 @@ class Campaign:
         return {'status': status, 'sequence': record['sequence'], 'label': record['label']['status'], 'paper_only': True}
 
 
+class DailyCampaign:
+    """Manual daily discovery; reuse its Gamma read within the six-GET cycle."""
+    def __init__(self, directory: Path, target_date: str, start_at: str, *, fetch=public_fetch, clock=None):
+        self.directory, self.target_date, self.start_at, self.fetch = directory, target_date, start_at, fetch
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def once(self) -> dict:
+        with _wall_bound(CYCLE_WALL_SECONDS, ValueError('cycle wall budget exhausted')):
+            now = self.clock().astimezone(timezone.utc)
+            rows = [row for row, _ in _records(self.directory)]
+            if now < _aware(self.start_at) or now >= _aware(self.start_at) + timedelta(days=MAX_DAYS):
+                return {'status': 'deadline', 'paper_only': True}
+            if len(rows) >= MAX_CYCLES or report(self.directory)['resolved_event_days'] >= MAX_RESOLVED_DAYS:
+                return {'status': 'cap', 'paper_only': True}
+            if any(row.get('campaign_start_at') != self.start_at or row.get('station') != 'OPKC' for row in rows):
+                raise ValueError('campaign start/station drift')
+            day = date.fromisoformat(self.target_date)
+            if day.isoformat() != self.target_date:
+                raise ValueError('invalid target date')
+            if not (_aware(self.start_at).astimezone(ZoneInfo('Asia/Karachi')).date() <= day <=
+                    (_aware(self.start_at) + timedelta(days=MAX_DAYS)).astimezone(ZoneInfo('Asia/Karachi')).date()):
+                raise ValueError('target date outside campaign')
+            slug = f'highest-temperature-in-karachi-on-{day.strftime("%B").lower()}-{day.day}-{day.year}'
+            previous = [r for r in rows if r.get('target_date') == self.target_date]
+            if previous and any(r.get('captured_at', '')[:13] == now.isoformat()[:13] for r in previous):
+                return {'status': 'already_captured', 'paper_only': True}
+            url = 'https://gamma-api.polymarket.com/events/slug/' + slug
+            response = self.fetch(url, LIMITS['gamma'])
+            body, _headers = response
+            if not isinstance(body, bytes) or len(body) > LIMITS['gamma']:
+                raise ValueError('invalid daily Gamma response')
+            event = json.loads(body.decode('utf-8'))
+            pinned = None
+            if previous:
+                first = previous[0]
+                pinned = Config(slug=slug, event_id=first['event_id'], market_id=first['market_id'],
+                                target_date=self.target_date, station='OPKC', zone='Asia/Karachi',
+                                latitude=24.9065, longitude=67.1608, start_at=self.start_at,
+                                rule_sha256=first['rule_sha256'])
+                if any((r['event_id'], r['market_id'], r['rule_sha256']) !=
+                       (pinned.event_id, pinned.market_id, pinned.rule_sha256) for r in previous):
+                    raise ValueError('prior daily manifest pin drift')
+            config = discover_daily_manifest(event, self.target_date, self.start_at, pinned=pinned)
+            return Campaign(self.directory, config, fetch=self.fetch, clock=self.clock)._once(gamma_response=response)
+
+
 def main():
     p = argparse.ArgumentParser(description='public-only AWC one-cycle evidence collector; no scheduler or trading')
     p.add_argument('--directory', required=True, type=Path)
-    p.add_argument('--config', required=True, type=Path, help='explicit event identity JSON')
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument('--config', type=Path, help='explicit event identity JSON')
+    group.add_argument('--discover-date', help='manual OPKC YYYY-MM-DD discovery')
+    p.add_argument('--start-at', help='fixed campaign start, required with --discover-date')
     p.add_argument('--report', action='store_true')
     args = p.parse_args()
     # Fail closed on unknown config keys (Config constructor) and runtime-only state.
-    config = Config(**json.loads(args.config.read_text()))
-    print(json.dumps(report(args.directory) if args.report else Campaign(args.directory, config).once(), sort_keys=True))
+    if args.discover_date and not args.start_at:
+        p.error('--start-at required for daily discovery')
+    if args.config and args.start_at:
+        p.error('--start-at only applies to daily discovery')
+    if args.report:
+        result = report(args.directory)
+    elif args.config:
+        result = Campaign(args.directory, Config(**json.loads(args.config.read_text()))).once()
+    else:
+        result = DailyCampaign(args.directory, args.discover_date, args.start_at).once()
+    print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == '__main__':

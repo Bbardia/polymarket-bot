@@ -136,9 +136,9 @@ def test_resolved_day_cap_blocks_all_network(tmp_path):
     previous = None
     for n in range(30):
         row = {'sequence': n, 'previous_sha256': previous,
-               'event_id': str(n + 1), 'target_date': config.target_date,
+               'event_id': str(n + 1), 'target_date': '2026-10-' + str(n + 1).zfill(2),
                'campaign_start_at': config.start_at, 'station': config.station,
-               'captured_at': NOW.isoformat(), 'label': {'status': 'official_gamma_binary'}}
+               'captured_at': NOW.isoformat(), 'label': {'status': 'independent_final_binary'}}
         body = _canonical(row)
         (tmp_path / f'{n:06d}.json').write_bytes(body)
         previous = hashlib.sha256(body).hexdigest()
@@ -561,3 +561,181 @@ def test_alarm_on_nested_entry_unmask_rolls_back_both_bounds(monkeypatch):
     assert sent and awc_campaign._deadlines == []
     assert signal.getsignal(signal.SIGALRM) is previous
     assert signal.getitimer(signal.ITIMER_REAL)[0] == 0
+
+
+def test_daily_manifest_discovery_pins_unique_first_rung_and_rule():
+    from src.v3.awc_campaign import discover_daily_manifest
+    config, event = fixture()
+    found = discover_daily_manifest(event, config.target_date, config.start_at)
+    assert found == config
+    for changed in (
+        {**event, 'eventDate': '2026-10-29'},
+        {**event, 'slug': SLUG + '-wrong'},
+        {**event, 'markets': event['markets'] * 2},
+        {**event, 'markets': [{**event['markets'][0], 'question': 'Karachi 32°C or below?'}]},
+        {**event, 'resolutionSource': SOURCE.replace('OPKC', 'KJFK')},
+    ):
+        with pytest.raises(ValueError):
+            discover_daily_manifest(changed, config.target_date, config.start_at)
+    changed = {**event, 'description': RULES + '\nchanged'}
+    changed['markets'] = [{**event['markets'][0], 'description': changed['description']}]
+    assert discover_daily_manifest(changed, config.target_date, config.start_at).rule_sha256 != config.rule_sha256
+    with pytest.raises(ValueError, match='pin'):
+        discover_daily_manifest(changed, config.target_date, config.start_at, pinned=config)
+
+
+def test_data_api_requires_exact_both_tokens_condition_event_and_terminal_resolution():
+    from src.v3.awc_campaign import crosscheck_resolution
+    config, event = fixture()
+    m = event['markets'][0]
+    m.update(closed=True, resolvedAt='2026-10-29T13:00:00Z', outcomePrices='["1","0"]')
+    label = _label(m, target_date=config.target_date, fetched_at='2026-10-30T00:00:00Z')
+    base = {'condition_id': m['conditionId'], 'event_id': int(config.event_id), 'event_slug': config.slug,
+            'resolved': True, 'closed': True, 'module': 'v1_ctf'}
+    tokens = {'data': [{**base, 'token_id': '123', 'opposite_token_id': '456',
+                        'outcome_index': 0, 'outcome': 'Yes', 'final_price': 1},
+                       {**base, 'token_id': '456', 'opposite_token_id': '123',
+                        'outcome_index': 1, 'outcome': 'No', 'final_price': 0}]}
+    resolution = {'data': [{'condition_id': m['conditionId'], 'status': 'resolved'}]}
+    assert crosscheck_resolution(config, m, label, tokens, resolution)['status'] == 'independent_final_binary'
+    for key, value in [('condition_id', '0x'+'b'*64), ('event_id', 999), ('resolved', False),
+                       ('final_price', .5), ('outcome', 'No'), ('opposite_token_id', '999'), ('module', 'v2')]:
+        bad = json.loads(json.dumps(tokens)); bad['data'][0][key] = value
+        assert crosscheck_resolution(config, m, label, bad, resolution)['status'] == 'unverified'
+    for bad in ({'data': tokens['data'][:1]}, {'data': tokens['data']*2}, {'data': 'error'}):
+        assert crosscheck_resolution(config, m, label, bad, resolution)['status'] == 'unverified'
+    for bad in ({'data': []}, {'data': [{'condition_id': m['conditionId'], 'status': 'proposed'}]},
+                {'data': [{'condition_id': '0x'+'b'*64, 'status': 'resolved'}]}):
+        assert crosscheck_resolution(config, m, label, tokens, bad)['status'] == 'unverified'
+    assert crosscheck_resolution(config, m, {'status': 'unverified'}, tokens, resolution)['status'] == 'unverified'
+
+
+def test_report_counts_only_independently_final_days_not_gamma_claims(tmp_path):
+    config, _ = fixture()
+    row = {'sequence': 0, 'previous_sha256': None, 'event_id': config.event_id,
+           'target_date': config.target_date, 'captured_at': NOW.isoformat(),
+           'label': {'status': 'official_gamma_binary'}}
+    (tmp_path / '000000.json').write_bytes(_canonical(row))
+    assert report(tmp_path)['resolved_event_days'] == 0
+    row['label']['status'] = 'independent_final_binary'
+    (tmp_path / '000000.json').write_bytes(_canonical(row))
+    assert report(tmp_path)['resolved_event_days'] == 1
+
+
+def test_cycle_crosscheck_is_bounded_and_outage_cannot_count_day(tmp_path):
+    config, event = fixture()
+    m = event['markets'][0]
+    m.update(closed=True, resolvedAt='2026-10-29T00:00:00Z', outcomePrices='["1","0"]')
+    future = datetime(2026, 10, 30, tzinfo=timezone.utc)
+    base = {'condition_id': m['conditionId'], 'event_id': int(config.event_id),
+            'event_slug': config.slug, 'resolved': True, 'closed': True, 'module': 'v1_ctf'}
+    tokens = {'data': [{**base, 'token_id': '123', 'opposite_token_id': '456',
+                       'outcome_index': 0, 'outcome': 'Yes', 'final_price': 1},
+                      {**base, 'token_id': '456', 'opposite_token_id': '123',
+                       'outcome_index': 1, 'outcome': 'No', 'final_price': 0}]}
+    resolution = {'data': [{'condition_id': m['conditionId'], 'status': 'resolved'}]}
+    calls = []
+    def fetch(url, limit):
+        calls.append(url)
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: return b'{"hourly":{}}', {}
+        if '/book?' in url:
+            return json.dumps({'market': m['conditionId'], 'asset_id': '123',
+                               'timestamp': '1793102400000', 'bids': [], 'asks': []}).encode(), {}
+        if 'aviationweather' in url: return b'', {'Status': 200}
+        if '/v2/tokens?' in url: return json.dumps(tokens).encode(), {}
+        if '/v2/resolutions?' in url: return json.dumps(resolution).encode(), {}
+        raise AssertionError(url)
+    result = Campaign(tmp_path, config, fetch=fetch, clock=lambda: future).once()
+    assert result['label'] == 'independent_final_binary' and len(calls) == 6
+    assert report(tmp_path)['resolved_event_days'] == 1
+    saved = json.loads((tmp_path / '000000.json').read_text())
+    assert set(saved['captures']) == {'gamma', 'forecast', 'book', 'awc', 'tokens', 'resolution'}
+    assert saved['gamma_label']['status'] == 'official_gamma_binary'
+    # A new hour cannot let an outage or disagreement claim another final day.
+    def outage(url, limit):
+        if '/v2/tokens?' in url: raise TimeoutError('offline')
+        return fetch(url, limit)
+    later = future.replace(hour=1)
+    result = Campaign(tmp_path, config, fetch=outage, clock=lambda: later).once()
+    assert result['label'] == 'unverified'
+    row = json.loads((tmp_path / '000001.json').read_text())
+    assert row['captures']['tokens']['failure_code'] == 'timeout'
+    assert 'resolution' not in row['captures']
+    assert len(calls) <= 11
+
+
+def test_daily_cycle_uses_one_gamma_and_pins_manifest_across_hours(tmp_path):
+    from src.v3.awc_campaign import DailyCampaign
+    config, event = fixture()
+    calls = []
+    def fetch(url, limit):
+        calls.append(url)
+        if 'gamma-api' in url: return json.dumps(event).encode(), {'Status': 200}
+        if 'open-meteo' in url: return b'{"hourly":{}}', {}
+        if '/book?' in url:
+            return json.dumps({'market': event['markets'][0]['conditionId'], 'asset_id': '123',
+                               'timestamp': '1793102400000', 'bids': [], 'asks': []}).encode(), {}
+        if 'aviationweather' in url: return b'', {'Status': 204}
+        raise AssertionError(url)
+    daily = DailyCampaign(tmp_path, config.target_date, config.start_at, fetch=fetch, clock=lambda: NOW)
+    assert daily.once()['status'] == 'captured_partial'
+    assert len(calls) == 4 and sum('gamma-api' in u for u in calls) == 1
+    assert daily.once()['status'] == 'already_captured' and len(calls) == 4
+    event['description'] += '\nchanged'
+    event['markets'][0]['description'] = event['description']
+    daily = DailyCampaign(tmp_path, config.target_date, config.start_at, fetch=fetch,
+                          clock=lambda: NOW.replace(hour=13))
+    with pytest.raises(ValueError, match='pin'):
+        daily.once()
+    assert len(calls) == 5 and len(list(tmp_path.glob('*.json'))) == 1
+    expired = DailyCampaign(tmp_path, config.target_date, '2026-08-01T00:00:00Z',
+                            fetch=lambda *_: (_ for _ in ()).throw(AssertionError('no GET')),
+                            clock=lambda: NOW)
+    assert expired.once()['status'] == 'deadline'
+
+
+def test_daily_discovery_failure_and_data_api_invalid_response_never_promote(tmp_path):
+    from src.v3.awc_campaign import DailyCampaign
+    config, event = fixture()
+    event['resolutionSource'] = SOURCE.replace('OPKC', 'KJFK')
+    requests = []
+    def fetch(url, limit):
+        requests.append(url)
+        return json.dumps(event).encode(), {'Status': 200}
+    with pytest.raises(ValueError, match='AWC'):
+        DailyCampaign(tmp_path, config.target_date, config.start_at,
+                      fetch=fetch, clock=lambda: NOW).once()
+    assert len(requests) == 1 and not list(tmp_path.glob('*.json'))
+
+    config, event = fixture()
+    event['markets'][0].update(closed=True, resolvedAt='2026-10-29T00:00:00Z',
+                               outcomePrices='["1","0"]')
+    future = datetime(2026, 10, 30, tzinfo=timezone.utc)
+    def invalid(url, limit):
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: return b'{"hourly":{}}', {}
+        if '/book?' in url:
+            return json.dumps({'market': event['markets'][0]['conditionId'], 'asset_id': '123',
+                               'timestamp': '1793102400000', 'bids': [], 'asks': []}).encode(), {}
+        if 'aviationweather' in url: return b'', {'Status': 200}
+        return b'{bad json', {'Status': 200}
+    result = DailyCampaign(tmp_path, config.target_date, config.start_at,
+                           fetch=invalid, clock=lambda: future).once()
+    assert result['label'] == 'unverified'
+    row = json.loads((tmp_path / '000000.json').read_text())
+    assert row['captures']['tokens']['body'] == '{bad json'
+    assert row['captures']['tokens']['failure_code'] == 'invalid_or_unavailable'
+    assert report(tmp_path)['resolved_event_days'] == 0
+
+
+def test_event_day_cap_deduplicates_same_date_even_if_ids_differ(tmp_path):
+    previous = None
+    for i in range(2):
+        row = {'sequence': i, 'previous_sha256': previous, 'event_id': str(i),
+               'target_date': '2026-10-28', 'captured_at': NOW.isoformat(),
+               'label': {'status': 'independent_final_binary'}}
+        body = _canonical(row)
+        (tmp_path / f'{i:06d}.json').write_bytes(body)
+        previous = hashlib.sha256(body).hexdigest()
+    assert report(tmp_path)['resolved_event_days'] == 1
