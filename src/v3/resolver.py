@@ -59,7 +59,21 @@ def parse_resolver_identity(source: str | None, description: str | None = None) 
             host = (parsed.hostname or "").lower()
             if parsed.scheme != "https" or parsed.username or parsed.password:
                 continue
-            if host in {"weather.gov", "www.weather.gov"} and parsed.path.rstrip("/") == "/wrh/timeseries":
+            if host == "aviationweather.gov" and parsed.path == "/api/data/metar":
+                # Identity for diagnostics only: raw METAR corrections, fallback and
+                # settlement timing are not verified by a station URL.
+                params = parse_qs(parsed.query, keep_blank_values=True)
+                station = params.get("ids", [None])[0]
+                if (parsed.netloc == host and not parsed.fragment
+                        and set(params) == {"ids", "format", "date", "hours"}
+                        and all(len(values) == 1 for values in params.values())
+                        and station is not None and re.fullmatch(r"[A-Z]{4}", station)
+                        and params["format"] == ["raw"]):
+                    identities.append(ResolverIdentity(station, "awc-metar-observation-only", False,
+                        "station identified; correction cutoff and fallback not verified"))
+                else:
+                    identities.append(ResolverIdentity(None, "awc-metar-unparsed", False, "invalid AWC source"))
+            elif host in {"weather.gov", "www.weather.gov"} and parsed.path.rstrip("/") == "/wrh/timeseries":
                 stations = parse_qs(parsed.query).get("site", [])
                 if len(stations) == 1 and re.fullmatch(r"[A-Za-z0-9]{3,4}", stations[0]):
                     identities.append(ResolverIdentity(stations[0].upper(), "weather.gov-timeseries", True, "METAR station parsed"))

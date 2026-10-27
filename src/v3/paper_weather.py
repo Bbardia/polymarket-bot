@@ -26,6 +26,7 @@ from .market_context import MarketContext
 from .maker_shadow import MakerShadowQuote, propose_buy_quote
 from .math import BookLevel, execution_fee, execution_vwap
 from .resolver import parse_resolver_identity
+from .awc_metar_observation import inspect_awc_source
 from .sanity import check_probability
 from .strategies.weather import WeatherDecision, WeatherMarketInput, evaluate_weather_market
 from .weather_surface import EventSurface, SurfaceBucket, analyze_event_surface
@@ -828,6 +829,8 @@ class WeatherUniverseResult:
     forecast_errors: tuple[str, ...] = field(default_factory=tuple)
     provider_names: tuple[str, ...] = field(default_factory=tuple)
     provider_failures: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+    awc_observation_only: int = 0
+    awc_rule_unverified: int = 0
 
 
 class WeatherPublicClient(Protocol):
@@ -2740,6 +2743,8 @@ async def evaluate_weather_universe(
     tag = await client.get_tag(slug="weather")
     markets: list[tuple[Any, HighTemperatureContract, str]] = []
     examined = 0
+    awc_observation_only = 0
+    awc_rule_unverified = 0
     paginator = client.list_markets(
         closed=False,
         tag_id=int(tag.id),
@@ -2755,6 +2760,24 @@ async def evaluate_weather_universe(
             end_date=getattr(market.state, "end_date", None),
         )
         source = getattr(market.resolution, "source", None)
+        identity = parse_resolver_identity(source)
+        if identity.authority in {"awc-metar-observation-only", "awc-metar-unparsed"}:
+            # An unparsed AWC URL is diagnostic-only too; never promote it to
+            # observation-only status or let it enter the tradeable station path.
+            timezone_name = CITY_TIMEZONES.get(contract.city) if contract else None
+            if (identity.authority == "awc-metar-observation-only"
+                    and contract is not None and timezone_name is not None and isinstance(source, str)
+                    and identity.station is not None and identity.station == CITY_STATIONS.get(contract.city)):
+                inspection = inspect_awc_source(
+                    source, station=identity.station, target_date=date.fromisoformat(contract.target_date),
+                    timezone_name=timezone_name, description=getattr(market, "description", None) or "",
+                )
+                if inspection.observation_only:
+                    awc_observation_only += 1
+                else:
+                    awc_rule_unverified += 1
+            else:
+                awc_rule_unverified += 1
         station_id = (
             _verified_resolution_station(contract, source)
             if contract is not None
@@ -3040,4 +3063,6 @@ async def evaluate_weather_universe(
         forecast_errors=tuple(forecast_errors),
         provider_names=tuple(sorted(provider_names)),
         provider_failures=tuple(sorted(provider_failures.items())),
+        awc_observation_only=awc_observation_only,
+        awc_rule_unverified=awc_rule_unverified,
     )
