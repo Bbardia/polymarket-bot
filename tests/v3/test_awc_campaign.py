@@ -131,21 +131,18 @@ def test_report_refuses_tampered_chain(tmp_path):
         report(tmp_path)
 
 
-def test_resolved_day_cap_blocks_all_network(tmp_path):
+def test_claimed_status_without_raw_resolution_cannot_trigger_cap(tmp_path):
     config, _ = fixture()
     previous = None
     for n in range(30):
         row = {'sequence': n, 'previous_sha256': previous,
                'event_id': str(n + 1), 'target_date': '2026-10-' + str(n + 1).zfill(2),
                'campaign_start_at': config.start_at, 'station': config.station,
-               'captured_at': NOW.isoformat(), 'label': {'status': 'independent_final_binary'}}
+               'captured_at': NOW.isoformat(), 'label': {'status': 'venue_corroborated_final_binary'}}
         body = _canonical(row)
         (tmp_path / f'{n:06d}.json').write_bytes(body)
         previous = hashlib.sha256(body).hexdigest()
-    assert report(tmp_path)['resolved_event_days'] == 30
-    def no_network(*_):
-        raise AssertionError('cap must block fetch')
-    assert Campaign(tmp_path, config, fetch=no_network, clock=lambda: NOW).once()['status'] == 'cap'
+    assert report(tmp_path)['resolved_event_days'] == 0
 
 
 def test_public_fetch_rejects_non_allowlisted_hosts_without_network():
@@ -583,6 +580,60 @@ def test_daily_manifest_discovery_pins_unique_first_rung_and_rule():
     with pytest.raises(ValueError, match='pin'):
         discover_daily_manifest(changed, config.target_date, config.start_at, pinned=config)
 
+@pytest.mark.parametrize('field,replacement', [('conditionId', '0x' + 'b'*64),
+                                                 ('clobTokenIds', '["999","456"]'),
+                                                 ('clobTokenIds', '["456","123"]')])
+def test_daily_legacy_raw_gamma_pins_exact_condition_and_ordered_tokens(tmp_path, field, replacement):
+    from src.v3.awc_campaign import DailyCampaign
+    config, event = fixture()
+    original = _offline_fetch(event)
+    assert DailyCampaign(tmp_path, config.target_date, config.start_at,
+                         fetch=original, clock=lambda: NOW).once()['status'] == 'captured_partial'
+    # Existing row has no explicit condition/token pin: recover it from raw Gamma.
+    row = json.loads((tmp_path / '000000.json').read_text())
+    assert 'condition_id' not in row
+    event['markets'][0][field] = replacement
+    calls = []
+    def fetch(url, limit):
+        calls.append(url)
+        return _offline_fetch(event)(url, limit)
+    with pytest.raises(ValueError, match='pin'):
+        DailyCampaign(tmp_path, config.target_date, config.start_at, fetch=fetch,
+                      clock=lambda: NOW.replace(hour=13)).once()
+    assert len(calls) == 1 and len(list(tmp_path.glob('*.json'))) == 1
+
+def test_direct_cycle_also_refuses_legacy_pin_drift(tmp_path):
+    config, event = fixture()
+    Campaign(tmp_path, config, fetch=_offline_fetch(event), clock=lambda: NOW).once()
+    event['markets'][0]['conditionId'] = '0x' + 'b'*64
+    with pytest.raises(ValueError, match='pin'):
+        Campaign(tmp_path, config, fetch=_offline_fetch(event),
+                 clock=lambda: NOW.replace(hour=13)).once()
+    assert report(tmp_path)['cycles'] == 1
+
+def test_tape_row_bound_includes_escaping_and_metadata_and_is_readable(tmp_path):
+    limit = awc_campaign.MAX_TAPE_ROW_BYTES
+    assert limit > sum(awc_campaign.LIMITS.values()) * 6
+    row = {'sequence': 0, 'previous_sha256': None, 'target_date': '2026-10-28',
+           'captured_at': NOW.isoformat(), 'captures': {
+        source: {'body': '\x00' * size, 'response_date': 'header'}
+        for source, size in awc_campaign.LIMITS.items()}}
+    body = _canonical(row)
+    assert len(body) <= limit
+    (tmp_path / '000000.json').write_bytes(body)
+    assert report(tmp_path)['cycles'] == 1
+    row['captures']['gamma']['response_date'] = 'x' * limit
+    (tmp_path / '000000.json').write_bytes(_canonical(row))
+    with pytest.raises(ValueError, match='size'):
+        report(tmp_path)
+
+def test_oversized_serialized_row_refused_before_publish(tmp_path, monkeypatch):
+    config, event = fixture()
+    monkeypatch.setattr(awc_campaign, 'MAX_TAPE_ROW_BYTES', 100)
+    with pytest.raises(ValueError, match='row.*limit'):
+        Campaign(tmp_path, config, fetch=_offline_fetch(event), clock=lambda: NOW).once()
+    assert not list(tmp_path.glob('*.json')) and not list(tmp_path.glob('*.tmp'))
+
 
 def test_data_api_requires_exact_both_tokens_condition_event_and_terminal_resolution():
     from src.v3.awc_campaign import crosscheck_resolution
@@ -597,7 +648,7 @@ def test_data_api_requires_exact_both_tokens_condition_event_and_terminal_resolu
                        {**base, 'token_id': '456', 'opposite_token_id': '123',
                         'outcome_index': 1, 'outcome': 'No', 'final_price': 0}]}
     resolution = {'data': [{'condition_id': m['conditionId'], 'status': 'resolved'}]}
-    assert crosscheck_resolution(config, m, label, tokens, resolution)['status'] == 'independent_final_binary'
+    assert crosscheck_resolution(config, m, label, tokens, resolution)['status'] == 'venue_corroborated_final_binary'
     for key, value in [('condition_id', '0x'+'b'*64), ('event_id', 999), ('resolved', False),
                        ('final_price', .5), ('outcome', 'No'), ('opposite_token_id', '999'), ('module', 'v2')]:
         bad = json.loads(json.dumps(tokens)); bad['data'][0][key] = value
@@ -610,16 +661,16 @@ def test_data_api_requires_exact_both_tokens_condition_event_and_terminal_resolu
     assert crosscheck_resolution(config, m, {'status': 'unverified'}, tokens, resolution)['status'] == 'unverified'
 
 
-def test_report_counts_only_independently_final_days_not_gamma_claims(tmp_path):
+def test_report_does_not_count_unsubstantiated_finality_claims(tmp_path):
     config, _ = fixture()
     row = {'sequence': 0, 'previous_sha256': None, 'event_id': config.event_id,
            'target_date': config.target_date, 'captured_at': NOW.isoformat(),
            'label': {'status': 'official_gamma_binary'}}
     (tmp_path / '000000.json').write_bytes(_canonical(row))
     assert report(tmp_path)['resolved_event_days'] == 0
-    row['label']['status'] = 'independent_final_binary'
+    row['label']['status'] = 'venue_corroborated_final_binary'
     (tmp_path / '000000.json').write_bytes(_canonical(row))
-    assert report(tmp_path)['resolved_event_days'] == 1
+    assert report(tmp_path)['resolved_event_days'] == 0
 
 
 def test_cycle_crosscheck_is_bounded_and_outage_cannot_count_day(tmp_path):
@@ -647,11 +698,34 @@ def test_cycle_crosscheck_is_bounded_and_outage_cannot_count_day(tmp_path):
         if '/v2/resolutions?' in url: return json.dumps(resolution).encode(), {}
         raise AssertionError(url)
     result = Campaign(tmp_path, config, fetch=fetch, clock=lambda: future).once()
-    assert result['label'] == 'independent_final_binary' and len(calls) == 6
+    assert result['label'] == 'venue_corroborated_final_binary' and len(calls) == 6
     assert report(tmp_path)['resolved_event_days'] == 1
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(awc_campaign, 'MAX_RESOLVED_DAYS', 1)
+        assert Campaign(tmp_path, config, fetch=lambda *_: pytest.fail('cap fetched network'),
+                        clock=lambda: future.replace(hour=1)).once()['status'] == 'cap'
     saved = json.loads((tmp_path / '000000.json').read_text())
     assert set(saved['captures']) == {'gamma', 'forecast', 'book', 'awc', 'tokens', 'resolution'}
     assert saved['gamma_label']['status'] == 'official_gamma_binary'
+    # The reporting cap must replay both APIs, not trust a status string or digest.
+    for kind, mutation in [('tokens', lambda d: d['data'][0].update(token_id='999')),
+                           ('tokens', lambda d: d['data'][0].update(final_price=0.5)),
+                           ('resolution', lambda d: d['data'][0].update(status='proposed')),
+                           ('resolution', lambda d: d['data'][0].update(condition_id='0x'+'b'*64))]:
+        forged = json.loads(json.dumps(saved))
+        payload = json.loads(forged['captures'][kind]['body'])
+        mutation(payload)
+        raw = json.dumps(payload)
+        forged['captures'][kind]['body'] = raw
+        forged['captures'][kind]['sha256'] = hashlib.sha256(raw.encode()).hexdigest()
+        (tmp_path / '000000.json').write_bytes(_canonical(forged))
+        assert report(tmp_path)['resolved_event_days'] == 0
+    (tmp_path / '000000.json').write_bytes(_canonical(saved))
+    duplicate = {**saved, 'sequence': 1, 'previous_sha256': hashlib.sha256(_canonical(saved)).hexdigest(),
+                 'captured_at': future.replace(hour=1).isoformat()}
+    (tmp_path / '000001.json').write_bytes(_canonical(duplicate))
+    assert report(tmp_path)['resolved_event_days'] == 1
+    (tmp_path / '000001.json').unlink()
     # A new hour cannot let an outage or disagreement claim another final day.
     def outage(url, limit):
         if '/v2/tokens?' in url: raise TimeoutError('offline')
@@ -729,13 +803,13 @@ def test_daily_discovery_failure_and_data_api_invalid_response_never_promote(tmp
     assert report(tmp_path)['resolved_event_days'] == 0
 
 
-def test_event_day_cap_deduplicates_same_date_even_if_ids_differ(tmp_path):
+def test_event_day_cap_does_not_trust_unbacked_status_even_if_ids_differ(tmp_path):
     previous = None
     for i in range(2):
         row = {'sequence': i, 'previous_sha256': previous, 'event_id': str(i),
                'target_date': '2026-10-28', 'captured_at': NOW.isoformat(),
-               'label': {'status': 'independent_final_binary'}}
+               'label': {'status': 'venue_corroborated_final_binary'}}
         body = _canonical(row)
         (tmp_path / f'{i:06d}.json').write_bytes(body)
         previous = hashlib.sha256(body).hexdigest()
-    assert report(tmp_path)['resolved_event_days'] == 1
+    assert report(tmp_path)['resolved_event_days'] == 0

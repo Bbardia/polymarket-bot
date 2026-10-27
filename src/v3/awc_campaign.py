@@ -33,6 +33,10 @@ MAX_RESOLVED_DAYS = 30
 MAX_DAYS = 45
 LIMITS = {'gamma': 1_000_000, 'forecast': 300_000, 'book': 512_000, 'awc': 256_000,
           'tokens': 128_000, 'resolution': 128_000}
+# Worst-case JSON escape expansion is six bytes per input byte (e.g. NUL).
+# 6 * sum(LIMITS) = 13,944,000; the remainder covers bounded row metadata.
+# Check the serialized row before publishing, including untrusted headers.
+MAX_TAPE_ROW_BYTES = 16_000_000
 APPROVED_OUTPUT_ROOT = Path(__file__).absolute().parents[2] / 'data' / 'awc-campaign'
 REQUEST_WALL_SECONDS = 12
 CYCLE_WALL_SECONDS = 60
@@ -231,9 +235,36 @@ def validate_event(config: Config, event: dict) -> dict:
     return {'market': market, 'token_id': tokens[0]}
 
 
+def _market_pin(market: dict) -> tuple[str, tuple[str, str]]:
+    return market['conditionId'], tuple(_array(market['clobTokenIds']))
+
+
+def _previous_pin(rows: list[dict], config: Config):
+    """Recover even legacy pins from immutable raw Gamma, rejecting missing/drifted evidence."""
+    pins = []
+    for row in rows:
+        if row.get('target_date') != config.target_date:
+            continue
+        if (row.get('event_id'), row.get('market_id'), row.get('rule_sha256')) != (
+                config.event_id, config.market_id, config.rule_sha256):
+            raise ValueError('prior daily manifest pin drift')
+        try:
+            capture = row['captures']['gamma']
+            raw = capture['body'].encode('utf-8')
+            if hashlib.sha256(raw).hexdigest() != capture['sha256']:
+                raise ValueError('Gamma digest mismatch')
+            market = validate_event(config, json.loads(raw))['market']
+            pins.append(_market_pin(market))
+        except (KeyError, TypeError, ValueError, UnicodeError) as exc:
+            raise ValueError('prior daily manifest pin evidence invalid') from exc
+    if len(set(pins)) > 1:
+        raise ValueError('prior daily manifest pin drift')
+    return pins[0] if pins else None
+
+
 
 def discover_daily_manifest(event: dict, target_date: str, start_at: str,
-                            *, pinned: Config | None = None) -> Config:
+                            *, pinned: Config | None = None, pinned_identity=None) -> Config:
     """Discover the unique lower-tail rung; pin every identity before collection.
 
     The first raw Gamma response may supply a candidate, not an operator-reviewed
@@ -262,9 +293,11 @@ def discover_daily_manifest(event: dict, target_date: str, start_at: str,
                     station='OPKC', zone='Asia/Karachi', latitude=24.9065, longitude=67.1608,
                     market_id=str(rungs[0]['id']), start_at=start_at,
                     rule_sha256=hashlib.sha256(event['description'].encode()).hexdigest())
-    validate_event(config, event)
+    identity = validate_event(config, event)
     if pinned is not None and config != pinned:
         raise ValueError('daily manifest pin drift')
+    if pinned_identity is not None and _market_pin(identity['market']) != pinned_identity:
+        raise ValueError('daily condition/token pin drift')
     return config
 
 
@@ -306,8 +339,8 @@ def crosscheck_resolution(config: Config, market: dict, gamma_label: dict,
             return failure
     except (KeyError, TypeError, ValueError, InvalidOperation):
         return failure
-    return {'status': 'independent_final_binary', 'winner': gamma_label['winner'],
-            'basis': 'Gamma payout + Data API exact token final prices and resolved condition'}
+    return {'status': 'venue_corroborated_final_binary', 'winner': gamma_label['winner'],
+            'basis': 'same-venue Gamma payout + Polymarket Data API token final prices and resolved condition; not independent UMA/on-chain verification'}
 
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
@@ -380,10 +413,10 @@ def _records(directory: Path) -> list[tuple[dict, str]]:
                 raise ValueError('symlink or invalid tape entry') from exc
             with os.fdopen(fd, 'rb') as file:
                 info = os.fstat(file.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_size > 2_200_000:
+                if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_TAPE_ROW_BYTES:
                     raise ValueError('tape sequence or size mismatch')
-                body = file.read(2_200_001)
-            if len(body) > 2_200_000:
+                body = file.read(MAX_TAPE_ROW_BYTES + 1)
+            if len(body) > MAX_TAPE_ROW_BYTES:
                 raise ValueError('tape size mismatch')
             record = json.loads(body)
             if body != _canonical(record) or record.get('sequence') != i or record.get('previous_sha256') != prev:
@@ -395,11 +428,41 @@ def _records(directory: Path) -> list[tuple[dict, str]]:
 
 def report(directory: Path) -> dict:
     rows = [row for row, _ in _records(directory)]
-    resolved = {row['target_date'] for row in rows if row.get('label', {}).get('status') == 'independent_final_binary'}
+    resolved = {row['target_date'] for row in rows if _corroborated_row(row)}
     return {'cycles': len(rows), 'resolved_event_days': len(resolved), 'last_at': rows[-1]['captured_at'] if rows else None,
-            'pending_labels': sum(row.get('label', {}).get('status') != 'independent_final_binary' for row in rows),
+            'pending_labels': sum(not _corroborated_row(row) for row in rows),
             'stop_at_resolved_days': MAX_RESOLVED_DAYS, 'stop_after_calendar_days': MAX_DAYS,
             'paper_only': True, 'live_eligible': False}
+
+
+def _corroborated_row(row: dict) -> bool:
+    """Count only replayable same-venue corroboration, never a claimed status alone."""
+    if row.get('status') != 'captured' or row.get('label', {}).get('status') != 'venue_corroborated_final_binary':
+        return False
+    try:
+        config = Config(slug=row['captures']['gamma']['url'].split('/events/slug/')[1],
+                        event_id=row['event_id'], market_id=row['market_id'],
+                        target_date=row['target_date'], station=row['station'], zone=row['zone'],
+                        latitude=24.9065, longitude=67.1608, start_at=row['campaign_start_at'],
+                        rule_sha256=row['rule_sha256'])
+        documents = {}
+        for kind in ('gamma', 'awc', 'tokens', 'resolution'):
+            capture = row['captures'][kind]
+            raw = capture['body'].encode('utf-8')
+            if capture['status'] != 200 or hashlib.sha256(raw).hexdigest() != capture['sha256']:
+                return False
+            if kind != 'awc':
+                documents[kind] = json.loads(raw)
+        event = documents['gamma']
+        market = validate_event(config, event)['market']
+        gamma_label = _label(market, event=event, target_date=config.target_date,
+                             fetched_at=row['captures']['gamma']['first_available_at'])
+        checked = crosscheck_resolution(config, market, gamma_label, documents['tokens'], documents['resolution'])
+        return (checked['status'] == 'venue_corroborated_final_binary' and
+                checked['winner'] == row['label'].get('winner') and
+                gamma_label == row.get('gamma_label'))
+    except (KeyError, TypeError, ValueError, IndexError, UnicodeError):
+        return False
 
 
 def _label(market: dict, *, event: dict | None = None,
@@ -489,6 +552,9 @@ class Campaign:
         event = json.loads(get('gamma', urls['gamma']))
         identity = validate_event(self.config, event)
         market = identity['market']
+        prior_pin = _previous_pin([row for row, _ in rows], self.config)
+        if prior_pin is not None and _market_pin(market) != prior_pin:
+            raise ValueError('daily condition/token pin drift')
         day = date.fromisoformat(self.config.target_date)
         forecast_url = 'https://api.open-meteo.com/v1/forecast?' + urlencode({
             'latitude': self.config.latitude, 'longitude': self.config.longitude,
@@ -521,7 +587,7 @@ class Campaign:
         gamma_label = _label(market, event=event, target_date=self.config.target_date,
                              fetched_at=captures['gamma']['first_available_at'])
         label = {'status': 'unverified', 'reason': 'AWC unavailable: ' + awc_reason} if awc_reason else {
-            'status': 'unverified', 'reason': 'independent finality unavailable'}
+            'status': 'unverified', 'reason': 'same-venue finality corroboration unavailable'}
         if not awc_reason and gamma_label['status'] == 'official_gamma_binary':
             tokens = _array(market['clobTokenIds'])
             checks = (
@@ -556,6 +622,8 @@ class Campaign:
         # Publish only a complete, fsynced row; a signal during creation must
         # never leave a numbered entry that blocks the sequence permanently.
         body = _canonical(record)
+        if len(body) > MAX_TAPE_ROW_BYTES:
+            raise ValueError('serialized tape row exceeds byte limit')
         with _directory_fd(self.directory, create=True) as dirfd:
             name = f'{len(rows):06d}.json'
             temp = f'.{name}.{secrets.token_hex(16)}.tmp'
@@ -633,7 +701,9 @@ class DailyCampaign:
                 if any((r['event_id'], r['market_id'], r['rule_sha256']) !=
                        (pinned.event_id, pinned.market_id, pinned.rule_sha256) for r in previous):
                     raise ValueError('prior daily manifest pin drift')
-            config = discover_daily_manifest(event, self.target_date, self.start_at, pinned=pinned)
+            prior_pin = _previous_pin(previous, pinned) if pinned is not None else None
+            config = discover_daily_manifest(event, self.target_date, self.start_at,
+                                             pinned=pinned, pinned_identity=prior_pin)
             return Campaign(self.directory, config, fetch=self.fetch, clock=self.clock)._once(gamma_response=response)
 
 
