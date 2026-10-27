@@ -1,0 +1,12 @@
+{
+  "slug": "highest-temperature-in-karachi-on-october-28-2026",
+  "event_id": "1257298",
+  "target_date": "2026-10-28",
+  "station": "OPKC",
+  "zone": "Asia/Karachi",
+  "latitude": 24.9065,
+  "longitude": 67.1608,
+  "market_id": "6239073",
+  "start_at": "2026-10-27T11:00:00+00:00",
+  "rule_sha256": "eb74d0fbf77f57141d6b99148ac185fbdbc382f6d815a72b0daeed089428a1cd"
+}
