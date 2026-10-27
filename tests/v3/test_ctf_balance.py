@@ -137,6 +137,8 @@ def test_chain_proof_cannot_hide_other_incompatible_position(monkeypatch):
         assert not report.safe_to_trade
         assert report.proof_failure is not None
         assert report.proof_failure.reason == "proof_ineligible"
+        assert report.position_mismatches == ("11", "22")
+        assert report.proof_failure.token_ids == ("11", "22")
         assert api.calls == []
     asyncio.run(scenario())
 
@@ -158,7 +160,7 @@ def test_failed_proof_records_fixed_category_and_safe_token_ids(error, category)
         assert report.position_mismatches == ("11",)
         assert report.proof_failure is not None
         assert report.proof_failure.reason == category
-        assert report.proof_failure.token_ids == ("11", "22")
+        assert report.proof_failure.token_ids == ("11",)
         assert "secret" not in repr(report.proof_failure)
         assert "private" not in repr(report.proof_failure)
     asyncio.run(scenario())
@@ -173,11 +175,13 @@ def test_partial_proof_and_chain_disagreement_remain_strict():
         assert not partial.safe_to_trade
         assert partial.proof_failure is not None
         assert partial.proof_failure.reason == "rpc_incomplete"
+        assert partial.proof_failure.token_ids == ("22",)
         api.balances["22"] = D("1.999999")
         drift = await Reconciler().compare_with_chain(local, remote, api)
         assert not drift.safe_to_trade
         assert drift.proof_failure is not None
         assert drift.proof_failure.reason == "rpc_disagreement"
+        assert drift.proof_failure.token_ids == ("22",)
         api.balances["22"] = D("2")
         success = await Reconciler().compare_with_chain(local, remote, api)
         assert success.safe_to_trade and success.proof_failure is None
@@ -202,8 +206,64 @@ def test_proof_diagnostic_ids_are_bounded_and_validated():
         assert not result.safe_to_trade
         assert result.proof_failure is not None
         assert result.proof_failure.reason == "rpc_error"
-        assert len(result.proof_failure.token_ids) <= 16
-        assert all(token.isascii() and token.isdecimal() for token in result.proof_failure.token_ids)
+        assert result.proof_failure.token_ids == ("1",)
+    asyncio.run(scenario())
+
+
+def test_proof_diagnostic_ids_never_lose_late_offender_or_include_unaffected_positions():
+    async def scenario():
+        quantities = {str(i): D("2") for i in range(1, 31)}
+        quantities["1"] = D("7.964043")
+        local = LocalSnapshot(D("10"), frozenset(quantities), frozenset(), quantities,
+                              {token: D("1") for token in quantities})
+        remote = RemoteSnapshot(D("10"), tuple(
+            RemotePosition("c" + token, token, D("7.964") if token == "1" else D("2"),
+                           D("1"), D("1")) for token in quantities), ())
+        api = FakeAPI()
+        api.balances = dict(quantities)
+        reconciler = Reconciler()
+        api.fail = True
+        timeout = await reconciler.compare_with_chain(local, remote, api)
+        assert not timeout.safe_to_trade
+        assert timeout.position_mismatches == ("1",)
+        assert timeout.proof_failure is not None
+        assert timeout.proof_failure.reason == "rpc_timeout"
+        assert timeout.proof_failure.token_ids == ("1",)
+        api.fail = False
+        api.balances["30"] = D("1.999999")
+        drift = await reconciler.compare_with_chain(local, remote, api)
+        assert not drift.safe_to_trade
+        assert drift.proof_failure is not None
+        assert drift.proof_failure.reason == "rpc_disagreement"
+        assert drift.proof_failure.token_ids == ("30",)
+        del api.balances["30"]
+        missing = await reconciler.compare_with_chain(local, remote, api)
+        assert not missing.safe_to_trade
+        assert missing.proof_failure is not None
+        assert missing.proof_failure.reason == "rpc_incomplete"
+        assert missing.proof_failure.token_ids == ("30",)
+        api.balances["30"] = D("NaN")
+        invalid = await reconciler.compare_with_chain(local, remote, api)
+        assert not invalid.safe_to_trade
+        assert invalid.proof_failure is not None
+        assert invalid.proof_failure.reason == "rpc_invalid"
+        assert invalid.proof_failure.token_ids == ("30",)
+        assert all(len(proof.token_ids) <= 16 for proof in
+                   (timeout.proof_failure, drift.proof_failure,
+                    missing.proof_failure, invalid.proof_failure))
+        api.balances = {token: D("1.999999") for token in quantities}
+        widespread = await reconciler.compare_with_chain(local, remote, api)
+        assert not widespread.safe_to_trade
+        assert widespread.proof_failure is not None
+        assert widespread.proof_failure.reason == "rpc_disagreement"
+        assert widespread.proof_failure.token_ids == tuple(sorted(quantities)[:16])
+        api.balances = dict(quantities)
+        api.balances["999"] = D("2")
+        extra = await reconciler.compare_with_chain(local, remote, api)
+        assert not extra.safe_to_trade
+        assert extra.proof_failure is not None
+        assert extra.proof_failure.reason == "rpc_incomplete"
+        assert extra.proof_failure.token_ids == ("1",)
     asyncio.run(scenario())
 
 

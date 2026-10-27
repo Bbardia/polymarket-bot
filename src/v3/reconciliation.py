@@ -283,17 +283,25 @@ class Reconciler:
                     or any(quantity != by_token[token].size
                            and not _display_compatible(quantity, by_token[token].size)
                            for token, quantity in quantities.items())):
-                return replace(strict, proof_failure=_proof_failure("proof_ineligible", quantities))
+                return replace(strict, proof_failure=_proof_failure("proof_ineligible", strict.position_mismatches))
             wallet = api.settings.wallet_address
             balances = await api.fetch_ctf_balances(wallet, tuple(sorted(quantities)))
             if not isinstance(balances, dict) or set(balances) != set(quantities):
-                return replace(strict, proof_failure=_proof_failure("rpc_incomplete", quantities))
+                missing = set(quantities) - balances.keys() if isinstance(balances, dict) else set()
+                return replace(strict, proof_failure=_proof_failure(
+                    "rpc_incomplete", missing or strict.position_mismatches))
             if any(not isinstance(quantity, Decimal) or not quantity.is_finite()
                    or quantity <= ZERO or not isinstance(balances[token], Decimal)
                    or not balances[token].is_finite() for token, quantity in quantities.items()):
-                return replace(strict, proof_failure=_proof_failure("rpc_invalid", quantities))
+                invalid = (token for token, quantity in quantities.items()
+                           if not isinstance(quantity, Decimal) or not quantity.is_finite()
+                           or quantity <= ZERO or not isinstance(balances[token], Decimal)
+                           or not balances[token].is_finite())
+                return replace(strict, proof_failure=_proof_failure("rpc_invalid", invalid))
             if any(balances[token] != quantity for token, quantity in quantities.items()):
-                return replace(strict, proof_failure=_proof_failure("rpc_disagreement", quantities))
+                disagreeing = (token for token, quantity in quantities.items()
+                               if balances[token] != quantity)
+                return replace(strict, proof_failure=_proof_failure("rpc_disagreement", disagreeing))
             proven = replace(remote, positions=tuple(
                 replace(p, size=quantities[p.token_id]) if p.token_id in quantities else p
                 for p in remote.positions
@@ -306,7 +314,7 @@ class Reconciler:
                 reason = "rpc_timeout"
             else:
                 reason = "rpc_error"
-            return replace(strict, proof_failure=_proof_failure(reason, quantities))
+            return replace(strict, proof_failure=_proof_failure(reason, strict.position_mismatches))
 
     def compare(self, local: LocalSnapshot, remote: RemoteSnapshot) -> ReconciliationReport:
         valid_local = (
