@@ -1089,6 +1089,8 @@ class LiveTradingRunner(LiveShadowRunner):
             },
             "entry_block_reason": entry_block,
             "weather_markets_evaluated": result.markets_evaluated,
+            "weather_awc_observation_only": getattr(result, "awc_observation_only", 0),
+            "weather_awc_rule_unverified": getattr(result, "awc_rule_unverified", 0),
             "weather_forecast_status": result.forecast_status,
             "weather_errors": len(result.errors),
             "weather_provider_failures": {
