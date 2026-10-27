@@ -1,6 +1,8 @@
 """Offline, deterministic paper-only campaign contract tests."""
 import json
 import hashlib
+import os
+import signal
 import time
 from urllib.error import URLError
 from datetime import datetime, timezone
@@ -10,6 +12,7 @@ import pytest
 
 from src.v3.awc_campaign import Campaign, Config, validate_event, report, _canonical, _label, public_fetch
 from src.v3.awc_metar_observation import _REQUIRED_RULES
+from src.v3 import awc_campaign
 
 @pytest.fixture(autouse=True)
 def reviewed_test_root(tmp_path, monkeypatch):
@@ -405,3 +408,156 @@ def test_cycle_deadline_takes_priority_over_awc_request_timeout(tmp_path, monkey
     with pytest.raises(ValueError, match='cycle wall budget exhausted'):
         Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW).once()
     assert not list(tmp_path.glob('*.json'))
+
+
+def _offline_fetch(event):
+    def fetch(url, limit):
+        if 'gamma-api' in url:
+            return json.dumps(event).encode(), {}
+        if 'open-meteo' in url:
+            return b'{"hourly":{}}', {}
+        if 'clob.polymarket.com' in url:
+            return json.dumps({'market': event['markets'][0]['conditionId'], 'asset_id': '123',
+                               'timestamp': '1793102400000', 'bids': [], 'asks': []}).encode(), {}
+        return b'', {'Status': 204}
+    return fetch
+
+
+@pytest.mark.parametrize('interruption', ['open_after_creation', 'fsync'])
+def test_alarm_during_append_never_publishes_incomplete_sequence(tmp_path, monkeypatch, interruption):
+    config, event = fixture()
+    campaign = Campaign(tmp_path, config, fetch=_offline_fetch(event), clock=lambda: NOW)
+    real_open, real_fsync = os.open, os.fsync
+    fired = False
+    def interrupted_open(path, flags, *args, **kwargs):
+        nonlocal fired
+        fd = real_open(path, flags, *args, **kwargs)
+        if interruption == 'open_after_creation' and str(path).endswith('.tmp') and not fired:
+            fired = True
+            os.close(fd)
+            raise ValueError('cycle wall budget exhausted')
+        return fd
+    def interrupted_fsync(fd):
+        nonlocal fired
+        if interruption == 'fsync' and not fired:
+            fired = True
+            raise ValueError('cycle wall budget exhausted')
+        return real_fsync(fd)
+    with monkeypatch.context() as patch:
+        patch.setattr(awc_campaign.os, 'open', interrupted_open)
+        patch.setattr(awc_campaign.os, 'fsync', interrupted_fsync)
+        with pytest.raises(ValueError, match='cycle wall budget exhausted'):
+            campaign.once()
+    assert fired
+    assert report(tmp_path)['cycles'] == 0
+    assert not list(tmp_path.glob('*.json'))
+    assert not list(tmp_path.glob('*.tmp'))
+    assert campaign.once()['sequence'] == 0
+    assert report(tmp_path)['cycles'] == 1
+
+
+def test_exclusive_publish_cannot_replace_competing_sequence(tmp_path, monkeypatch):
+    config, event = fixture()
+    campaign = Campaign(tmp_path, config, fetch=_offline_fetch(event), clock=lambda: NOW)
+    real_link = os.link
+    competing = _canonical({'sequence': 0, 'previous_sha256': None, 'event_id': 'other',
+                            'target_date': config.target_date, 'captured_at': NOW.isoformat(),
+                            'label': {'status': 'unverified'}})
+    def race(src, dst, *args, **kwargs):
+        (tmp_path / dst).write_bytes(competing)
+        return real_link(src, dst, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(awc_campaign.os, 'link', race)
+        with pytest.raises(FileExistsError):
+            campaign.once()
+    assert (tmp_path / '000000.json').read_bytes() == competing
+    assert report(tmp_path)['cycles'] == 1
+    assert not list(tmp_path.glob('*.tmp'))
+
+
+def test_real_cycle_alarm_during_temp_fsync_leaves_tape_retryable(tmp_path, monkeypatch):
+    config, event = fixture()
+    campaign = Campaign(tmp_path, config, fetch=_offline_fetch(event), clock=lambda: NOW)
+    real_fsync = os.fsync
+    monkeypatch.setattr(awc_campaign, 'CYCLE_WALL_SECONDS', 0.02)
+    def slow_fsync(fd):
+        time.sleep(0.08)
+        return real_fsync(fd)
+    with monkeypatch.context() as patch:
+        patch.setattr(awc_campaign.os, 'fsync', slow_fsync)
+        with pytest.raises(ValueError, match='cycle wall budget exhausted'):
+            campaign.once()
+    assert report(tmp_path)['cycles'] == 0
+    assert not list(tmp_path.glob('*.tmp'))
+    monkeypatch.setattr(awc_campaign, 'CYCLE_WALL_SECONDS', 60)
+    assert campaign.once()['sequence'] == 0
+
+
+def test_alarm_during_wall_cleanup_restores_handler_and_timer(monkeypatch):
+    if not hasattr(signal, 'setitimer'):
+        pytest.skip('POSIX timer required')
+    previous = signal.getsignal(signal.SIGALRM)
+    real_setitimer = signal.setitimer
+    triggered = False
+    def interrupt_disarm(which, seconds, *args):
+        nonlocal triggered
+        if seconds == 0 and not triggered:
+            triggered = True
+            awc_campaign._alarm(signal.SIGALRM, None)
+        return real_setitimer(which, seconds, *args)
+    with monkeypatch.context() as patch:
+        patch.setattr(awc_campaign.signal, 'setitimer', interrupt_disarm)
+        with awc_campaign._wall_bound(1, ValueError('outer expired')):
+            with awc_campaign._wall_bound(0.5, TimeoutError('inner expired')):
+                pass
+    assert triggered
+    assert awc_campaign._deadlines == []
+    assert signal.getsignal(signal.SIGALRM) is previous
+    assert signal.getitimer(signal.ITIMER_REAL)[0] == 0
+
+
+def test_pending_alarm_during_disarm_is_not_delivered_to_previous_handler(monkeypatch):
+    previous = signal.getsignal(signal.SIGALRM)
+    delivered = []
+    signal.signal(signal.SIGALRM, lambda *_: delivered.append('stale'))
+    real_setitimer = signal.setitimer
+    sent = False
+    def pending_disarm(which, seconds, *args):
+        nonlocal sent
+        if seconds == 0 and not sent:
+            sent = True
+            signal.raise_signal(signal.SIGALRM)
+        return real_setitimer(which, seconds, *args)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(awc_campaign.signal, 'setitimer', pending_disarm)
+            with awc_campaign._wall_bound(1, ValueError('expired')):
+                pass
+        assert sent and not delivered
+        assert awc_campaign._deadlines == []
+        assert signal.getitimer(signal.ITIMER_REAL)[0] == 0
+    finally:
+        signal.signal(signal.SIGALRM, previous)
+
+
+def test_alarm_on_nested_entry_unmask_rolls_back_both_bounds(monkeypatch):
+    previous = signal.getsignal(signal.SIGALRM)
+    real_sigmask = signal.pthread_sigmask
+    sent = False
+    def alarm_at_unmask(how, mask):
+        nonlocal sent
+        if how == signal.SIG_SETMASK and len(awc_campaign._deadlines) == 2 and not sent:
+            sent = True
+            d, error = awc_campaign._deadlines[0]
+            awc_campaign._deadlines[0] = (time.monotonic() - 1, error)
+            signal.raise_signal(signal.SIGALRM)
+        return real_sigmask(how, mask)
+    with monkeypatch.context() as patch:
+        patch.setattr(awc_campaign.signal, 'pthread_sigmask', alarm_at_unmask)
+        with pytest.raises(ValueError, match='outer expired'):
+            with awc_campaign._wall_bound(1, ValueError('outer expired')):
+                with awc_campaign._wall_bound(1, TimeoutError('inner expired')):
+                    pytest.fail('should not enter inner bound')
+    assert sent and awc_campaign._deadlines == []
+    assert signal.getsignal(signal.SIGALRM) is previous
+    assert signal.getitimer(signal.ITIMER_REAL)[0] == 0

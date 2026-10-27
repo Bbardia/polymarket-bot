@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import signal
 import stat
 import threading
@@ -41,34 +42,74 @@ def _alarm(_signum, _frame):
     for deadline, error in _deadlines:
         if now >= deadline:
             raise error
-    signal.setitimer(signal.ITIMER_REAL, max(0.000001, min(d for d, _ in _deadlines) - now))
+    if _deadlines:
+        signal.setitimer(signal.ITIMER_REAL, max(0.000001, min(d for d, _ in _deadlines) - now))
 
 
 @contextmanager
 def _wall_bound(seconds, error):
     """Interrupt blocked reads, including slow trickles. Main-thread POSIX only."""
-    if threading.current_thread() is not threading.main_thread() or not hasattr(signal, 'setitimer'):
+    if (threading.current_thread() is not threading.main_thread() or
+            not all(hasattr(signal, name) for name in ('setitimer', 'pthread_sigmask', 'sigpending', 'sigwait'))):
         raise ValueError('wall deadline requires POSIX main thread')
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
     outer = not _deadlines
     previous = None
-    if outer:
-        if signal.getitimer(signal.ITIMER_REAL)[0]:
-            raise ValueError('pre-existing alarm prevents safe wall deadline')
-        previous = signal.signal(signal.SIGALRM, _alarm)
-    deadline = time.monotonic() + seconds
-    _deadlines.append((deadline, error))
-    signal.setitimer(signal.ITIMER_REAL, max(0.000001, min(d for d, _ in _deadlines) - time.monotonic()))
+    added = False
+    try:
+        if signal.SIGALRM in previous_mask:
+            raise ValueError('blocked alarm prevents safe wall deadline')
+        if outer:
+            if signal.getitimer(signal.ITIMER_REAL)[0]:
+                raise ValueError('pre-existing alarm prevents safe wall deadline')
+            previous = signal.signal(signal.SIGALRM, _alarm)
+        deadline = time.monotonic() + seconds
+        _deadlines.append((deadline, error))
+        added = True
+        signal.setitimer(signal.ITIMER_REAL, max(0.000001, min(d for d, _ in _deadlines) - time.monotonic()))
+        # An overdue outer alarm can be delivered while unmasking, before
+        # contextmanager has yielded. Roll it back through the same path.
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+        try:
+            if added:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                _deadlines.pop()
+            if signal.SIGALRM in signal.sigpending():
+                signal.sigwait({signal.SIGALRM})
+            if outer and previous is not None:
+                signal.signal(signal.SIGALRM, previous)
+            elif added:
+                signal.setitimer(signal.ITIMER_REAL, max(0.000001, min(d for d, _ in _deadlines) - time.monotonic()))
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        raise
     try:
         yield
-        if time.monotonic() >= deadline:
-            _alarm(0, None)
     finally:
-        _deadlines.pop()
-        if outer:
+        try:
+            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+        except BaseException:
+            # A callback can run immediately after the mask syscall returns;
+            # still finish teardown rather than leaving a live timer/handler.
+            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+        try:
+            # Disarm before changing the stack, and consume an already pending
+            # timer before restoring the caller's handler on the outer exit.
             signal.setitimer(signal.ITIMER_REAL, 0)
-            signal.signal(signal.SIGALRM, previous)
-        else:
-            signal.setitimer(signal.ITIMER_REAL, max(0.000001, min(d for d, _ in _deadlines) - time.monotonic()))
+            expired = next((exc for d, exc in _deadlines if time.monotonic() >= d), None)
+            _deadlines.pop()
+            if signal.SIGALRM in signal.sigpending():
+                signal.sigwait({signal.SIGALRM})
+            if outer:
+                signal.signal(signal.SIGALRM, previous)
+            else:
+                signal.setitimer(signal.ITIMER_REAL, max(0.000001, min(d for d, _ in _deadlines) - time.monotonic()))
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        if expired is not None:
+            raise expired
 
 
 @contextmanager
@@ -404,20 +445,41 @@ class Campaign:
                   'label': {'status': 'unverified', 'reason': 'AWC unavailable: ' + awc_reason} if awc_reason else
                            _label(market, event=event, target_date=self.config.target_date,
                                   fetched_at=captures['gamma']['first_available_at'])}
-        # Exclusive append, no overwrite. Only bounded AWC absence/timeouts allow partial rows.
+        # Publish only a complete, fsynced row; a signal during creation must
+        # never leave a numbered entry that blocks the sequence permanently.
         body = _canonical(record)
         with _directory_fd(self.directory, create=True) as dirfd:
             name = f'{len(rows):06d}.json'
-            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                         0o600, dir_fd=dirfd)
+            temp = f'.{name}.{secrets.token_hex(16)}.tmp'
             try:
+                fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=dirfd)
                 with os.fdopen(fd, 'wb') as f:
                     f.write(body)
                     f.flush()
                     os.fsync(f.fileno())
-            except BaseException:
-                os.unlink(name, dir_fd=dirfd)  # Never leave a half-written sequence entry.
-                raise
+                # Hard-link is atomic and exclusive: rename could replace a
+                # concurrent writer's numbered entry. Keep the alarm masked
+                # only for this short publish/cleanup critical section.
+                previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+                try:
+                    now = time.monotonic()
+                    for deadline, wall_error in _deadlines:
+                        if now >= deadline:
+                            raise wall_error
+                    os.link(temp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd, follow_symlinks=False)
+                    os.unlink(temp, dir_fd=dirfd)
+                finally:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            finally:
+                previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+                try:
+                    try:
+                        os.unlink(temp, dir_fd=dirfd)
+                    except FileNotFoundError:
+                        pass
+                finally:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         return {'status': status, 'sequence': record['sequence'], 'label': record['label']['status'], 'paper_only': True}
 
 
