@@ -1,6 +1,7 @@
 """Offline, deterministic paper-only campaign contract tests."""
 import json
 import hashlib
+import time
 from urllib.error import URLError
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,6 +10,10 @@ import pytest
 
 from src.v3.awc_campaign import Campaign, Config, validate_event, report, _canonical, _label, public_fetch
 from src.v3.awc_metar_observation import _REQUIRED_RULES
+
+@pytest.fixture(autouse=True)
+def reviewed_test_root(tmp_path, monkeypatch):
+    monkeypatch.setattr('src.v3.awc_campaign.APPROVED_OUTPUT_ROOT', tmp_path)
 
 
 RULES = '\n'.join(_REQUIRED_RULES)
@@ -287,3 +292,116 @@ def test_public_fetch_204_other_sources_is_failure(monkeypatch):
     monkeypatch.setattr('src.v3.awc_campaign.build_opener', lambda *args: type('Opener', (), {'open': lambda *args, **kwargs: Response()})())
     with pytest.raises(ValueError, match='non-200'):
         public_fetch('https://gamma-api.polymarket.com/events/slug/' + SLUG, 100)
+
+def test_unapproved_or_symlinked_directory_refused_before_fetch(tmp_path):
+    config, _ = fixture()
+    outside = tmp_path.parent / 'unapproved-output'
+    outside.mkdir(exist_ok=True)
+    (tmp_path / 'link').symlink_to(outside, target_is_directory=True)
+    def no_fetch(*_):
+        raise AssertionError('network before path validation')
+    for directory in (outside, tmp_path / 'link', tmp_path / 'link' / 'nested',
+                      tmp_path / '..' / outside.name):
+        with pytest.raises(ValueError, match='output|symlink'):
+            Campaign(directory, config, fetch=no_fetch, clock=lambda: NOW).once()
+        with pytest.raises(ValueError, match='output|symlink'):
+            report(directory)
+    assert not (outside / 'nested').exists()
+
+def test_symlinked_tape_entry_refused_without_reading_target_or_fetch(tmp_path):
+    config, _ = fixture()
+    target = tmp_path.parent / 'external-tape.json'
+    target.write_text('private')
+    (tmp_path / '000000.json').symlink_to(target)
+    def no_fetch(*_):
+        raise AssertionError('network before tape validation')
+    with pytest.raises(ValueError, match='symlink|tape'):
+        Campaign(tmp_path, config, fetch=no_fetch, clock=lambda: NOW).once()
+    with pytest.raises(ValueError, match='symlink|tape'):
+        report(tmp_path)
+    assert target.read_text() == 'private'
+
+def test_public_fetch_slow_trickle_is_interrupted_by_wall_deadline(monkeypatch):
+    class Response:
+        status = 200
+        headers = {}
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+        def read(self, size):
+            time.sleep(0.06)
+            return b'x'
+    class Opener:
+        def open(self, *args, **kwargs): return Response()
+    monkeypatch.setattr('src.v3.awc_campaign.build_opener', lambda *args: Opener())
+    monkeypatch.setattr('src.v3.awc_campaign.REQUEST_WALL_SECONDS', 0.12)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match='timed out'):
+        public_fetch(SOURCE, 10000)
+    assert time.monotonic() - started < 0.6
+
+def test_cycle_wall_deadline_interrupts_blocked_fetch_without_partial_row(tmp_path, monkeypatch):
+    config, _ = fixture()
+    monkeypatch.setattr('src.v3.awc_campaign.CYCLE_WALL_SECONDS', 0.12)
+    def blocked(*_):
+        time.sleep(0.8)
+        raise AssertionError('not interrupted')
+    started = time.monotonic()
+    with pytest.raises(ValueError, match='cycle wall budget exhausted'):
+        Campaign(tmp_path, config, fetch=blocked, clock=lambda: NOW).once()
+    assert time.monotonic() - started < 0.6
+    assert not list(tmp_path.glob('*.json'))
+
+def test_symlinked_parent_within_approved_root_is_refused(tmp_path):
+    config, _ = fixture()
+    (tmp_path / 'real').mkdir()
+    (tmp_path / 'alias').symlink_to(tmp_path / 'real', target_is_directory=True)
+    with pytest.raises(ValueError, match='symlink'):
+        Campaign(tmp_path / 'alias', config, fetch=lambda *_: pytest.fail('unexpected fetch'),
+                 clock=lambda: NOW).once()
+
+def test_directory_replaced_after_preflight_cannot_redirect_append(tmp_path):
+    config, event = fixture()
+    inside = tmp_path / 'capture'
+    inside.mkdir()
+    outside = tmp_path.parent / 'redirected-capture'
+    outside.mkdir(exist_ok=True)
+    def fetch(url, limit):
+        if 'gamma-api' in url:
+            inside.rename(tmp_path / 'original')
+            inside.symlink_to(outside, target_is_directory=True)
+            return json.dumps(event).encode(), {}
+        if 'open-meteo' in url:
+            return b'{"hourly":{}}', {}
+        if 'clob.polymarket.com' in url:
+            return json.dumps({'market': event['markets'][0]['conditionId'], 'asset_id': '123',
+                               'timestamp': '1793102400000', 'bids': [], 'asks': []}).encode(), {}
+        return b'', {'Status': 204}
+    with pytest.raises(ValueError, match='symlink'):
+        Campaign(inside, config, fetch=fetch, clock=lambda: NOW).once()
+    assert not list(outside.glob('*.json'))
+
+def test_cycle_deadline_takes_priority_over_awc_request_timeout(tmp_path, monkeypatch):
+    config, event = fixture()
+    monkeypatch.setattr('src.v3.awc_campaign.CYCLE_WALL_SECONDS', 0.12)
+    monkeypatch.setattr('src.v3.awc_campaign.REQUEST_WALL_SECONDS', 0.5)
+    class Response:
+        status = 200
+        headers = {}
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+        def read(self, size):
+            time.sleep(0.8)
+            return b'x'
+    def fetch(url, limit):
+        if 'gamma-api' in url:
+            return json.dumps(event).encode(), {}
+        if 'open-meteo' in url:
+            return b'{"hourly":{}}', {}
+        if 'clob.polymarket.com' in url:
+            return json.dumps({'market': event['markets'][0]['conditionId'], 'asset_id': '123',
+                               'timestamp': '1793102400000', 'bids': [], 'asks': []}).encode(), {}
+        return public_fetch(SOURCE, limit)
+    monkeypatch.setattr('src.v3.awc_campaign.build_opener', lambda *args: type('Opener', (), {'open': lambda *a, **kw: Response()})())
+    with pytest.raises(ValueError, match='cycle wall budget exhausted'):
+        Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW).once()
+    assert not list(tmp_path.glob('*.json'))

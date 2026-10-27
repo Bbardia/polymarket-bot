@@ -9,8 +9,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+import signal
+import stat
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +30,77 @@ MAX_CYCLES = 180  # 4/day for 45 days, independent hard disk bound
 MAX_RESOLVED_DAYS = 30
 MAX_DAYS = 45
 LIMITS = {'gamma': 1_000_000, 'forecast': 300_000, 'book': 512_000, 'awc': 256_000}
+APPROVED_OUTPUT_ROOT = Path(__file__).absolute().parents[2] / 'data' / 'awc-campaign'
+REQUEST_WALL_SECONDS = 12
+CYCLE_WALL_SECONDS = 60
+_deadlines = []
+
+
+def _alarm(_signum, _frame):
+    now = time.monotonic()
+    for deadline, error in _deadlines:
+        if now >= deadline:
+            raise error
+    signal.setitimer(signal.ITIMER_REAL, max(0.000001, min(d for d, _ in _deadlines) - now))
+
+
+@contextmanager
+def _wall_bound(seconds, error):
+    """Interrupt blocked reads, including slow trickles. Main-thread POSIX only."""
+    if threading.current_thread() is not threading.main_thread() or not hasattr(signal, 'setitimer'):
+        raise ValueError('wall deadline requires POSIX main thread')
+    outer = not _deadlines
+    previous = None
+    if outer:
+        if signal.getitimer(signal.ITIMER_REAL)[0]:
+            raise ValueError('pre-existing alarm prevents safe wall deadline')
+        previous = signal.signal(signal.SIGALRM, _alarm)
+    deadline = time.monotonic() + seconds
+    _deadlines.append((deadline, error))
+    signal.setitimer(signal.ITIMER_REAL, max(0.000001, min(d for d, _ in _deadlines) - time.monotonic()))
+    try:
+        yield
+        if time.monotonic() >= deadline:
+            _alarm(0, None)
+    finally:
+        _deadlines.pop()
+        if outer:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+        else:
+            signal.setitimer(signal.ITIMER_REAL, max(0.000001, min(d for d, _ in _deadlines) - time.monotonic()))
+
+
+@contextmanager
+def _directory_fd(directory: Path, *, create=False):
+    """Walk from / using directory handles; never follow a replaced component."""
+    root = Path(os.path.abspath(APPROVED_OUTPUT_ROOT))
+    target = Path(os.path.abspath(directory))
+    if target != root and root not in target.parents:
+        raise ValueError('output outside approved research root')
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        missing = False
+        for component in target.parts[1:]:
+            if missing:
+                break
+            try:
+                child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    missing = True
+                    continue
+                os.mkdir(component, mode=0o700, dir_fd=fd)
+                child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError as exc:
+                raise ValueError('symlink or invalid output directory component') from exc
+            os.close(fd)
+            fd = child
+        yield None if missing else fd
+    finally:
+        os.close(fd)
+
+
 _SLUG = re.compile(r'highest-temperature-in-[a-z]+(?:-[a-z]+)*-on-[a-z]+-\d{1,2}-20\d{2}')
 _STATION = re.compile(r'[A-Z]{4}')
 _ID = re.compile(r'[0-9]{1,32}')
@@ -126,8 +202,12 @@ def public_fetch(url: str, limit: int) -> tuple[bytes, dict]:
             or parts.username or parts.password or parts.port or parts.fragment):
         raise ValueError('non-public endpoint')
     # Never inherit proxy configuration (which can contain credentials).
-    opener = build_opener(ProxyHandler({}), _NoRedirect)
-    deadline = time.monotonic() + 12
+    with _wall_bound(REQUEST_WALL_SECONDS, TimeoutError('public request timed out')):
+        opener = build_opener(ProxyHandler({}), _NoRedirect)
+        return _fetch_response(opener, url, parts, limit)
+
+
+def _fetch_response(opener, url, parts, limit):
     try:
         with opener.open(Request(url, headers={'User-Agent': 'awc-paper-observation/1.0', 'Accept': 'application/json, text/plain'}), timeout=10) as response:
             if response.status != 200 and not (parts.hostname == 'aviationweather.gov' and response.status == 204):
@@ -137,8 +217,6 @@ def public_fetch(url: str, limit: int) -> tuple[bytes, dict]:
                 raise ValueError('response exceeds byte limit')
             chunks = bytearray()
             while True:
-                if time.monotonic() > deadline:
-                    raise ValueError('request wall budget exhausted')
                 chunk = response.read(min(16384, limit + 1 - len(chunks)))
                 chunks.extend(chunk)
                 if len(chunks) > limit:
@@ -165,21 +243,32 @@ def _canonical(record: dict) -> bytes:
 
 
 def _records(directory: Path) -> list[tuple[dict, str]]:
-    paths = sorted(directory.glob('*.json')) if directory.exists() else []
-    if len(paths) > MAX_CYCLES:
-        raise ValueError('cycle cap exceeded')
-    records = []
-    prev = None
-    for i, path in enumerate(paths):
-        if path.name != f'{i:06d}.json' or path.stat().st_size > 2_200_000:
-            raise ValueError('tape sequence or size mismatch')
-        body = path.read_bytes()
-        record = json.loads(body)
-        if body != _canonical(record) or record.get('sequence') != i or record.get('previous_sha256') != prev:
-            raise ValueError('tape continuity mismatch')
-        prev = hashlib.sha256(body).hexdigest()
-        records.append((record, prev))
-    return records
+    with _directory_fd(directory) as dirfd:
+        paths = sorted(name for name in os.listdir(dirfd) if name.endswith('.json')) if dirfd is not None else []
+        if len(paths) > MAX_CYCLES:
+            raise ValueError('cycle cap exceeded')
+        records = []
+        prev = None
+        for i, name in enumerate(paths):
+            if name != f'{i:06d}.json':
+                raise ValueError('tape sequence mismatch')
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd)
+            except OSError as exc:
+                raise ValueError('symlink or invalid tape entry') from exc
+            with os.fdopen(fd, 'rb') as file:
+                info = os.fstat(file.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 2_200_000:
+                    raise ValueError('tape sequence or size mismatch')
+                body = file.read(2_200_001)
+            if len(body) > 2_200_000:
+                raise ValueError('tape size mismatch')
+            record = json.loads(body)
+            if body != _canonical(record) or record.get('sequence') != i or record.get('previous_sha256') != prev:
+                raise ValueError('tape continuity mismatch')
+            prev = hashlib.sha256(body).hexdigest()
+            records.append((record, prev))
+        return records
 
 
 def report(directory: Path) -> dict:
@@ -228,6 +317,10 @@ class Campaign:
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     def once(self) -> dict:
+        with _wall_bound(CYCLE_WALL_SECONDS, ValueError('cycle wall budget exhausted')):
+            return self._once()
+
+    def _once(self) -> dict:
         now = self.clock().astimezone(timezone.utc)
         rows = _records(self.directory)
         if rows and any(r.get('campaign_start_at') != self.config.start_at or
@@ -243,22 +336,17 @@ class Campaign:
             return {'status': 'already_captured', 'paper_only': True}
         urls = {'gamma': 'https://gamma-api.polymarket.com/events/slug/' + self.config.slug}
         captures = {}
-        cycle_deadline = time.monotonic() + 60
         def get(kind, url):
-            if time.monotonic() > cycle_deadline:
-                raise ValueError('cycle wall budget exhausted')
             start = self.clock().astimezone(timezone.utc).isoformat()
             try:
                 body, headers = self.fetch(url, LIMITS[kind])
             except TimeoutError:
-                if kind != 'awc' or time.monotonic() > cycle_deadline:
+                if kind != 'awc':
                     raise
                 captures[kind] = {'url': url, 'request_at': start,
                                   'failed_at': self.clock().astimezone(timezone.utc).isoformat(),
                                   'status': 'timeout', 'failure_code': 'timeout'}
                 return None
-            if time.monotonic() > cycle_deadline:
-                raise ValueError('cycle wall budget exhausted')
             if not isinstance(body, bytes) or len(body) > LIMITS[kind]:
                 raise ValueError('oversized or invalid response')
             status = headers.get('Status', 200)
@@ -316,14 +404,20 @@ class Campaign:
                   'label': {'status': 'unverified', 'reason': 'AWC unavailable: ' + awc_reason} if awc_reason else
                            _label(market, event=event, target_date=self.config.target_date,
                                   fetched_at=captures['gamma']['first_available_at'])}
-        self.directory.mkdir(parents=True, exist_ok=True)
-        path = self.directory / f'{len(rows):06d}.json'
         # Exclusive append, no overwrite. Only bounded AWC absence/timeouts allow partial rows.
-        with path.open('xb') as f:
-            f.write(_canonical(record))
-            f.flush()
-            import os
-            os.fsync(f.fileno())
+        body = _canonical(record)
+        with _directory_fd(self.directory, create=True) as dirfd:
+            name = f'{len(rows):06d}.json'
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600, dir_fd=dirfd)
+            try:
+                with os.fdopen(fd, 'wb') as f:
+                    f.write(body)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except BaseException:
+                os.unlink(name, dir_fd=dirfd)  # Never leave a half-written sequence entry.
+                raise
         return {'status': status, 'sequence': record['sequence'], 'label': record['label']['status'], 'paper_only': True}
 
 
