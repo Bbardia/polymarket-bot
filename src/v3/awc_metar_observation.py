@@ -120,7 +120,10 @@ def parse_raw_observations(raw: str, *, station: str, target_date: date,
             raise ValueError('ambiguous remark')
         body = tokens[:remark_positions[0]] if remark_positions else tokens
         remarks = tokens[remark_positions[0] + 1:] if remark_positions else []
-        t_tokens = [token for token in remarks if token.startswith('T') and len(token) > 1 and token[1].isdigit()]
+        # Reject malformed T-like groups (including T/...) rather than using
+        # a plausible body value; ordinary text groups such as TSNO are not T remarks.
+        t_tokens = [token for token in remarks if token.startswith('T')
+                    and (len(token) == 1 or not token[1].isalpha())]
         if any(_REMARK.fullmatch(token) is None for token in t_tokens) or len(t_tokens) > 1:
             raise ValueError('malformed or ambiguous hourly T remark')
         if t_tokens:
@@ -135,6 +138,9 @@ def parse_raw_observations(raw: str, *, station: str, target_date: date,
                 continue
             first = values[0].split('/')[0]
             temperature = Decimal(int(first[1:] if first.startswith('M') else first) * (-1 if first.startswith('M') else 1))
+        # This AWC market rounds exact halves to the next *higher* whole degree:
+        # -8.5 -> -8, unlike the generic ROUND_HALF_UP helper (-8.5 -> -9).
+        # Source: https://gamma-api.polymarket.com/events/slug/highest-temperature-in-karachi-on-october-28-2026
         item = AWCRawObservation(stamp, temperature, int((temperature + Decimal('0.5')).to_integral_value(rounding=ROUND_FLOOR)), line)
         if stamp in rows and rows[stamp].raw != line:
             raise ValueError('multiple report versions for observation time; correction order unknown')

@@ -48,7 +48,12 @@ def test_station_and_rule_drift_rejected():
     assert not inspect_awc_source(URL, station='OPKC', target_date=date(2026, 10, 28), timezone_name='Asia/Karachi', description=RULES.replace('does not count', 'does count')).observation_only
 
 
-def test_discovery_funnel_counts_awc_but_never_fetches_books_or_forecasts():
+@pytest.mark.parametrize(('source', 'observation_only', 'unverified'), [
+    (URL, 1, 0),
+    (URL.replace('format=raw', 'format=json'), 0, 1),  # AWC identity is unparsed.
+    (URL.replace('hours=30', 'hours=2'), 0, 1),  # Parsed URL, insufficient day coverage.
+])
+def test_discovery_funnel_counts_awc_but_never_fetches_books_or_forecasts(source, observation_only, unverified):
     class Client:
         async def get_tag(self, *, slug):
             return SimpleNamespace(id=84)
@@ -62,7 +67,7 @@ def test_discovery_funnel_counts_awc_but_never_fetches_books_or_forecasts():
 
     market = SimpleNamespace(
         question='Will the highest temperature in Karachi be 32°C or below on October 28?',
-        description=RULES, resolution=SimpleNamespace(source=URL),
+        description=RULES, resolution=SimpleNamespace(source=source),
         state=SimpleNamespace(end_date=datetime(2026, 10, 28, 12, tzinfo=timezone.utc)),
         outcomes=SimpleNamespace(yes=SimpleNamespace(token_id='yes'), no=SimpleNamespace(token_id='no')),
         metrics=SimpleNamespace(liquidity_num=Decimal('10000')),
@@ -75,8 +80,8 @@ def test_discovery_funnel_counts_awc_but_never_fetches_books_or_forecasts():
         client=Client(), forecast=NoForecast(), policy=WeatherPaperPolicy(),
         now=datetime(2026, 10, 27, tzinfo=timezone.utc),
     ))
-    assert result.awc_observation_only == 1
-    assert result.awc_rule_unverified == 0
+    assert result.awc_observation_only == observation_only
+    assert result.awc_rule_unverified == unverified
     assert result.markets_discovered == result.markets_evaluated == 0
 
 
@@ -94,6 +99,15 @@ METAR OPKC 281900Z 00000KT 50/20 RMK T05000000'''
     assert [r.rounded_c for r in rows] == [14, -8, 16, 18, 20]
 
 
+def test_negative_half_tie_follows_awc_market_rule_not_generic_round_half_up():
+    rows = parse_raw_observations(
+        'OPKC 281200Z 00000KT M08/M17 RMK T10851000',
+        station='OPKC', target_date=date(2026, 10, 28), timezone_name='Asia/Karachi',
+    )
+    assert rows[0].temperature_c == Decimal('-8.5')
+    assert rows[0].rounded_c == -8  # Rules say next higher whole degree, not away from zero (-9).
+
+
 def test_corrected_snapshot_and_daylight_saving_boundary_are_observation_only():
     rows = parse_raw_observations(
         'METAR COR KLGA 010430Z 00000KT M01/M03 RMK T10050030\n'
@@ -108,6 +122,7 @@ def test_corrected_snapshot_and_daylight_saving_boundary_are_observation_only():
     'OPKC 281200Z 00000KT 19/10 RMK T01901000 T02001000',
     'OPKC 281200Z 00000KT 19/10 RMK T019010000',
     'OPKC 281200Z 00000KT 19/10 RMK T21901000',
+    'OPKC 281200Z 00000KT 19/10 RMK T/1901000',
     'OPKC 281200Z 00000KT 19/10 RMK T01901000\nOPKC 281200Z 00000KT 20/10 RMK T02001000',
     'KHI 281200Z 00000KT 19/10 RMK T01901000',
 ])

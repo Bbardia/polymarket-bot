@@ -2761,9 +2761,12 @@ async def evaluate_weather_universe(
         )
         source = getattr(market.resolution, "source", None)
         identity = parse_resolver_identity(source)
-        if identity.authority == "awc-metar-observation-only":
+        if identity.authority in {"awc-metar-observation-only", "awc-metar-unparsed"}:
+            # An unparsed AWC URL is diagnostic-only too; never promote it to
+            # observation-only status or let it enter the tradeable station path.
             timezone_name = CITY_TIMEZONES.get(contract.city) if contract else None
-            if (contract is not None and timezone_name is not None and isinstance(source, str)
+            if (identity.authority == "awc-metar-observation-only"
+                    and contract is not None and timezone_name is not None and isinstance(source, str)
                     and identity.station is not None and identity.station == CITY_STATIONS.get(contract.city)):
                 inspection = inspect_awc_source(
                     source, station=identity.station, target_date=date.fromisoformat(contract.target_date),
