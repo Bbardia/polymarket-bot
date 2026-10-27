@@ -8,6 +8,10 @@ from decimal import Decimal, ROUND_DOWN
 import re
 from typing import Any, Iterable
 
+import requests
+
+from .ctf_balance import CTFProofError
+
 ZERO = Decimal("0")
 TRADE_STATUSES = frozenset({"MATCHED", "MATCHED_NOT_BROADCASTED", "MINED", "CONFIRMED", "RETRYING", "FAILED"})
 TRADE_TRADER_SIDES = frozenset({"TAKER", "MAKER"})
@@ -202,6 +206,21 @@ class RemoteSnapshot:
 
 
 @dataclass(frozen=True)
+class CTFProofFailure:
+    """Only fixed categories and a small, validated subset of token identities."""
+
+    reason: str
+    token_ids: tuple[str, ...]
+
+
+def _proof_failure(reason: str, tokens: Iterable[str]) -> CTFProofFailure:
+    safe = sorted(token for token in tokens if isinstance(token, str)
+                  and 1 <= len(token) <= 78 and token.isascii() and token.isdecimal()
+                  and int(token) < 2**256)
+    return CTFProofFailure(reason, tuple(safe[:16]))
+
+
+@dataclass(frozen=True)
 class ReconciliationReport:
     safe_to_trade: bool
     cash_delta: Decimal
@@ -214,6 +233,7 @@ class ReconciliationReport:
     position_mismatches: tuple[str, ...] = ()
     invalid_snapshot: bool = False
     actions: tuple[object, ...] = ()
+    proof_failure: CTFProofFailure | None = None
 
 
 class Reconciler:
@@ -263,21 +283,30 @@ class Reconciler:
                     or any(quantity != by_token[token].size
                            and not _display_compatible(quantity, by_token[token].size)
                            for token, quantity in quantities.items())):
-                return strict
+                return replace(strict, proof_failure=_proof_failure("proof_ineligible", quantities))
             wallet = api.settings.wallet_address
             balances = await api.fetch_ctf_balances(wallet, tuple(sorted(quantities)))
-            if (not isinstance(balances, dict) or set(balances) != set(quantities)
-                    or any(not isinstance(quantity, Decimal) or not quantity.is_finite()
-                           or quantity <= ZERO or balances[token] != quantity
-                           for token, quantity in quantities.items())):
-                return strict
+            if not isinstance(balances, dict) or set(balances) != set(quantities):
+                return replace(strict, proof_failure=_proof_failure("rpc_incomplete", quantities))
+            if any(not isinstance(quantity, Decimal) or not quantity.is_finite()
+                   or quantity <= ZERO or not isinstance(balances[token], Decimal)
+                   or not balances[token].is_finite() for token, quantity in quantities.items()):
+                return replace(strict, proof_failure=_proof_failure("rpc_invalid", quantities))
+            if any(balances[token] != quantity for token, quantity in quantities.items()):
+                return replace(strict, proof_failure=_proof_failure("rpc_disagreement", quantities))
             proven = replace(remote, positions=tuple(
                 replace(p, size=quantities[p.token_id]) if p.token_id in quantities else p
                 for p in remote.positions
             ))
             return self.compare(local, proven)
-        except Exception:
-            return strict
+        except Exception as exc:
+            if isinstance(exc, CTFProofError):
+                reason = exc.category
+            elif isinstance(exc, (TimeoutError, requests.exceptions.Timeout)):
+                reason = "rpc_timeout"
+            else:
+                reason = "rpc_error"
+            return replace(strict, proof_failure=_proof_failure(reason, quantities))
 
     def compare(self, local: LocalSnapshot, remote: RemoteSnapshot) -> ReconciliationReport:
         valid_local = (

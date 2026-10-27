@@ -16,6 +16,16 @@ WALLET = re.compile(r"0x[0-9a-fA-F]{40}\Z")
 TOKEN = re.compile(r"[0-9]+\Z")
 
 
+class CTFProofError(ValueError):
+    """Proof failure with an allowlisted, non-sensitive diagnostic category."""
+
+    def __init__(self, category: str, message: str):
+        if category not in {"rpc_invalid", "rpc_incomplete", "rpc_disagreement", "rpc_stale"}:
+            raise ValueError("unknown CTF proof failure category")
+        self.category = category
+        super().__init__(message)
+
+
 def _rpc(endpoint: str, calls: list[dict]) -> dict[int, object]:
     session = requests.Session()
     session.trust_env = False
@@ -23,29 +33,32 @@ def _rpc(endpoint: str, calls: list[dict]) -> dict[int, object]:
         response = session.post(endpoint, json=calls, timeout=(5, 15))
         response.raise_for_status()
         if len(response.content) > 250_000:
-            raise ValueError("CTF RPC response exceeds size bound")
-        payload = response.json()
+            raise CTFProofError("rpc_invalid", "CTF RPC response exceeds size bound")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise CTFProofError("rpc_invalid", "invalid CTF RPC JSON") from exc
     finally:
         session.close()
     if not isinstance(payload, list) or len(payload) != len(calls):
-        raise ValueError("incomplete CTF RPC batch")
+        raise CTFProofError("rpc_incomplete", "incomplete CTF RPC batch")
     results: dict[int, object] = {}
     for item in payload:
         if (not isinstance(item, dict) or item.get("jsonrpc") != "2.0"
                 or type(item.get("id")) is not int or item["id"] in results
                 or item.get("error") is not None):
-            raise ValueError("invalid CTF RPC response")
+            raise CTFProofError("rpc_invalid", "invalid CTF RPC response")
         results[item["id"]] = item.get("result")
     if set(results) != {call["id"] for call in calls}:
-        raise ValueError("CTF RPC request mismatch")
+        raise CTFProofError("rpc_invalid", "CTF RPC request mismatch")
     return results
 
 
 def _hex(value: object, *, word: bool = False) -> int:
     if not isinstance(value, str) or not re.fullmatch(r"0x[0-9a-fA-F]+", value):
-        raise ValueError("invalid CTF RPC hex")
+        raise CTFProofError("rpc_invalid", "invalid CTF RPC hex")
     if word and len(value) != 66:
-        raise ValueError("invalid ERC-1155 ABI word")
+        raise CTFProofError("rpc_invalid", "invalid ERC-1155 ABI word")
     return int(value, 16)
 
 
@@ -63,12 +76,12 @@ def _read_balances(wallet: str, tokens: tuple[str, ...]) -> dict[str, Decimal]:
             {"jsonrpc": "2.0", "id": 2, "method": "eth_getBlockByNumber", "params": ["latest", False]},
         ])
         if _hex(header[1]) != 137 or not isinstance(header[2], dict):
-            raise ValueError("CTF RPC wrong chain or malformed block")
+            raise CTFProofError("rpc_invalid", "CTF RPC wrong chain or malformed block")
         block = header[2]
         height, stamp = _hex(block.get("number")), _hex(block.get("timestamp"))
         # Bor block timestamps may run a few seconds ahead of wall time.
         if not (-5 <= time.time() - stamp <= 45):
-            raise ValueError("CTF RPC stale or future block")
+            raise CTFProofError("rpc_stale", "CTF RPC stale or future block")
         calls = []
         for index, token in enumerate(tokens, 1):
             data = "0x" + BALANCE_OF + wallet[2:].zfill(64) + f"{int(token):064x}"
@@ -82,10 +95,10 @@ def _read_balances(wallet: str, tokens: tuple[str, ...]) -> dict[str, Decimal]:
         snapshots.append((height, stamp, {token: Decimal(_hex(balances[index], word=True)) / UNITS
                                           for index, token in enumerate(tokens, 1)}))
     if (time.monotonic() - started > 30
-            or any(not (-5 <= time.time() - stamp <= 45) for _, stamp, _ in snapshots)
-            or abs(snapshots[0][0] - snapshots[1][0]) > 12
-            or snapshots[0][2] != snapshots[1][2]):
-        raise ValueError("independent CTF RPC balances disagree or proof is stale")
+            or any(not (-5 <= time.time() - stamp <= 45) for _, stamp, _ in snapshots)):
+        raise CTFProofError("rpc_stale", "independent CTF RPC proof is stale")
+    if abs(snapshots[0][0] - snapshots[1][0]) > 12 or snapshots[0][2] != snapshots[1][2]:
+        raise CTFProofError("rpc_disagreement", "independent CTF RPC balances disagree")
     return snapshots[0][2]
 
 

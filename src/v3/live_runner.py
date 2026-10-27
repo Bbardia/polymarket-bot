@@ -928,6 +928,7 @@ class LiveTradingRunner(LiveShadowRunner):
                 "missing_orders": len(report.missing_orders),
                 "position_mismatches": len(report.position_mismatches),
                 "external_positions": len(report.external_positions),
+                "ctf_proof_failure": asdict(report.proof_failure) if report.proof_failure else None,
             },
         })
 
@@ -1070,6 +1071,7 @@ class LiveTradingRunner(LiveShadowRunner):
                         "missing_orders": len(final_report.missing_orders),
                         "position_mismatches": len(final_report.position_mismatches),
                         "external_positions": len(final_report.external_positions),
+                        "ctf_proof_failure": asdict(final_report.proof_failure) if final_report.proof_failure else None,
                     },
                 })
             except Exception as exc:

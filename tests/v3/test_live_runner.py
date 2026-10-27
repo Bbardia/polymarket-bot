@@ -1706,6 +1706,35 @@ def test_post_cycle_snapshot_failure_marks_status_unhealthy_and_blocked(tmp_path
     assert status["entry_block_reason"] == "post-cycle account verification failed"
 
 
+@pytest.mark.parametrize("post_submission", [False, True])
+def test_cycle_records_ctf_proof_failure_without_clearing_mismatch(tmp_path, monkeypatch, post_submission):
+    api = _API()
+    monkeypatch.setattr(api, "settings", SimpleNamespace(wallet_address="0x" + "2" * 40), raising=False)
+    async def failed_proof(wallet, tokens):
+        raise TimeoutError("private HTTP body")
+    monkeypatch.setattr(api, "fetch_ctf_balances", failed_proof, raising=False)
+    runner, store = _runner(tmp_path, monkeypatch, api=api)
+    _seed_managed_position(runner.ledger, token="11", shares="7.964043", price="0.50")
+    initial = RemoteSnapshot(D("233.1479785"),
+        (RemotePosition("cond", "11", D("7.964043"), D("4"), D("3.9820215")),), ())
+    rounded = RemoteSnapshot(initial.cash,
+        (RemotePosition("cond", "11", D("7.964"), D("4"), D("3.9820215")),), ())
+    api.snapshot_overrides = {1: initial if post_submission else rounded, 2: rounded}
+    status = asyncio.run(runner.run_cycle(now=NOW))
+    assert status["reconciliation"]["safe_to_trade"] is False
+    assert status["reconciliation"]["position_mismatches"] == 1
+    assert status["reconciliation"]["ctf_proof_failure"] == {
+        "reason": "rpc_timeout", "token_ids": ("11",),
+    }
+    assert "private" not in store.status_path.read_text()
+    if post_submission:
+        assert status["outcomes_this_cycle"] == {"accepted": 1}
+        assert status["entry_block_reason"] == "account reconciliation blocked entries after submission"
+    else:
+        assert status["outcomes_this_cycle"] == {"blocked": 1}
+        assert status["entry_block_reason"] == "account reconciliation blocked entries"
+
+
 @pytest.mark.parametrize("corruption", ["peak", "epoch", "day_start_missing"])
 def test_malformed_persisted_risk_baseline_blocks_before_account_reads(
     tmp_path, monkeypatch, corruption,

@@ -133,5 +133,94 @@ def test_chain_proof_cannot_hide_other_incompatible_position(monkeypatch):
         local, remote = snapshots()
         remote = RemoteSnapshot(remote.cash, (remote.positions[0],
             RemotePosition("c2", "22", D("1.5"), D("1"), D("1"))), ())
-        assert not (await Reconciler().compare_with_chain(local, remote, api)).safe_to_trade
+        report = await Reconciler().compare_with_chain(local, remote, api)
+        assert not report.safe_to_trade
+        assert report.proof_failure is not None
+        assert report.proof_failure.reason == "proof_ineligible"
+        assert api.calls == []
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("error,category", [
+    (TimeoutError("private key / HTTP body"), "rpc_timeout"),
+    (ctf_balance.CTFProofError("rpc_invalid", "invalid CTF RPC response"), "rpc_invalid"),
+    (RuntimeError("secret HTTP body"), "rpc_error"),
+])
+def test_failed_proof_records_fixed_category_and_safe_token_ids(error, category):
+    async def scenario():
+        api = FakeAPI()
+        async def fail(wallet, tokens):
+            raise error
+        api.fetch_ctf_balances = fail
+        local, remote = snapshots()
+        report = await Reconciler().compare_with_chain(local, remote, api)
+        assert not report.safe_to_trade
+        assert report.position_mismatches == ("11",)
+        assert report.proof_failure is not None
+        assert report.proof_failure.reason == category
+        assert report.proof_failure.token_ids == ("11", "22")
+        assert "secret" not in repr(report.proof_failure)
+        assert "private" not in repr(report.proof_failure)
+    asyncio.run(scenario())
+
+
+def test_partial_proof_and_chain_disagreement_remain_strict():
+    async def scenario():
+        api = FakeAPI()
+        local, remote = snapshots()
+        api.balances.pop("22")
+        partial = await Reconciler().compare_with_chain(local, remote, api)
+        assert not partial.safe_to_trade
+        assert partial.proof_failure is not None
+        assert partial.proof_failure.reason == "rpc_incomplete"
+        api.balances["22"] = D("1.999999")
+        drift = await Reconciler().compare_with_chain(local, remote, api)
+        assert not drift.safe_to_trade
+        assert drift.proof_failure is not None
+        assert drift.proof_failure.reason == "rpc_disagreement"
+        api.balances["22"] = D("2")
+        success = await Reconciler().compare_with_chain(local, remote, api)
+        assert success.safe_to_trade and success.proof_failure is None
+    asyncio.run(scenario())
+
+
+def test_proof_diagnostic_ids_are_bounded_and_validated():
+    async def scenario():
+        quantities = {str(i): D("2") for i in range(1, 31)}
+        quantities["1"] = D("7.964043")
+        quantities["leak:credential"] = D("2")
+        local = LocalSnapshot(D("10"), frozenset(quantities), frozenset(), quantities,
+                              {token: D("1") for token in quantities})
+        remote = RemoteSnapshot(D("10"), tuple(
+            RemotePosition("c", token, D("7.964") if token == "1" else D("2"),
+                           D("1"), D("1")) for token in quantities), ())
+        api = FakeAPI()
+        async def reject(wallet, tokens):
+            raise ValueError("invalid CTF balance request: leak:credential")
+        api.fetch_ctf_balances = reject
+        result = await Reconciler().compare_with_chain(local, remote, api)
+        assert not result.safe_to_trade
+        assert result.proof_failure is not None
+        assert result.proof_failure.reason == "rpc_error"
+        assert len(result.proof_failure.token_ids) <= 16
+        assert all(token.isascii() and token.isdecimal() for token in result.proof_failure.token_ids)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fault,category", [
+    ("malformed", "rpc_invalid"), ("stale", "rpc_stale"),
+    ("disagree", "rpc_disagreement"),
+])
+def test_rpc_proof_errors_carry_fixed_categories(monkeypatch, fault, category):
+    def rpc(endpoint, requests):
+        if requests[0]["method"] == "eth_chainId":
+            stamp = int(ctf_balance.time.time()) - (300 if fault == "stale" else 0)
+            return {1: "0x89", 2: {"number": "0x123", "timestamp": hex(stamp)}}
+        if fault == "malformed":
+            raise ctf_balance.CTFProofError("rpc_invalid", "invalid CTF RPC response")
+        value = 7964044 if endpoint == ctf_balance.RPC_ENDPOINTS[1] else 7964043
+        return {1: "0x" + f"{value:064x}"}
+    monkeypatch.setattr(ctf_balance, "_rpc", rpc)
+    with pytest.raises(ctf_balance.CTFProofError) as raised:
+        ctf_balance._read_balances(WALLET, ("11",))
+    assert raised.value.category == category
