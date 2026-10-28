@@ -9,7 +9,7 @@ from urllib.error import HTTPError, URLError
 from io import BytesIO
 from email.message import Message
 from urllib.parse import parse_qs, urlsplit
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -112,7 +112,7 @@ def test_two_exact_books_and_strict_seven_get_ceiling(tmp_path):
 @pytest.mark.parametrize('bad', [
     {'asset_id': '999'}, {'asset_id': '123'}, {'market': '0x' + 'b'*64},
     {'timestamp': '179310240000'}, {'timestamp': '1793102400001.0'},
-    {'timestamp': '1793102406000'}, {'timestamp': '1793000000000'},
+    {'timestamp': '1793102406000'},
 ])
 def test_no_book_identity_and_time_fail_closed(tmp_path, bad):
     config, event = fixture()
@@ -127,6 +127,82 @@ def test_no_book_identity_and_time_fail_closed(tmp_path, bad):
     with pytest.raises(ValueError, match='book identity/timestamp'):
         Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW).once()
     assert not list(tmp_path.glob('*.json'))
+
+
+@pytest.mark.parametrize('stale_side', ['Yes', 'No', 'both'])
+@pytest.mark.parametrize('awc_status', [200, 204])
+def test_stale_identity_valid_books_keep_raw_evidence_without_executable_quote(tmp_path, stale_side, awc_status):
+    config, event = fixture()
+    calls = []
+    def fetch(url, limit):
+        calls.append(url)
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: return b'{"hourly":{}}', {}
+        if '/book?' in url:
+            side = 'No' if '456' in url else 'Yes'
+            at = NOW - timedelta(seconds=155) if side == stale_side or stale_side == 'both' else NOW
+            return _book_for(url, event, at=at, asks=[{'price': '0.3', 'size': '20'}])
+        if 'aviationweather' in url: return b'', {'Status': awc_status}
+        raise AssertionError(url)
+    result = Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW).once()
+    assert result['status'] == ('captured' if awc_status == 200 else 'captured_partial')
+    assert len(calls) == 5
+    row = json.loads((tmp_path / '000000.json').read_text())
+    assert row['book_evidence'] == {
+        side: ('unverified_stale_book' if side == stale_side or stale_side == 'both' else 'verified_book')
+        for side in ('Yes', 'No')}
+    for kind, side in (('book', 'Yes'), ('book_no', 'No')):
+        raw = row['captures'][kind]['body'].encode()
+        assert row['captures'][kind]['sha256'] == hashlib.sha256(raw).hexdigest()
+        assert json.loads(raw)['asset_id'] == ('123' if side == 'Yes' else '456')
+        expected_at = NOW - timedelta(seconds=155) if side == stale_side or stale_side == 'both' else NOW
+        assert json.loads(raw)['timestamp'] == str(int(expected_at.timestamp() * 1000))
+    assert row['captures']['forecast']['status'] == 200
+    assert row['captures']['awc']['status'] == awc_status
+    assert row['label']['status'] == 'unverified'
+    assert report(tmp_path)['cycles'] == 1
+    assert report(tmp_path)['resolved_event_days'] == 0
+
+
+@pytest.mark.parametrize('side', ['Yes', 'No'])
+@pytest.mark.parametrize('mutation,exception', [
+    ('wrong_identity', 'book identity/timestamp'),
+    ('bad_level', 'book level invalid'),
+    ('future', 'book identity/timestamp'),
+])
+def test_invalid_book_cannot_hide_behind_other_side_or_staleness(tmp_path, side, mutation, exception):
+    config, event = fixture()
+    def fetch(url, limit):
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: return b'{"hourly":{}}', {}
+        if '/book?' in url:
+            target = ('456' in url) == (side == 'No')
+            at = NOW + timedelta(seconds=6) if mutation == 'future' and target else NOW - timedelta(seconds=155)
+            body, headers = _book_for(url, event, at=at, asks=[{'price': '0.3', 'size': '20'}])
+            if target:
+                book = json.loads(body)
+                if mutation == 'wrong_identity': book['asset_id'] = 'other'
+                if mutation == 'bad_level': book['asks'][0]['size'] = 'NaN'
+                body = json.dumps(book).encode()
+            return body, headers
+        if 'aviationweather' in url: return b'', {'Status': 204}
+        raise AssertionError(url)
+    with pytest.raises(ValueError, match=exception):
+        Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW).once()
+    assert not list(tmp_path.glob('*.json'))
+
+
+def test_yes_book_without_ask_is_not_verified(tmp_path):
+    config, event = fixture()
+    def fetch(url, limit):
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: return b'{"hourly":{}}', {}
+        if '/book?' in url: return _book_for(url, event)
+        if 'aviationweather' in url: return b'', {'Status': 204}
+        raise AssertionError(url)
+    Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW).once()
+    row = json.loads((tmp_path / '000000.json').read_text())
+    assert row['book_evidence'] == {'Yes': 'unverified_no_ask', 'No': 'unverified_no_ask'}
 
 
 @pytest.mark.parametrize('level', [{'price': 'NaN', 'size': '1'},
@@ -161,7 +237,7 @@ def test_no_book_unavailable_retains_upstream_without_executable_claim(tmp_path,
             if '456' in url:
                 if isinstance(no_result, Exception): raise no_result
                 return no_result
-            return _book_for(url, event)
+            return _book_for(url, event, asks=[{'price': '0.3', 'size': '20'}])
         if 'aviationweather' in url: return b'', {'Status': 200}
         raise AssertionError(url)
     assert Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW).once()['status'] == 'captured'
@@ -178,15 +254,17 @@ def test_no_book_unavailable_retains_upstream_without_executable_claim(tmp_path,
         assert 'body' not in row['captures']['book_no']
 
 
+@pytest.mark.parametrize('side', ['Yes', 'No'])
 @pytest.mark.parametrize('response', [(b'{"error":"unknown token"}', {'Status': 404}),
                                       (b'{"error":"No orderbook exists for the requested token id"}', {'Status': 200}),
-                                      (b'{"error":"No orderbook exists for the requested token id"}', {'Status': 503})])
-def test_unknown_no_token_or_unexpected_status_fails_closed(tmp_path, response):
+                                      (b'{"error":"No orderbook exists for the requested token id"}', {'Status': 503}),
+                                      (b'{"error":"No orderbook exists for the requested token id","extra":1}', {'Status': 404})])
+def test_unknown_book_or_unexpected_status_fails_closed(tmp_path, side, response):
     config, event = fixture()
     def fetch(url, limit):
         if 'gamma-api' in url: return json.dumps(event).encode(), {}
         if 'open-meteo' in url: return b'{"hourly":{}}', {}
-        if '/book?' in url: return response if '456' in url else _book_for(url, event)
+        if '/book?' in url: return response if ('456' in url) == (side == 'No') else _book_for(url, event)
         raise AssertionError(url)
     with pytest.raises(ValueError):
         Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW).once()
@@ -1029,6 +1107,44 @@ def test_report_does_not_count_unsubstantiated_finality_claims(tmp_path):
     row['label']['status'] = 'venue_corroborated_final_binary'
     (tmp_path / '000000.json').write_bytes(_canonical(row))
     assert report(tmp_path)['resolved_event_days'] == 0
+
+
+def test_closed_market_both_documented_404_books_can_corroborate_without_quotes(tmp_path):
+    config, event = fixture()
+    market = event['markets'][0]
+    market.update(closed=True, resolvedAt='2026-10-29T00:00:00Z', outcomePrices='["1","0"]')
+    future = datetime(2026, 10, 30, tzinfo=timezone.utc)
+    base = {'condition_id': market['conditionId'], 'event_id': int(config.event_id),
+            'event_slug': config.slug, 'resolved': True, 'closed': True, 'module': 'v1_ctf'}
+    tokens = {'data': [
+        {**base, 'token_id': '123', 'opposite_token_id': '456', 'outcome_index': 0,
+         'outcome': 'Yes', 'final_price': 1},
+        {**base, 'token_id': '456', 'opposite_token_id': '123', 'outcome_index': 1,
+         'outcome': 'No', 'final_price': 0}]}
+    resolution = {'data': [{'condition_id': market['conditionId'], 'status': 'resolved'}]}
+    no_book = b'{"error":"No orderbook exists for the requested token id"}'
+    calls = []
+    def fetch(url, limit):
+        calls.append(url)
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: return b'{"hourly":{}}', {}
+        if '/book?' in url: return no_book, {'Status': 404}
+        if 'aviationweather' in url: return b'', {'Status': 200}
+        if '/v2/tokens?' in url: return json.dumps(tokens).encode(), {}
+        if '/v2/resolutions?' in url: return json.dumps(resolution).encode(), {}
+        raise AssertionError(url)
+    result = Campaign(tmp_path, config, fetch=fetch, clock=lambda: future).once()
+    assert result['status'] == 'captured' and result['label'] == 'venue_corroborated_final_binary'
+    assert len(calls) == 7
+    row = json.loads((tmp_path / '000000.json').read_text())
+    assert row['book_evidence'] == {'Yes': 'unverified_no_book', 'No': 'unverified_no_book'}
+    for kind in ('book', 'book_no'):
+        assert row['captures'][kind]['body'].encode() == no_book
+        assert row['captures'][kind]['sha256'] == hashlib.sha256(no_book).hexdigest()
+        assert row['captures'][kind]['failure_code'] == 'no_book'
+    assert row['captures']['awc']['status'] == 200
+    assert row['captures']['tokens']['status'] == row['captures']['resolution']['status'] == 200
+    assert report(tmp_path)['resolved_event_days'] == 1
 
 
 def test_cycle_crosscheck_is_bounded_and_outage_cannot_count_day(tmp_path):

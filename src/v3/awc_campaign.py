@@ -633,7 +633,7 @@ class Campaign:
             if not isinstance(body, bytes) or len(body) > LIMITS[kind]:
                 raise ValueError('oversized or invalid response')
             status = headers.get('Status', 200)
-            if status != 200 and not (kind == 'awc' and status == 204 and not body) and not (kind == 'book_no' and status == 404):
+            if status != 200 and not (kind == 'awc' and status == 204 and not body) and not (kind in ('book', 'book_no') and status == 404):
                 raise ValueError('unexpected source status or 204 body')
             end = self.clock().astimezone(timezone.utc).isoformat()
             text = body.decode('utf-8', errors='strict')
@@ -643,7 +643,7 @@ class Campaign:
                               'sha256': hashlib.sha256(body).hexdigest(), 'body': text}
             if status == 204:
                 captures[kind]['failure_code'] = 'no_data'
-            if kind == 'book_no' and status == 404:
+            if kind in ('book', 'book_no') and status == 404:
                 # Only the documented no-orderbook reply, never unknown token
                 # or a generic CLOB error, can be persisted as absence.
                 if _strict_json_loads(text) != {'error': 'No orderbook exists for the requested token id'}:
@@ -670,7 +670,7 @@ class Campaign:
         def checked_book(kind, token):
             raw_book = get(kind, 'https://clob.polymarket.com/book?' + urlencode({'token_id': token}))
             if raw_book is None or captures[kind].get('failure_code'):
-                return None
+                return 'unverified_' + captures[kind]['failure_code']
             book = _strict_json_loads(raw_book)
             if (not isinstance(book, dict) or book.get('market') != market['conditionId'] or
                     book.get('asset_id') != token or not isinstance(book.get('bids'), list) or
@@ -692,17 +692,15 @@ class Campaign:
                         raise ValueError('book level invalid')
             book_at = datetime.fromtimestamp(int(book['timestamp']) / 1000, timezone.utc)
             received = _aware(captures[kind]['first_available_at'])
-            if not received - timedelta(seconds=120) <= book_at <= received + timedelta(seconds=5):
+            if book_at > received + timedelta(seconds=5):
                 raise ValueError('book identity/timestamp mismatch')
-            return book
-        checked_book('book', identity['token_id'])
-        no_book = checked_book('book_no', identity['no_token_id'])
-        no_reason = captures['book_no'].get('failure_code')
-        if no_reason:
-            no_status = 'unverified_' + no_reason
-        else:
-            no_status = 'verified_book' if no_book is not None and no_book['asks'] else 'unverified_no_ask'
-        book_evidence = {'Yes': 'verified_book', 'No': no_status}
+            # Retain identity-valid old raw snapshots, but never treat their
+            # levels as executable quotes (even when an ask is present).
+            if book_at < received - timedelta(seconds=120):
+                return 'unverified_stale_book'
+            return 'verified_book' if book['asks'] else 'unverified_no_ask'
+        book_evidence = {'Yes': checked_book('book', identity['token_id']),
+                         'No': checked_book('book_no', identity['no_token_id'])}
         raw = get('awc', event['resolutionSource'])
         awc_reason = captures['awc'].get('failure_code')
         if awc_reason:
