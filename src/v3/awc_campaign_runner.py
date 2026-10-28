@@ -22,8 +22,9 @@ from . import awc_campaign as tape
 ZONE = ZoneInfo('Asia/Karachi')
 MAX_ENTRIES = 2 * tape.MAX_CYCLES + 1
 MAX_ENTRY_BYTES = 2048
+MAX_REVISITS_PER_DAY = 3
 WINDOW = timedelta(minutes=10)
-CODES = {'timeout', 'invalid_response', 'capture_failed', 'internal_failure', 'collector_refused'}
+CODES = {'timeout', 'invalid_response', 'storage_failure', 'capture_failed', 'internal_failure', 'collector_refused'}
 REASONS = {'resolved_days', 'calendar_days', 'attempted_slots'}
 RESULTS = {'captured', 'captured_partial'}
 
@@ -36,7 +37,7 @@ def slots(start: datetime):
         for hour in (8, 10, 14, 20):
             stamp = datetime.combine(day, time(hour), ZONE).astimezone(timezone.utc)
             if stamp >= start:
-                target = day - timedelta(days=1) if hour == 10 else day
+                target = max(first, day - timedelta(days=1)) if hour == 10 else day
                 yield stamp, target.isoformat()
 
 
@@ -44,10 +45,28 @@ def _body(record):
     return (json.dumps(record, sort_keys=True, separators=(',', ':'), ensure_ascii=True) + '\n').encode()
 
 
+def _valid_target(start: datetime, slot: str, target: str, kind: str) -> bool:
+    """Bound a journal target to its slot's Karachi campaign date."""
+    try:
+        instant = tape._aware(slot)
+        day = date.fromisoformat(target)
+        first = start.astimezone(ZONE).date()
+        local = instant.astimezone(ZONE)
+        if target != day.isoformat() or not first <= day < first + timedelta(days=tape.MAX_DAYS):
+            return False
+        if local.hour == 10:
+            return day < local.date() or (kind == 'missed' and day == first == local.date())
+        return day == local.date()
+    except (ValueError, TypeError):
+        return False
+
+
 def replay(directory: Path, start_at: str):
     """Validate bounded canonical journal and START/terminal transitions."""
-    state = {'attempted': 0, 'stop_reason': None, 'slots': {}, 'next': 0, 'digest': None}
-    valid_slots = {(s.isoformat(), d) for s, d in slots(tape._aware(start_at))}
+    state = {'attempted': 0, 'stop_reason': None, 'slots': {}, 'targets': {},
+             'revisits': {}, 'next': 0, 'digest': None}
+    start = tape._aware(start_at)
+    valid_slots = {s.isoformat() for s, _ in slots(start)}
     with tape._directory_fd(directory) as fd:
         names = sorted(n for n in os.listdir(fd) if n.endswith('.json')) if fd is not None else []
         if len(names) > MAX_ENTRIES:
@@ -86,14 +105,22 @@ def replay(directory: Path, start_at: str):
                     raise ValueError('invalid slot')
                 instant = tape._aware(slot)
                 if (slot != instant.isoformat() or
-                        (slot, target) not in valid_slots):
+                        slot not in valid_slots or not isinstance(kind, str) or
+                        not _valid_target(start, slot, target, kind)):
                     raise ValueError('slot outside campaign')
                 previous = state['slots'].get(slot)
                 code = row['code']
                 if kind in ('started', 'missed') and previous is None and code is None:
+                    if kind == 'started' and instant.astimezone(ZONE).hour == 10:
+                        count = state['revisits'].get(target, 0)
+                        if count >= MAX_REVISITS_PER_DAY:
+                            raise ValueError('revisit cap exceeded')
+                        state['revisits'][target] = count + 1
                     state['slots'][slot] = kind
+                    state['targets'][slot] = target
                     state['attempted'] += 1
-                elif kind == 'finished' and previous == 'started' and code in RESULTS | CODES:
+                elif (kind == 'finished' and previous == 'started' and
+                      target == state['targets'][slot] and code in RESULTS | CODES):
                     state['slots'][slot] = 'finished'
                 else:
                     raise ValueError('duplicate or invalid slot transition')
@@ -118,6 +145,8 @@ def append(directory: Path, start_at: str, kind: str, slot=None, target_date=Non
     else:
         if kind not in ('started', 'missed', 'finished'):
             raise ValueError('invalid entry kind')
+        if not isinstance(slot, datetime) or not isinstance(target_date, str):
+            raise ValueError('invalid target date for slot')
         row.update(slot=slot.isoformat(), target_date=target_date, code=code)
     body = _body(row)
     if len(body) > MAX_ENTRY_BYTES:
@@ -125,8 +154,12 @@ def append(directory: Path, start_at: str, kind: str, slot=None, target_date=Non
     # Validate transition before writing; an unfinished START remains an attempt.
     if kind != 'stop':
         prior = state['slots'].get(row['slot'])
+        if not isinstance(target_date, str) or not _valid_target(tape._aware(start_at), row['slot'], target_date, kind):
+            raise ValueError('invalid target date for slot')
+        if kind == 'started' and slot.astimezone(ZONE).hour == 10 and state['revisits'].get(target_date, 0) >= MAX_REVISITS_PER_DAY:
+            raise ValueError('revisit cap exceeded')
         if ((kind in ('started', 'missed') and (prior is not None or code is not None or state['attempted'] >= tape.MAX_CYCLES)) or
-                (kind == 'finished' and (prior != 'started' or code not in RESULTS | CODES))):
+                (kind == 'finished' and (prior != 'started' or state['targets'].get(row['slot']) != target_date or code not in RESULTS | CODES))):
             raise ValueError('invalid attempt transition')
     with tape._directory_fd(directory, create=True) as fd:
         name = f'{state["next"]:06d}.json'
@@ -147,6 +180,9 @@ def append(directory: Path, start_at: str, kind: str, slot=None, target_date=Non
         state['stop_reason'] = code
     elif kind in ('started', 'missed'):
         state['slots'][row['slot']] = kind
+        state['targets'][row['slot']] = target_date
+        if kind == 'started' and slot.astimezone(ZONE).hour == 10:
+            state['revisits'][target_date] = state['revisits'].get(target_date, 0) + 1
         state['attempted'] += 1
     else:
         state['slots'][row['slot']] = 'finished'
@@ -173,10 +209,23 @@ def _lock(directory: Path):
             os.close(handle)
 
 
-def tape_state(directory: Path):
+def tape_state(directory: Path, start_at: str):
     """Read each bounded tape row once; retain only day keys, not raw bodies."""
     resolved, captured = set(), set()
+    first = tape._aware(start_at).astimezone(ZONE).date()
     for row, _ in tape._iter_records(directory):
+        try:
+            day = date.fromisoformat(row['target_date'])
+            captured_at = tape._aware(row['captured_at'])
+            valid = (row.get('campaign_start_at') == start_at and row['target_date'] == day.isoformat()
+                     and first <= day < first + timedelta(days=tape.MAX_DAYS)
+                     and captured_at >= tape._aware(start_at)
+                     and first <= captured_at.astimezone(ZONE).date() < first + timedelta(days=tape.MAX_DAYS)
+                     and row.get('station') == 'OPKC' and row.get('zone') == 'Asia/Karachi')
+        except (KeyError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise ValueError('tape campaign identity or local date drift')
         good = tape._corroborated_row(row)
         if good:
             resolved.add(row['target_date'])
@@ -210,7 +259,7 @@ def once(directory: Path, start_at: str, *, clock=None, collect=None):
             return {'status': 'stopped', 'reason': state['stop_reason'], 'paper_only': True}
         day = now.astimezone(ZONE).date()
         first = start.astimezone(ZONE).date()
-        resolved, pending_days = tape_state(evidence)
+        resolved, pending_days = tape_state(evidence, start_at)
         def stop(reason):
             append(journal, start_at, 'stop', code=reason, state=state)
             return {'status': 'stopped', 'reason': reason, 'paper_only': True}
@@ -226,8 +275,12 @@ def once(directory: Path, start_at: str, *, clock=None, collect=None):
                 break
             if stamp.isoformat() in state['slots']:
                 continue
-            if stamp.astimezone(ZONE).hour == 10 and target not in pending_days:
-                continue  # no captured pending prior day, so no revisit
+            if stamp.astimezone(ZONE).hour == 10:
+                eligible = (d for d in pending_days if d < stamp.astimezone(ZONE).date().isoformat()
+                            and state['revisits'].get(d, 0) < MAX_REVISITS_PER_DAY)
+                target = min(eligible, key=lambda d: (state['revisits'].get(d, 0), d), default=None)
+                if target is None:
+                    continue  # no eligible captured pending prior date
             if state['attempted'] >= tape.MAX_CYCLES:
                 return stop('attempted_slots')
             if (now >= stamp + WINDOW or
@@ -238,16 +291,18 @@ def once(directory: Path, start_at: str, *, clock=None, collect=None):
             try:
                 result = (collect or _collect)(target, start_at, evidence)
                 code = result['status'] if result.get('status') in RESULTS else 'collector_refused'
-            except TimeoutError:
+            except (TimeoutError, tape.CycleWallExceeded):
                 code = 'timeout'
-            except (ValueError, TypeError, KeyError, OSError, UnicodeError, json.JSONDecodeError):
+            except (ValueError, TypeError, KeyError, UnicodeError, json.JSONDecodeError):
                 code = 'invalid_response'
+            except OSError:
+                code = 'storage_failure'
             except Exception:
                 code = 'internal_failure'
             append(journal, start_at, 'finished', stamp, target, code, state=state)
             if state['attempted'] >= tape.MAX_CYCLES:
                 stop('attempted_slots')
-            elif code in RESULTS and tape_state(evidence)[0] >= tape.MAX_RESOLVED_DAYS:
+            elif code in RESULTS and tape_state(evidence, start_at)[0] >= tape.MAX_RESOLVED_DAYS:
                 stop('resolved_days')
             return {'status': code if code in RESULTS else 'failed', 'failure_code': None if code in RESULTS else code,
                     'paper_only': True}

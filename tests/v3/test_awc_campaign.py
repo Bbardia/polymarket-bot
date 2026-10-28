@@ -630,6 +630,25 @@ def test_exclusive_publish_cannot_replace_competing_sequence(tmp_path, monkeypat
     assert not list(tmp_path.glob('*.tmp'))
 
 
+def test_directory_fsync_failure_never_reports_success(tmp_path, monkeypatch):
+    config, event = fixture()
+    campaign = Campaign(tmp_path, config, fetch=_offline_fetch(event), clock=lambda: NOW)
+    original = os.fsync
+    calls = []
+    def fail_directory(fd):
+        calls.append(fd)
+        if len(calls) == 2:
+            raise OSError('directory fsync failed')
+        return original(fd)
+    with monkeypatch.context() as patch:
+        patch.setattr(awc_campaign.os, 'fsync', fail_directory)
+        with pytest.raises(OSError, match='directory fsync failed'):
+            campaign.once()
+    assert len(calls) == 2
+    assert report(tmp_path)['cycles'] == 1
+    assert not list(tmp_path.glob('*.tmp'))
+
+
 def test_real_cycle_alarm_during_temp_fsync_leaves_tape_retryable(tmp_path, monkeypatch):
     config, event = fixture()
     campaign = Campaign(tmp_path, config, fetch=_offline_fetch(event), clock=lambda: NOW)

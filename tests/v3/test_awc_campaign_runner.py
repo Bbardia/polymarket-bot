@@ -88,7 +88,7 @@ def test_slot_cap_and_terminal_stop_no_get(tmp_path):
 
 
 def test_resolved_cap_no_network(tmp_path, monkeypatch):
-    monkeypatch.setattr(runner, 'tape_state', lambda directory: (30, set()))
+    monkeypatch.setattr(runner, 'tape_state', lambda directory, start: (30, set()))
     calls = []
     assert invoke(tmp_path, at(0, 8), lambda *a: calls.append(1))['status'] == 'stopped'
     assert rows(tmp_path)['stop_reason'] == 'resolved_days' and not calls
@@ -118,7 +118,7 @@ def test_no_credentials_and_no_retroactive_fetch(tmp_path):
 
 
 def test_revisit_only_after_captured_pending_prior_even_after_two_day_outage(tmp_path, monkeypatch):
-    monkeypatch.setattr(runner, 'tape_state', lambda directory: (0, {'2026-10-28'}))
+    monkeypatch.setattr(runner, 'tape_state', lambda directory, start: (0, {'2026-10-28'}))
     calls = []
     invoke(tmp_path, at(2, 14), lambda day, *_: calls.append(day) or {'status': 'captured'})
     state = rows(tmp_path)
@@ -162,7 +162,7 @@ def test_collector_last_local_day_not_utc_45_day_cutoff(tmp_path):
 
 def test_stop_immediately_after_thirtieth_verified_capture(tmp_path, monkeypatch):
     visits = []
-    def state(directory):
+    def state(directory, start):
         visits.append(1)
         return (30 if len(visits) == 2 else 29, set())
     monkeypatch.setattr(runner, 'tape_state', state)
@@ -209,3 +209,75 @@ def test_journal_fsync_fail_windows_never_get(tmp_path, monkeypatch, failure_cal
     assert not list((tmp_path / 'recurring' / 'journal').glob('*.tmp'))
     if expected_attempts:
         assert invoke(tmp_path, at(0, 8, 1), lambda *a: pytest.fail('retry'))['status'] == 'already_recorded'
+
+
+def test_delayed_finality_revisits_older_pending_and_replays_after_restart(tmp_path, monkeypatch):
+    pending = {'2026-10-28'}
+    monkeypatch.setattr(runner, 'tape_state', lambda directory, start: (0, pending.copy()))
+    calls = []
+    for day in (1, 2, 3):
+        invoke(tmp_path, at(day, 10), lambda target, *_: calls.append(target) or {'status': 'captured'})
+    assert calls == ['2026-10-28'] * 3
+    assert rows(tmp_path)['revisits']['2026-10-28'] == 3
+    assert invoke(tmp_path, at(4, 10), lambda *_: pytest.fail('fourth revisit'))['status'] == 'outside_window'
+    assert rows(tmp_path)['revisits']['2026-10-28'] == 3
+
+
+def test_pending_selection_least_visits_then_oldest(tmp_path, monkeypatch):
+    pending = {'2026-10-28'}
+    monkeypatch.setattr(runner, 'tape_state', lambda directory, start: (0, pending.copy()))
+    calls = []
+    invoke(tmp_path, at(1, 10), lambda target, *_: calls.append(target) or {'status': 'captured'})
+    pending.update({'2026-10-29', '2026-10-30'})
+    for day in (2, 3, 4):
+        invoke(tmp_path, at(day, 10), lambda target, *_: calls.append(target) or {'status': 'captured'})
+    assert calls == ['2026-10-28', '2026-10-29', '2026-10-30', '2026-10-28']
+
+
+def test_replay_rejects_invalid_prior_target_and_excess_revisits(tmp_path):
+    journal = tmp_path / 'recurring' / 'journal'
+    with pytest.raises(ValueError, match='target'):
+        runner.append(journal, START.isoformat(), 'started', at(1, 10), '2026-10-30')
+    for day in (1, 2, 3):
+        runner.append(journal, START.isoformat(), 'started', at(day, 10), '2026-10-28')
+        runner.append(journal, START.isoformat(), 'finished', at(day, 10), '2026-10-28', 'captured')
+    with pytest.raises(ValueError, match='revisit'):
+        runner.append(journal, START.isoformat(), 'started', at(4, 10), '2026-10-28')
+
+
+@pytest.mark.parametrize('bad_date', ['2026-10-27', '2026-12-12', 'not-a-date'])
+def test_tape_identity_and_local_date_rejected_before_get(tmp_path, monkeypatch, bad_date):
+    monkeypatch.setattr(tape, '_iter_records', lambda directory: iter([({'campaign_start_at': START.isoformat(),
+        'target_date': bad_date, 'captured_at': at(0, 8).isoformat(),
+        'status': 'captured', 'station': 'OPKC', 'zone': 'Asia/Karachi'}, 'digest')]))
+    with pytest.raises(ValueError, match='tape'):
+        invoke(tmp_path, at(0, 8), lambda *_: pytest.fail('GET'))
+
+
+def test_foreign_start_tape_rejected_before_get(tmp_path, monkeypatch):
+    monkeypatch.setattr(tape, '_iter_records', lambda directory: iter([({'campaign_start_at':
+        (START + timedelta(minutes=1)).isoformat(), 'target_date': '2026-10-28',
+        'captured_at': at(0, 8).isoformat(),
+        'status': 'captured', 'station': 'OPKC', 'zone': 'Asia/Karachi'}, 'digest')]))
+    with pytest.raises(ValueError, match='tape'):
+        invoke(tmp_path, at(0, 8), lambda *_: pytest.fail('GET'))
+
+
+def test_stale_capture_timestamp_rejected_before_get(tmp_path, monkeypatch):
+    monkeypatch.setattr(tape, '_iter_records', lambda directory: iter([({
+        'campaign_start_at': START.isoformat(), 'target_date': '2026-10-28',
+        'captured_at': (START - timedelta(seconds=1)).isoformat(),
+        'status': 'captured', 'station': 'OPKC', 'zone': 'Asia/Karachi'}, 'digest')]))
+    with pytest.raises(ValueError, match='tape'):
+        invoke(tmp_path, at(0, 8), lambda *_: pytest.fail('GET'))
+
+
+@pytest.mark.parametrize('exc,code', [(ValueError('bad response'), 'invalid_response'),
+                                      (OSError('storage secret'), 'storage_failure'),
+                                      (TimeoutError('late secret'), 'timeout'),
+                                      (tape.CycleWallExceeded('cycle secret'), 'timeout')])
+def test_fixed_collector_failure_classes(tmp_path, exc, code):
+    def fail(*_):
+        raise exc
+    assert invoke(tmp_path, at(0, 8), fail)['failure_code'] == code
+    assert 'secret' not in ''.join(p.read_text() for p in (tmp_path / 'recurring' / 'journal').glob('*.json'))

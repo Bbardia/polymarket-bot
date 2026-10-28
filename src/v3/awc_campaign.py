@@ -43,6 +43,10 @@ CYCLE_WALL_SECONDS = 60
 _deadlines = []
 
 
+class CycleWallExceeded(ValueError):
+    """Distinct deadline failure, not an invalid provider response."""
+
+
 def _alarm(_signum, _frame):
     now = time.monotonic()
     for deadline, error in _deadlines:
@@ -539,7 +543,7 @@ class Campaign:
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     def once(self) -> dict:
-        with _wall_bound(CYCLE_WALL_SECONDS, ValueError('cycle wall budget exhausted')):
+        with _wall_bound(CYCLE_WALL_SECONDS, CycleWallExceeded('cycle wall budget exhausted')):
             return self._once()
 
     def _once(self, *, gamma_response=None, preflight=None) -> dict:
@@ -720,6 +724,10 @@ class Campaign:
                     os.unlink(temp, dir_fd=dirfd)
                 finally:
                     signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                # Do not mask the wall alarm across potentially slow storage I/O.
+                # The numbered entry must be durable before reporting capture.
+                assert dirfd is not None  # create=True guarantees a directory descriptor
+                os.fsync(dirfd)
             finally:
                 previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
                 try:
@@ -739,7 +747,7 @@ class DailyCampaign:
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     def once(self) -> dict:
-        with _wall_bound(CYCLE_WALL_SECONDS, ValueError('cycle wall budget exhausted')):
+        with _wall_bound(CYCLE_WALL_SECONDS, CycleWallExceeded('cycle wall budget exhausted')):
             now = self.clock().astimezone(timezone.utc)
             first = _aware(self.start_at).astimezone(ZoneInfo('Asia/Karachi')).date()
             expired = now < _aware(self.start_at) or now.astimezone(ZoneInfo('Asia/Karachi')).date() >= first + timedelta(days=MAX_DAYS)
