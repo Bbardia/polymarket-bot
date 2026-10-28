@@ -1236,3 +1236,161 @@ def test_replay_rejects_middle_chain_before_fetch(tmp_path):
                                        clock=lambda: NOW.replace(hour=13)).once()):
         with pytest.raises(ValueError, match='continuity'):
             operation()
+
+
+@pytest.mark.parametrize('path,key,conflict', [
+    ('event', 'id', '999'),
+    ('event', 'slug', 'wrong-slug'),
+    ('market', 'id', '999'),
+    ('market', 'conditionId', '0x' + 'b' * 64),
+    ('market', 'clobTokenIds', '["999","888"]'),
+    ('market', 'outcomes', '["No","Yes"]'),
+    ('nested', 'unrelated', 'wrong'),
+])
+@pytest.mark.parametrize('daily', [False, True])
+def test_duplicate_gamma_keys_abort_before_downstream_get_or_append(tmp_path, path, key, conflict, daily):
+    config, event = daily_fixture() if daily else fixture()
+    if path == 'nested':
+        event['metadata'] = {'unrelated': 'right'}
+    raw = json.dumps(event)
+    if path == 'market':
+        market = event['markets'][5 if daily else 0]
+        original = json.dumps(key) + ': ' + json.dumps(market[key])
+    elif path == 'nested':
+        original = '"unrelated": "right"'
+    else:
+        original = json.dumps(key) + ': ' + json.dumps(event[key])
+    # Select the actual selected market, even if other bracket values match.
+    if path == 'market':
+        prefix, suffix = raw.split('"markets": [', 1)
+        index = 5 if daily else 0
+        selected = json.dumps(event['markets'][index])
+        assert selected in suffix and original in selected
+        changed = selected.replace(original, json.dumps(key) + ': ' + json.dumps(conflict) + ', ' + original, 1)
+        raw = prefix + '"markets": [' + suffix.replace(selected, changed, 1)
+    else:
+        assert raw.count(original) == 1
+        raw = raw.replace(original, json.dumps(key) + ': ' + json.dumps(conflict) + ', ' + original, 1)
+    calls = []
+    def fetch(url, limit):
+        calls.append(url)
+        assert 'gamma-api' in url, 'duplicate Gamma must stop before another GET'
+        return raw.encode(), {'Status': 200}
+    campaign = (awc_campaign.DailyCampaign(tmp_path, config.target_date, config.start_at,
+                                          fetch=fetch, clock=lambda: NOW) if daily else
+                Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW))
+    with pytest.raises(ValueError, match='duplicate JSON key'):
+        campaign.once()
+    assert len(calls) == 1 and not list(tmp_path.glob('*.json'))
+
+
+@pytest.mark.parametrize('kind,body', [
+    ('forecast', b'{"hourly":{},"hourly":{}}'),
+    ('book', b'{"market":"wrong","market":"right"}'),
+    ('book_no', b'{"error":"wrong","error":"No orderbook exists for the requested token id"}'),
+])
+def test_duplicate_forecast_or_book_response_never_appended(tmp_path, kind, body):
+    config, event = fixture()
+    calls = []
+    def fetch(url, limit):
+        calls.append(url)
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: return body if kind == 'forecast' else b'{"hourly":{}}', {}
+        if '/book?' in url:
+            if kind == 'book' or (kind == 'book_no' and '456' in url):
+                return body, {'Status': 404 if kind == 'book_no' else 200}
+            return _book_for(url, event)
+        pytest.fail('fetched after ambiguous response')
+    with pytest.raises(ValueError, match='duplicate JSON key'):
+        Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW).once()
+    assert len(calls) == {'forecast': 2, 'book': 3, 'book_no': 4}[kind]
+    assert not list(tmp_path.glob('*.json'))
+
+
+def test_replay_rejects_rehashed_ambiguous_gamma_before_fetch(tmp_path):
+    config, event = fixture()
+    Campaign(tmp_path, config, fetch=_offline_fetch(event), clock=lambda: NOW).once()
+    row = json.loads((tmp_path / '000000.json').read_bytes())
+    raw = row['captures']['gamma']['body']
+    original = '"conditionId": "0x' + 'a' * 64 + '"'
+    assert raw.count(original) == 1
+    row['captures']['gamma']['body'] = raw.replace(original, '"conditionId": "0x' + 'b' * 64 + '", ' + original)
+    row['captures']['gamma']['sha256'] = hashlib.sha256(row['captures']['gamma']['body'].encode()).hexdigest()
+    (tmp_path / '000000.json').write_bytes(_canonical(row))
+    assert report(tmp_path)['resolved_event_days'] == 0
+    with pytest.raises(ValueError, match='pin evidence invalid'):
+        Campaign(tmp_path, config, fetch=lambda *_: pytest.fail('GET before replay validation'),
+                 clock=lambda: NOW.replace(hour=13)).once()
+
+
+@pytest.mark.parametrize('kind,body', [
+    ('tokens', b'{"data":[],"data":[]}'),
+    ('resolution', b'{"data":[],"data":[]}'),
+])
+def test_duplicate_data_api_body_cannot_append_or_credit(tmp_path, kind, body):
+    config, event = fixture()
+    event['markets'][0].update(closed=True, resolvedAt='2026-10-29T00:00:00Z',
+                               outcomePrices='["1","0"]')
+    future = datetime(2026, 10, 30, tzinfo=timezone.utc)
+    calls = []
+    def fetch(url, limit):
+        calls.append(url)
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: return b'{"hourly":{}}', {}
+        if '/book?' in url: return _book_for(url, event, at=future)
+        if 'aviationweather' in url: return b'', {'Status': 200}
+        if '/v2/tokens?' in url: return body if kind == 'tokens' else b'{"data":[]}', {}
+        if '/v2/resolutions?' in url: return body, {}
+        pytest.fail('unexpected GET')
+    with pytest.raises(ValueError, match='duplicate JSON key'):
+        Campaign(tmp_path, config, fetch=fetch, clock=lambda: future).once()
+    assert len(calls) == (6 if kind == 'tokens' else 7)
+    assert report(tmp_path)['cycles'] == 0 and not list(tmp_path.glob('*.json'))
+
+
+def test_replay_never_credits_rehashed_duplicate_in_terminal_sources(tmp_path):
+    config, event = fixture()
+    market = event['markets'][0]
+    market.update(closed=True, resolvedAt='2026-10-29T00:00:00Z', outcomePrices='["1","0"]')
+    future = datetime(2026, 10, 30, tzinfo=timezone.utc)
+    base = {'condition_id': market['conditionId'], 'event_id': int(config.event_id),
+            'event_slug': config.slug, 'resolved': True, 'closed': True, 'module': 'v1_ctf'}
+    tokens = {'data': [{**base, 'token_id': token, 'opposite_token_id': opposite,
+                        'outcome_index': index, 'outcome': outcome, 'final_price': price}
+                       for index, (token, opposite, outcome, price) in enumerate(
+                           [('123', '456', 'Yes', 1), ('456', '123', 'No', 0)])]}
+    resolution = {'data': [{'condition_id': market['conditionId'], 'status': 'resolved'}]}
+    def fetch(url, limit):
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: return b'{"hourly":{}}', {}
+        if '/book?' in url: return _book_for(url, event, at=future)
+        if 'aviationweather' in url: return b'', {'Status': 200}
+        if '/v2/tokens?' in url: return json.dumps(tokens).encode(), {}
+        if '/v2/resolutions?' in url: return json.dumps(resolution).encode(), {}
+        pytest.fail('unexpected GET')
+    assert Campaign(tmp_path, config, fetch=fetch, clock=lambda: future).once()['label'] == 'venue_corroborated_final_binary'
+    assert report(tmp_path)['resolved_event_days'] == 1
+    original = (tmp_path / '000000.json').read_bytes()
+    for kind, old, duplicate in (
+        ('gamma', '"conditionId": "0x' + 'a' * 64 + '"', '"conditionId": "0x' + 'b' * 64 + '"'),
+        ('tokens', '"token_id": "123"', '"token_id": "999"'),
+        ('resolution', '"status": "resolved"', '"status": "proposed"'),
+    ):
+        row = json.loads(original)
+        capture = row['captures'][kind]
+        assert old in capture['body']
+        capture['body'] = capture['body'].replace(old, duplicate + ', ' + old, 1)
+        capture['sha256'] = hashlib.sha256(capture['body'].encode()).hexdigest()
+        (tmp_path / '000000.json').write_bytes(_canonical(row))
+        assert report(tmp_path)['resolved_event_days'] == 0, kind
+    (tmp_path / '000000.json').write_bytes(original)
+    assert report(tmp_path)['resolved_event_days'] == 1
+
+
+def test_escaped_duplicate_key_and_outer_tape_row_rejected(tmp_path):
+    with pytest.raises(ValueError, match='duplicate JSON key'):
+        awc_campaign._strict_json_loads('{"id": "wrong", "\\u0069d": "right"}')
+    row = _canonical({'sequence': 0, 'previous_sha256': None, 'label': {'status': 'unverified'}})
+    (tmp_path / '000000.json').write_bytes(row.replace(b'"sequence":0', b'"sequence":0,"sequence":0'))
+    with pytest.raises(ValueError, match='duplicate JSON key'):
+        report(tmp_path)

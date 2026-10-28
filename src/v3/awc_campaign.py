@@ -200,8 +200,24 @@ def _aware(value: str) -> datetime:
     return stamp.astimezone(timezone.utc)
 
 
+class DuplicateJSONKeyError(ValueError):
+    """An ambiguous source body must not become an evidence snapshot."""
+
+
+def _strict_json_loads(value):
+    """Reject repeated object keys at every depth, including escaped aliases."""
+    def unique_object(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise DuplicateJSONKeyError('duplicate JSON key')
+            result[key] = item
+        return result
+    return json.loads(value, object_pairs_hook=unique_object)
+
+
 def _array(value):
-    result = json.loads(value) if isinstance(value, str) else value
+    result = _strict_json_loads(value) if isinstance(value, str) else value
     if not isinstance(result, list):
         raise ValueError('expected array')
     return result
@@ -253,7 +269,7 @@ def _row_pin(row: dict, config: Config):
         raw = capture['body'].encode('utf-8')
         if hashlib.sha256(raw).hexdigest() != capture['sha256']:
             raise ValueError('Gamma digest mismatch')
-        return _market_pin(validate_event(config, json.loads(raw))['market'])
+        return _market_pin(validate_event(config, _strict_json_loads(raw))['market'])
     except (KeyError, TypeError, ValueError, UnicodeError) as exc:
         raise ValueError('prior daily manifest pin evidence invalid') from exc
 
@@ -440,7 +456,7 @@ def _iter_records(directory: Path):
                 body = file.read(MAX_TAPE_ROW_BYTES + 1)
             if len(body) > MAX_TAPE_ROW_BYTES:
                 raise ValueError('tape size mismatch')
-            record = json.loads(body)
+            record = _strict_json_loads(body)
             if body != _canonical(record) or record.get('sequence') != i or record.get('previous_sha256') != prev:
                 raise ValueError('tape continuity mismatch')
             prev = hashlib.sha256(body).hexdigest()
@@ -509,7 +525,7 @@ def _corroborated_row(row: dict) -> bool:
             if capture['status'] != 200 or hashlib.sha256(raw).hexdigest() != capture['sha256']:
                 return False
             if kind != 'awc':
-                documents[kind] = json.loads(raw)
+                documents[kind] = _strict_json_loads(raw)
         event = documents['gamma']
         market = validate_event(config, event)['market']
         gamma_label = _label(market, event=event, target_date=config.target_date,
@@ -608,13 +624,13 @@ class Campaign:
             if kind == 'book_no' and status == 404:
                 # Only the documented no-orderbook reply, never unknown token
                 # or a generic CLOB error, can be persisted as absence.
-                if json.loads(text) != {'error': 'No orderbook exists for the requested token id'}:
+                if _strict_json_loads(text) != {'error': 'No orderbook exists for the requested token id'}:
                     raise ValueError('unexpected No book 404')
                 captures[kind]['failure_code'] = 'no_book'
             if kind == 'forecast':
                 captures[kind]['issue_at'] = None  # provider omitted run issuance
             return text
-        event = json.loads(get('gamma', urls['gamma']))
+        event = _strict_json_loads(get('gamma', urls['gamma']))
         identity = validate_event(self.config, event)
         market = identity['market']
         prior_pin = state['prior_pin']
@@ -625,7 +641,7 @@ class Campaign:
             'latitude': self.config.latitude, 'longitude': self.config.longitude,
             'hourly': 'temperature_2m', 'timezone': self.config.zone,
             'start_date': day.isoformat(), 'end_date': day.isoformat()})
-        forecast = json.loads(get('forecast', forecast_url))
+        forecast = _strict_json_loads(get('forecast', forecast_url))
         if not isinstance(forecast, dict) or not isinstance(forecast.get('hourly'), dict):
             raise ValueError('invalid forecast')
         # Open-Meteo response lacks a reliable run/issue timestamp. Never infer one.
@@ -633,7 +649,7 @@ class Campaign:
             raw_book = get(kind, 'https://clob.polymarket.com/book?' + urlencode({'token_id': token}))
             if raw_book is None or captures[kind].get('failure_code'):
                 return None
-            book = json.loads(raw_book)
+            book = _strict_json_loads(raw_book)
             if (not isinstance(book, dict) or book.get('market') != market['conditionId'] or
                     book.get('asset_id') != token or not isinstance(book.get('bids'), list) or
                     not isinstance(book.get('asks'), list) or not isinstance(book.get('timestamp'), str) or
@@ -697,7 +713,9 @@ class Campaign:
                     raw = get(kind, url)
                     if raw is None:
                         raise ValueError('missing Data API body')
-                    documents[kind] = json.loads(raw)
+                    documents[kind] = _strict_json_loads(raw)
+                except DuplicateJSONKeyError:
+                    raise  # Not a provider outage: never append ambiguous evidence.
                 except (TimeoutError, ValueError, TypeError) as exc:
                     failure_code = 'timeout' if isinstance(exc, TimeoutError) else 'invalid_or_unavailable'
                     captures.setdefault(kind, {'url': url, 'request_at': self.clock().astimezone(timezone.utc).isoformat(),
@@ -789,7 +807,7 @@ class DailyCampaign:
             body, _headers = response
             if not isinstance(body, bytes) or len(body) > LIMITS['gamma']:
                 raise ValueError('invalid daily Gamma response')
-            event = json.loads(body.decode('utf-8'))
+            event = _strict_json_loads(body.decode('utf-8'))
             config = discover_daily_manifest(event, self.target_date, self.start_at,
                                              pinned=state['pinned'], pinned_identity=state['prior_pin'])
             return Campaign(self.directory, config, fetch=self.fetch, clock=self.clock)._once(
@@ -813,7 +831,7 @@ def main():
     if args.report:
         result = report(args.directory)
     elif args.config:
-        result = Campaign(args.directory, Config(**json.loads(args.config.read_text()))).once()
+        result = Campaign(args.directory, Config(**_strict_json_loads(args.config.read_text()))).once()
     else:
         result = DailyCampaign(args.directory, args.discover_date, args.start_at).once()
     print(json.dumps(result, sort_keys=True))
