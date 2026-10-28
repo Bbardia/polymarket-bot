@@ -4,6 +4,7 @@ import hashlib
 import os
 import signal
 import time
+import tracemalloc
 from urllib.error import URLError
 from datetime import datetime, timezone
 from pathlib import Path
@@ -878,3 +879,113 @@ def test_event_day_cap_does_not_trust_unbacked_status_even_if_ids_differ(tmp_pat
         (tmp_path / f'{i:06d}.json').write_bytes(body)
         previous = hashlib.sha256(body).hexdigest()
     assert report(tmp_path)['resolved_event_days'] == 0
+
+
+def test_preflight_replays_once_without_materializing_rows(tmp_path, monkeypatch):
+    config, event = fixture()
+    assert awc_campaign.DailyCampaign(tmp_path, config.target_date, config.start_at,
+                                      fetch=_offline_fetch(event), clock=lambda: NOW).once()['sequence'] == 0
+    visits = []
+    original = awc_campaign._canonical
+    def counted(record):
+        if 'sequence' in record:
+            visits.append(record['sequence'])
+        return original(record)
+    monkeypatch.setattr(awc_campaign, '_canonical', counted)
+    assert awc_campaign.DailyCampaign(tmp_path, config.target_date, config.start_at,
+                                      fetch=_offline_fetch(event),
+                                      clock=lambda: NOW.replace(hour=13)).once()['sequence'] == 1
+    assert visits == [0, 1]  # one replay, then the new row's serialization
+
+
+def test_replay_memory_and_time_for_max_row_and_180_rows(tmp_path):
+    # One near-ceiling row plus a full chain of small rows: never build a 2.88 GB fixture.
+    row = {'sequence': 0, 'previous_sha256': None, 'target_date': '2026-10-28',
+           'captured_at': NOW.isoformat(), 'label': {'status': 'unverified'},
+           'captures': {'forecast': {'body': '\x00' * 2_200_000}}}
+    body = _canonical(row)
+    assert 13_000_000 < len(body) < awc_campaign.MAX_TAPE_ROW_BYTES
+    (tmp_path / '000000.json').write_bytes(body)
+    previous = hashlib.sha256(body).hexdigest()
+    for i in range(1, 180):
+        body = _canonical({'sequence': i, 'previous_sha256': previous,
+                           'target_date': '2026-10-28', 'captured_at': NOW.isoformat(),
+                           'label': {'status': 'unverified'}})
+        (tmp_path / f'{i:06d}.json').write_bytes(body)
+        previous = hashlib.sha256(body).hexdigest()
+    del row, body
+    tracemalloc.start()
+    start = time.monotonic()
+    result = report(tmp_path)
+    elapsed = time.monotonic() - start
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    print(f'AWC replay: peak={peak/1_000_000:.1f} MB elapsed={elapsed:.2f}s')
+    assert result['cycles'] == 180 and result['pending_labels'] == 180
+    assert peak < 130_000_000 and elapsed < 30
+
+
+def test_replay_preflight_180_rows_with_large_raw_capture(tmp_path):
+    config, event = fixture()
+    Campaign(tmp_path, config, fetch=_offline_fetch(event), clock=lambda: NOW).once()
+    row = json.loads((tmp_path / '000000.json').read_bytes())
+    row['captures']['forecast']['body'] = '\x00' * 2_200_000
+    row['captures']['forecast']['sha256'] = hashlib.sha256(row['captures']['forecast']['body'].encode()).hexdigest()
+    body = _canonical(row)
+    assert 13_000_000 < len(body) <= awc_campaign.MAX_TAPE_ROW_BYTES
+    (tmp_path / '000000.json').write_bytes(body)
+    previous = hashlib.sha256(body).hexdigest()
+    row['captures']['forecast']['body'] = ''
+    row['captures']['forecast']['sha256'] = hashlib.sha256(b'').hexdigest()
+    for i in range(1, 180):
+        row['sequence'], row['previous_sha256'] = i, previous
+        row['captured_at'] = NOW.replace(hour=13).isoformat()
+        body = _canonical(row)
+        (tmp_path / f'{i:06d}.json').write_bytes(body)
+        previous = hashlib.sha256(body).hexdigest()
+    del row, body
+    tracemalloc.start()
+    start = time.monotonic()
+    result = Campaign(tmp_path, config, fetch=lambda *_: pytest.fail('cap fetched'),
+                      clock=lambda: NOW.replace(hour=14)).once()
+    elapsed = time.monotonic() - start
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    print(f'AWC preflight: peak={peak/1_000_000:.1f} MB elapsed={elapsed:.2f}s')
+    assert result['status'] == 'cap'
+    assert peak < 130_000_000 and elapsed < 30
+
+
+def test_replay_rejects_rechained_prior_pin_drift_before_fetch(tmp_path):
+    config, event = fixture()
+    Campaign(tmp_path, config, fetch=_offline_fetch(event), clock=lambda: NOW).once()
+    Campaign(tmp_path, config, fetch=_offline_fetch(event),
+             clock=lambda: NOW.replace(hour=13)).once()
+    second = json.loads((tmp_path / '000001.json').read_bytes())
+    gamma = second['captures']['gamma']
+    changed = json.loads(gamma['body'])
+    changed['markets'][0]['conditionId'] = '0x' + 'b' * 64
+    gamma['body'] = json.dumps(changed)
+    gamma['sha256'] = hashlib.sha256(gamma['body'].encode()).hexdigest()
+    (tmp_path / '000001.json').write_bytes(_canonical(second))
+    # Canonical bytes, correct previous link and correct Gamma digest are not enough.
+    assert report(tmp_path)['cycles'] == 2
+    with pytest.raises(ValueError, match='pin drift'):
+        Campaign(tmp_path, config, fetch=lambda *_: pytest.fail('fetched'),
+                 clock=lambda: NOW.replace(hour=14)).once()
+
+
+def test_replay_rejects_middle_chain_before_fetch(tmp_path):
+    config, event = fixture()
+    Campaign(tmp_path, config, fetch=_offline_fetch(event), clock=lambda: NOW).once()
+    first = (tmp_path / '000000.json').read_bytes()
+    second = _canonical({'sequence': 1, 'previous_sha256': hashlib.sha256(first).hexdigest(),
+                         'target_date': config.target_date, 'captured_at': NOW.isoformat(),
+                         'label': {'status': 'unverified'}})
+    (tmp_path / '000001.json').write_bytes(second)
+    (tmp_path / '000000.json').write_bytes(first.replace(b'captured_partial', b'captured_changed'))
+    for operation in (lambda: report(tmp_path),
+                      lambda: Campaign(tmp_path, config, fetch=lambda *_: pytest.fail('fetched'),
+                                       clock=lambda: NOW.replace(hour=13)).once()):
+        with pytest.raises(ValueError, match='continuity'):
+            operation()

@@ -239,27 +239,19 @@ def _market_pin(market: dict) -> tuple[str, tuple[str, str]]:
     return market['conditionId'], tuple(_array(market['clobTokenIds']))
 
 
-def _previous_pin(rows: list[dict], config: Config):
-    """Recover even legacy pins from immutable raw Gamma, rejecting missing/drifted evidence."""
-    pins = []
-    for row in rows:
-        if row.get('target_date') != config.target_date:
-            continue
-        if (row.get('event_id'), row.get('market_id'), row.get('rule_sha256')) != (
-                config.event_id, config.market_id, config.rule_sha256):
-            raise ValueError('prior daily manifest pin drift')
-        try:
-            capture = row['captures']['gamma']
-            raw = capture['body'].encode('utf-8')
-            if hashlib.sha256(raw).hexdigest() != capture['sha256']:
-                raise ValueError('Gamma digest mismatch')
-            market = validate_event(config, json.loads(raw))['market']
-            pins.append(_market_pin(market))
-        except (KeyError, TypeError, ValueError, UnicodeError) as exc:
-            raise ValueError('prior daily manifest pin evidence invalid') from exc
-    if len(set(pins)) > 1:
+def _row_pin(row: dict, config: Config):
+    """Recover legacy condition and ordered tokens from hashed raw Gamma."""
+    if (row.get('event_id'), row.get('market_id'), row.get('rule_sha256')) != (
+            config.event_id, config.market_id, config.rule_sha256):
         raise ValueError('prior daily manifest pin drift')
-    return pins[0] if pins else None
+    try:
+        capture = row['captures']['gamma']
+        raw = capture['body'].encode('utf-8')
+        if hashlib.sha256(raw).hexdigest() != capture['sha256']:
+            raise ValueError('Gamma digest mismatch')
+        return _market_pin(validate_event(config, json.loads(raw))['market'])
+    except (KeyError, TypeError, ValueError, UnicodeError) as exc:
+        raise ValueError('prior daily manifest pin evidence invalid') from exc
 
 
 
@@ -398,12 +390,12 @@ def _canonical(record: dict) -> bytes:
     return (json.dumps(record, sort_keys=True, separators=(',', ':'), ensure_ascii=False) + '\n').encode()
 
 
-def _records(directory: Path) -> list[tuple[dict, str]]:
+def _iter_records(directory: Path):
+    """Validate and yield one bounded row at a time; never retain tape bodies."""
     with _directory_fd(directory) as dirfd:
         paths = sorted(name for name in os.listdir(dirfd) if name.endswith('.json')) if dirfd is not None else []
         if len(paths) > MAX_CYCLES:
             raise ValueError('cycle cap exceeded')
-        records = []
         prev = None
         for i, name in enumerate(paths):
             if name != f'{i:06d}.json':
@@ -423,15 +415,50 @@ def _records(directory: Path) -> list[tuple[dict, str]]:
             if body != _canonical(record) or record.get('sequence') != i or record.get('previous_sha256') != prev:
                 raise ValueError('tape continuity mismatch')
             prev = hashlib.sha256(body).hexdigest()
-            records.append((record, prev))
-        return records
+            yield record, prev
+
+
+def _replay(directory: Path, *, target_date=None, start_at=None, station=None, config=None, hour=None):
+    """Single-pass chain, finality and optional target-day pin preflight."""
+    state = {'cycles': 0, 'previous_sha256': None, 'last_at': None, 'pending_labels': 0,
+             'resolved_event_days': 0, 'already_captured': False, 'pinned': config,
+             'prior_pin': None}
+    resolved = set()  # at most 180 unique dates, never raw bodies
+    for row, digest in _iter_records(directory):
+        state['cycles'] += 1
+        state['previous_sha256'] = digest
+        state['last_at'] = row.get('captured_at')
+        corroborated = _corroborated_row(row)
+        if corroborated:
+            resolved.add(row['target_date'])
+        else:
+            state['pending_labels'] += 1
+        if start_at is not None and (row.get('campaign_start_at') != start_at or
+                                     row.get('station') != station):
+            raise ValueError('campaign identity/start drift')
+        if target_date is not None and row.get('target_date') == target_date:
+            if hour is not None and row.get('captured_at', '')[:13] == hour:
+                if config is None or row.get('event_id') == config.event_id:
+                    state['already_captured'] = True
+            if state['pinned'] is None:
+                day = date.fromisoformat(target_date)
+                slug = f'highest-temperature-in-karachi-on-{day.strftime("%B").lower()}-{day.day}-{day.year}'
+                state['pinned'] = Config(slug=slug, event_id=row['event_id'], market_id=row['market_id'],
+                                         target_date=target_date, station='OPKC', zone='Asia/Karachi',
+                                         latitude=24.9065, longitude=67.1608, start_at=start_at,
+                                         rule_sha256=row['rule_sha256'])
+            pin = _row_pin(row, state['pinned'])
+            if state['prior_pin'] is not None and pin != state['prior_pin']:
+                raise ValueError('prior daily manifest pin drift')
+            state['prior_pin'] = pin
+    state['resolved_event_days'] = len(resolved)
+    return state
 
 
 def report(directory: Path) -> dict:
-    rows = [row for row, _ in _records(directory)]
-    resolved = {row['target_date'] for row in rows if _corroborated_row(row)}
-    return {'cycles': len(rows), 'resolved_event_days': len(resolved), 'last_at': rows[-1]['captured_at'] if rows else None,
-            'pending_labels': sum(not _corroborated_row(row) for row in rows),
+    state = _replay(directory)
+    return {'cycles': state['cycles'], 'resolved_event_days': state['resolved_event_days'],
+            'last_at': state['last_at'], 'pending_labels': state['pending_labels'],
             'stop_at_resolved_days': MAX_RESOLVED_DAYS, 'stop_after_calendar_days': MAX_DAYS,
             'paper_only': True, 'live_eligible': False}
 
@@ -508,19 +535,17 @@ class Campaign:
         with _wall_bound(CYCLE_WALL_SECONDS, ValueError('cycle wall budget exhausted')):
             return self._once()
 
-    def _once(self, *, gamma_response=None) -> dict:
+    def _once(self, *, gamma_response=None, preflight=None) -> dict:
         now = self.clock().astimezone(timezone.utc)
-        rows = _records(self.directory)
-        if rows and any(r.get('campaign_start_at') != self.config.start_at or
-                        r.get('station') != self.config.station for r, _ in rows):
-            raise ValueError('campaign identity/start drift')
+        state = preflight if preflight is not None else _replay(
+            self.directory, target_date=self.config.target_date, start_at=self.config.start_at,
+            station=self.config.station, config=self.config, hour=now.isoformat()[:13])
         if now < _aware(self.config.start_at) or now >= _aware(self.config.start_at) + timedelta(days=MAX_DAYS):
             return {'status': 'deadline', 'paper_only': True}
-        if len(rows) >= MAX_CYCLES or report(self.directory)['resolved_event_days'] >= MAX_RESOLVED_DAYS:
+        if state['cycles'] >= MAX_CYCLES or state['resolved_event_days'] >= MAX_RESOLVED_DAYS:
             return {'status': 'cap', 'paper_only': True}
         # One immutable snapshot per event/UTC hour; no implicit retries.
-        if any(r['event_id'] == self.config.event_id and r['target_date'] == self.config.target_date
-               and r['captured_at'][:13] == now.isoformat()[:13] for r, _ in rows):
+        if state['already_captured']:
             return {'status': 'already_captured', 'paper_only': True}
         urls = {'gamma': 'https://gamma-api.polymarket.com/events/slug/' + self.config.slug}
         captures = {}
@@ -555,7 +580,7 @@ class Campaign:
         event = json.loads(get('gamma', urls['gamma']))
         identity = validate_event(self.config, event)
         market = identity['market']
-        prior_pin = _previous_pin([row for row, _ in rows], self.config)
+        prior_pin = state['prior_pin']
         if prior_pin is not None and _market_pin(market) != prior_pin:
             raise ValueError('daily condition/token pin drift')
         day = date.fromisoformat(self.config.target_date)
@@ -615,7 +640,7 @@ class Campaign:
             else:
                 label = crosscheck_resolution(self.config, market, gamma_label,
                                               documents['tokens'], documents['resolution'])
-        record = {'sequence': len(rows), 'previous_sha256': rows[-1][1] if rows else None,
+        record = {'sequence': state['cycles'], 'previous_sha256': state['previous_sha256'],
                   'status': status, 'paper_only': True, 'live_eligible': False,
                   'event_id': self.config.event_id, 'market_id': self.config.market_id,
                   'target_date': self.config.target_date, 'station': self.config.station, 'zone': self.config.zone,
@@ -628,7 +653,7 @@ class Campaign:
         if len(body) > MAX_TAPE_ROW_BYTES:
             raise ValueError('serialized tape row exceeds byte limit')
         with _directory_fd(self.directory, create=True) as dirfd:
-            name = f'{len(rows):06d}.json'
+            name = f'{state["cycles"]:06d}.json'
             temp = f'.{name}.{secrets.token_hex(16)}.tmp'
             try:
                 fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -671,13 +696,14 @@ class DailyCampaign:
     def once(self) -> dict:
         with _wall_bound(CYCLE_WALL_SECONDS, ValueError('cycle wall budget exhausted')):
             now = self.clock().astimezone(timezone.utc)
-            rows = [row for row, _ in _records(self.directory)]
-            if now < _aware(self.start_at) or now >= _aware(self.start_at) + timedelta(days=MAX_DAYS):
+            expired = now < _aware(self.start_at) or now >= _aware(self.start_at) + timedelta(days=MAX_DAYS)
+            state = _replay(self.directory, target_date=None if expired else self.target_date,
+                            start_at=None if expired else self.start_at, station='OPKC',
+                            hour=now.isoformat()[:13])
+            if expired:
                 return {'status': 'deadline', 'paper_only': True}
-            if len(rows) >= MAX_CYCLES or report(self.directory)['resolved_event_days'] >= MAX_RESOLVED_DAYS:
+            if state['cycles'] >= MAX_CYCLES or state['resolved_event_days'] >= MAX_RESOLVED_DAYS:
                 return {'status': 'cap', 'paper_only': True}
-            if any(row.get('campaign_start_at') != self.start_at or row.get('station') != 'OPKC' for row in rows):
-                raise ValueError('campaign start/station drift')
             day = date.fromisoformat(self.target_date)
             if day.isoformat() != self.target_date:
                 raise ValueError('invalid target date')
@@ -685,8 +711,7 @@ class DailyCampaign:
                     (_aware(self.start_at) + timedelta(days=MAX_DAYS)).astimezone(ZoneInfo('Asia/Karachi')).date()):
                 raise ValueError('target date outside campaign')
             slug = f'highest-temperature-in-karachi-on-{day.strftime("%B").lower()}-{day.day}-{day.year}'
-            previous = [r for r in rows if r.get('target_date') == self.target_date]
-            if previous and any(r.get('captured_at', '')[:13] == now.isoformat()[:13] for r in previous):
+            if state['already_captured']:
                 return {'status': 'already_captured', 'paper_only': True}
             url = 'https://gamma-api.polymarket.com/events/slug/' + slug
             response = self.fetch(url, LIMITS['gamma'])
@@ -694,20 +719,10 @@ class DailyCampaign:
             if not isinstance(body, bytes) or len(body) > LIMITS['gamma']:
                 raise ValueError('invalid daily Gamma response')
             event = json.loads(body.decode('utf-8'))
-            pinned = None
-            if previous:
-                first = previous[0]
-                pinned = Config(slug=slug, event_id=first['event_id'], market_id=first['market_id'],
-                                target_date=self.target_date, station='OPKC', zone='Asia/Karachi',
-                                latitude=24.9065, longitude=67.1608, start_at=self.start_at,
-                                rule_sha256=first['rule_sha256'])
-                if any((r['event_id'], r['market_id'], r['rule_sha256']) !=
-                       (pinned.event_id, pinned.market_id, pinned.rule_sha256) for r in previous):
-                    raise ValueError('prior daily manifest pin drift')
-            prior_pin = _previous_pin(previous, pinned) if pinned is not None else None
             config = discover_daily_manifest(event, self.target_date, self.start_at,
-                                             pinned=pinned, pinned_identity=prior_pin)
-            return Campaign(self.directory, config, fetch=self.fetch, clock=self.clock)._once(gamma_response=response)
+                                             pinned=state['pinned'], pinned_identity=state['prior_pin'])
+            return Campaign(self.directory, config, fetch=self.fetch, clock=self.clock)._once(
+                gamma_response=response, preflight=state)
 
 
 def main():
