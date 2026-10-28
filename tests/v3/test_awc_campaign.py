@@ -5,7 +5,10 @@ import os
 import signal
 import time
 import tracemalloc
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
+from io import BytesIO
+from email.message import Message
+from urllib.parse import parse_qs, urlsplit
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -38,6 +41,154 @@ def fixture():
     event = {'id': '1257298', 'slug': SLUG, 'eventDate': '2026-10-28',
              'description': RULES, 'resolutionSource': SOURCE, 'markets': [market]}
     return config, event
+
+
+def _book_for(url, event, *, bids=None, asks=None, at=NOW):
+    token = parse_qs(urlsplit(url).query)['token_id'][0]
+    return json.dumps({'market': event['markets'][0]['conditionId'], 'asset_id': token,
+                       'timestamp': str(int(at.timestamp() * 1000)), 'bids': bids if bids is not None else [],
+                       'asks': asks if asks is not None else []}).encode(), {'Status': 200}
+
+
+def test_two_exact_books_and_strict_seven_get_ceiling(tmp_path):
+    config, event = fixture()
+    calls = []
+    def fetch(url, limit):
+        calls.append((url, limit))
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: return b'{"hourly":{}}', {}
+        if '/book?' in url:
+            return _book_for(url, event, bids=[{'price': '0.2', 'size': '50'}],
+                             asks=[{'price': '0.3', 'size': '20'}])
+        if 'aviationweather' in url: return b'', {'Status': 204}
+        raise AssertionError(url)
+    result = awc_campaign.DailyCampaign(tmp_path, config.target_date, config.start_at,
+                                        fetch=fetch, clock=lambda: NOW).once()
+    assert result['status'] == 'captured_partial'
+    assert len(calls) == 5 and len(calls) <= 7
+    assert [parse_qs(urlsplit(u).query)['token_id'][0] for u, _ in calls if '/book?' in u] == ['123', '456']
+    row = json.loads((tmp_path / '000000.json').read_text())
+    assert row['book_evidence'] == {'Yes': 'verified_book', 'No': 'verified_book'}
+    assert row['captures']['book_no']['body'] != row['captures']['book']['body']
+    assert row['captures']['book_no']['sha256'] == hashlib.sha256(row['captures']['book_no']['body'].encode()).hexdigest()
+    assert row['captures']['book_no']['first_available_at'] == NOW.isoformat()
+    assert sum(awc_campaign.LIMITS.values()) * 6 < awc_campaign.MAX_TAPE_ROW_BYTES
+
+
+@pytest.mark.parametrize('bad', [
+    {'asset_id': '999'}, {'asset_id': '123'}, {'market': '0x' + 'b'*64},
+    {'timestamp': '179310240000'}, {'timestamp': '1793102400001.0'},
+    {'timestamp': '1793102406000'}, {'timestamp': '1793000000000'},
+])
+def test_no_book_identity_and_time_fail_closed(tmp_path, bad):
+    config, event = fixture()
+    def fetch(url, limit):
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: return b'{"hourly":{}}', {}
+        if '/book?' in url:
+            body, headers = _book_for(url, event)
+            if '456' in url: return json.dumps({**json.loads(body), **bad}).encode(), headers
+            return body, headers
+        raise AssertionError('should stop at invalid No book')
+    with pytest.raises(ValueError, match='book identity/timestamp'):
+        Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW).once()
+    assert not list(tmp_path.glob('*.json'))
+
+
+@pytest.mark.parametrize('level', [{'price': 'NaN', 'size': '1'},
+                                    {'price': '1.1', 'size': '1'},
+                                    {'price': '0.5', 'size': '0'},
+                                    {'price': '0.5', 'size': 'Infinity'},
+                                    {'price': '0.5'}])
+def test_malformed_no_ask_cannot_claim_book(tmp_path, level):
+    config, event = fixture()
+    def fetch(url, limit):
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: return b'{"hourly":{}}', {}
+        if '/book?' in url: return _book_for(url, event, asks=[level] if '456' in url else [])
+        raise AssertionError(url)
+    with pytest.raises(ValueError, match='book level'):
+        Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW).once()
+    assert not list(tmp_path.glob('*.json'))
+
+
+@pytest.mark.parametrize('no_result,code', [
+    ((b'{"error":"No orderbook exists for the requested token id"}', {'Status': 404}), 'no_book'),
+    (TimeoutError('timed out'), 'timeout'),
+])
+def test_no_book_unavailable_retains_upstream_without_executable_claim(tmp_path, no_result, code):
+    config, event = fixture()
+    calls = []
+    def fetch(url, limit):
+        calls.append(url)
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: return b'{"hourly":{}}', {}
+        if '/book?' in url:
+            if '456' in url:
+                if isinstance(no_result, Exception): raise no_result
+                return no_result
+            return _book_for(url, event)
+        if 'aviationweather' in url: return b'', {'Status': 200}
+        raise AssertionError(url)
+    assert Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW).once()['status'] == 'captured'
+    assert len(calls) == 5
+    row = json.loads((tmp_path / '000000.json').read_text())
+    assert row['book_evidence'] == {'Yes': 'verified_book', 'No': 'unverified_' + code}
+    assert row['captures']['book_no']['failure_code'] == code
+    assert row['captures']['book']['status'] == 200
+    assert row['label']['status'] == 'unverified' and report(tmp_path)['resolved_event_days'] == 0
+    if code == 'no_book':
+        assert row['captures']['book_no']['status'] == 404
+        assert row['captures']['book_no']['body'] == no_result[0].decode()
+    else:
+        assert 'body' not in row['captures']['book_no']
+
+
+@pytest.mark.parametrize('response', [(b'{"error":"unknown token"}', {'Status': 404}),
+                                      (b'{"error":"No orderbook exists for the requested token id"}', {'Status': 200}),
+                                      (b'{"error":"No orderbook exists for the requested token id"}', {'Status': 503})])
+def test_unknown_no_token_or_unexpected_status_fails_closed(tmp_path, response):
+    config, event = fixture()
+    def fetch(url, limit):
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: return b'{"hourly":{}}', {}
+        if '/book?' in url: return response if '456' in url else _book_for(url, event)
+        raise AssertionError(url)
+    with pytest.raises(ValueError):
+        Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW).once()
+    assert not list(tmp_path.glob('*.json'))
+
+
+def test_no_ask_book_keeps_raw_snapshot_but_cannot_claim_executable_no(tmp_path):
+    config, event = fixture()
+    def fetch(url, limit):
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: return b'{"hourly":{}}', {}
+        if '/book?' in url: return _book_for(url, event, bids=[])
+        if 'aviationweather' in url: return b'', {'Status': 204}
+        raise AssertionError(url)
+    Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW).once()
+    row = json.loads((tmp_path / '000000.json').read_text())
+    assert row['book_evidence']['No'] == 'unverified_no_ask'
+    assert row['captures']['book_no']['status'] == 200
+    assert json.loads(row['captures']['book_no']['body'])['asks'] == []
+
+
+def test_public_fetch_bounded_clob_404_preserves_body_and_rejects_other_http(monkeypatch):
+    calls = []
+    def open_response(request, timeout):
+        calls.append(request.full_url)
+        headers = Message()
+        headers['Date'] = 'test'
+        raise HTTPError(request.full_url, 404, 'Not Found', headers,
+                        BytesIO(b'{"error":"No orderbook exists for the requested token id"}'))
+    monkeypatch.setattr(awc_campaign, 'build_opener', lambda *args: type('Opener', (), {'open': staticmethod(open_response)})())
+    body, headers = public_fetch('https://clob.polymarket.com/book?token_id=456', 100)
+    assert headers['Status'] == 404 and body.startswith(b'{"error"') and len(calls) == 1
+    with pytest.raises(ValueError):
+        public_fetch('https://gamma-api.polymarket.com/events/slug/' + SLUG, 100)
+    with pytest.raises(ValueError, match='byte limit'):
+        public_fetch('https://clob.polymarket.com/book?token_id=456', 5)
 
 
 def test_identity_rejects_modified_rule_station_source_and_duplicate():
@@ -84,12 +235,11 @@ def test_cycle_is_bounded_append_only_and_stops_on_deadline(tmp_path):
         if 'open-meteo' in url:
             return b'{"hourly":{"time":[],"temperature_2m":[]}}', {}
         if 'clob.polymarket.com' in url:
-            return json.dumps({'market': '0x'+'a'*64, 'asset_id': '123',
-                               'timestamp': '1793102400000', 'bids': [], 'asks': []}).encode(), {}
+            return _book_for(url, event)
         return b'METAR OPKC 280600Z 00000KT 9999 FEW020 32/23 Q1010 RMK T03200230\n', {}
     campaign = Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW)
     result = campaign.once()
-    assert result['status'] == 'captured' and len(calls) == 4
+    assert result['status'] == 'captured' and len(calls) == 5
     files = list(tmp_path.glob('*.json'))
     assert len(files) == 1
     saved = json.loads(files[0].read_text())
@@ -99,7 +249,7 @@ def test_cycle_is_bounded_append_only_and_stops_on_deadline(tmp_path):
     assert saved['observation']['status'] == 'future_day'
     assert saved['label']['status'] == 'unverified'
     assert campaign.once()['status'] == 'already_captured'
-    assert len(calls) == 4 and len(list(tmp_path.glob('*.json'))) == 1
+    assert len(calls) == 5 and len(list(tmp_path.glob('*.json'))) == 1
     assert report(tmp_path)['cycles'] == 1
     expired = Config(**{**config.__dict__, 'start_at': '2026-09-01T00:00:00+00:00'})
     assert Campaign(tmp_path / 'expired', expired, fetch=fetch, clock=lambda: NOW).once()['status'] == 'deadline'
@@ -199,19 +349,18 @@ def test_awc_unavailable_preserves_verified_upstream_evidence_without_label(tmp_
         if 'open-meteo' in url:
             return b'{"hourly":{"time":[],"temperature_2m":[]}}', {'Status': 200}
         if 'clob.polymarket.com' in url:
-            return json.dumps({'market': market['conditionId'], 'asset_id': '123',
-                               'timestamp': '1793102400000', 'bids': [], 'asks': []}).encode(), {'Status': 200}
+            return _book_for(url, event)
         if isinstance(awc_result, Exception):
             raise awc_result
         return awc_result
     campaign = Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW)
     result = campaign.once()
     assert result['status'] == 'captured_partial' and result['label'] == 'unverified'
-    assert len(calls) == 4
+    assert len(calls) == 5
     saved = json.loads((tmp_path / '000000.json').read_text())
     assert saved['status'] == 'captured_partial'
-    assert set(saved['captures']) == {'gamma', 'forecast', 'book', 'awc'}
-    for source in ('gamma', 'forecast', 'book'):
+    assert set(saved['captures']) == {'gamma', 'forecast', 'book', 'book_no', 'awc'}
+    for source in ('gamma', 'forecast', 'book', 'book_no'):
         capture = saved['captures'][source]
         assert capture['status'] == 200 and capture['body'] and len(capture['sha256']) == 64
         assert capture['first_available_at'] == NOW.isoformat()
@@ -226,7 +375,7 @@ def test_awc_unavailable_preserves_verified_upstream_evidence_without_label(tmp_
     assert saved['observation'] == {'status': 'unavailable', 'reason': reason,
                                      'correction_cutoff_proven': False, 'wu_fallback_proven': False}
     assert saved['label']['status'] == 'unverified' and 'winner' not in saved['label']
-    assert campaign.once()['status'] == 'already_captured' and len(calls) == 4
+    assert campaign.once()['status'] == 'already_captured' and len(calls) == 5
     assert report(tmp_path)['pending_labels'] == 1
     assert report(tmp_path)['resolved_event_days'] == 0
 
@@ -254,8 +403,7 @@ def test_only_awc_no_data_or_timeout_can_write_partial(tmp_path, failure):
         if 'open-meteo' in url:
             return b'{"hourly":{}}', {}
         if 'clob.polymarket.com' in url:
-            return json.dumps({'market': event['markets'][0]['conditionId'], 'asset_id': '123',
-                               'timestamp': '1793102400000', 'bids': [], 'asks': []}).encode(), {}
+            return _book_for(url, event)
         if isinstance(failure, Exception):
             raise failure
         return failure
@@ -386,8 +534,7 @@ def test_directory_replaced_after_preflight_cannot_redirect_append(tmp_path):
         if 'open-meteo' in url:
             return b'{"hourly":{}}', {}
         if 'clob.polymarket.com' in url:
-            return json.dumps({'market': event['markets'][0]['conditionId'], 'asset_id': '123',
-                               'timestamp': '1793102400000', 'bids': [], 'asks': []}).encode(), {}
+            return _book_for(url, event)
         return b'', {'Status': 204}
     with pytest.raises(ValueError, match='symlink'):
         Campaign(inside, config, fetch=fetch, clock=lambda: NOW).once()
@@ -411,8 +558,7 @@ def test_cycle_deadline_takes_priority_over_awc_request_timeout(tmp_path, monkey
         if 'open-meteo' in url:
             return b'{"hourly":{}}', {}
         if 'clob.polymarket.com' in url:
-            return json.dumps({'market': event['markets'][0]['conditionId'], 'asset_id': '123',
-                               'timestamp': '1793102400000', 'bids': [], 'asks': []}).encode(), {}
+            return _book_for(url, event)
         return public_fetch(SOURCE, limit)
     monkeypatch.setattr('src.v3.awc_campaign.build_opener', lambda *args: type('Opener', (), {'open': lambda *a, **kw: Response()})())
     with pytest.raises(ValueError, match='cycle wall budget exhausted'):
@@ -420,15 +566,14 @@ def test_cycle_deadline_takes_priority_over_awc_request_timeout(tmp_path, monkey
     assert not list(tmp_path.glob('*.json'))
 
 
-def _offline_fetch(event):
+def _offline_fetch(event, *, at=NOW):
     def fetch(url, limit):
         if 'gamma-api' in url:
             return json.dumps(event).encode(), {}
         if 'open-meteo' in url:
             return b'{"hourly":{}}', {}
         if 'clob.polymarket.com' in url:
-            return json.dumps({'market': event['markets'][0]['conditionId'], 'asset_id': '123',
-                               'timestamp': '1793102400000', 'bids': [], 'asks': []}).encode(), {}
+            return _book_for(url, event, at=at)
         return b'', {'Status': 204}
     return fetch
 
@@ -757,21 +902,23 @@ def test_cycle_crosscheck_is_bounded_and_outage_cannot_count_day(tmp_path):
         if 'gamma-api' in url: return json.dumps(event).encode(), {}
         if 'open-meteo' in url: return b'{"hourly":{}}', {}
         if '/book?' in url:
-            return json.dumps({'market': m['conditionId'], 'asset_id': '123',
-                               'timestamp': '1793102400000', 'bids': [], 'asks': []}).encode(), {}
+            if 'token_id=456' in url:
+                return b'{"error":"No orderbook exists for the requested token id"}', {'Status': 404}
+            return _book_for(url, event, at=future if len(calls) <= 7 else future.replace(hour=1))
         if 'aviationweather' in url: return b'', {'Status': 200}
         if '/v2/tokens?' in url: return json.dumps(tokens).encode(), {}
         if '/v2/resolutions?' in url: return json.dumps(resolution).encode(), {}
         raise AssertionError(url)
     result = Campaign(tmp_path, config, fetch=fetch, clock=lambda: future).once()
-    assert result['label'] == 'venue_corroborated_final_binary' and len(calls) == 6
+    assert result['label'] == 'venue_corroborated_final_binary' and len(calls) == 7
     assert report(tmp_path)['resolved_event_days'] == 1
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(awc_campaign, 'MAX_RESOLVED_DAYS', 1)
         assert Campaign(tmp_path, config, fetch=lambda *_: pytest.fail('cap fetched network'),
                         clock=lambda: future.replace(hour=1)).once()['status'] == 'cap'
     saved = json.loads((tmp_path / '000000.json').read_text())
-    assert set(saved['captures']) == {'gamma', 'forecast', 'book', 'awc', 'tokens', 'resolution'}
+    assert set(saved['captures']) == {'gamma', 'forecast', 'book', 'book_no', 'awc', 'tokens', 'resolution'}
+    assert saved['book_evidence']['No'] == 'unverified_no_book'
     assert saved['gamma_label']['status'] == 'official_gamma_binary'
     # The reporting cap must replay both APIs, not trust a status string or digest.
     for kind, mutation in [('tokens', lambda d: d['data'][0].update(token_id='999')),
@@ -802,7 +949,7 @@ def test_cycle_crosscheck_is_bounded_and_outage_cannot_count_day(tmp_path):
     row = json.loads((tmp_path / '000001.json').read_text())
     assert row['captures']['tokens']['failure_code'] == 'timeout'
     assert 'resolution' not in row['captures']
-    assert len(calls) <= 11
+    assert len(calls) <= 13
 
 
 def test_daily_cycle_uses_one_gamma_and_pins_manifest_across_hours(tmp_path):
@@ -814,21 +961,20 @@ def test_daily_cycle_uses_one_gamma_and_pins_manifest_across_hours(tmp_path):
         if 'gamma-api' in url: return json.dumps(event).encode(), {'Status': 200}
         if 'open-meteo' in url: return b'{"hourly":{}}', {}
         if '/book?' in url:
-            return json.dumps({'market': event['markets'][0]['conditionId'], 'asset_id': '123',
-                               'timestamp': '1793102400000', 'bids': [], 'asks': []}).encode(), {}
+            return _book_for(url, event)
         if 'aviationweather' in url: return b'', {'Status': 204}
         raise AssertionError(url)
     daily = DailyCampaign(tmp_path, config.target_date, config.start_at, fetch=fetch, clock=lambda: NOW)
     assert daily.once()['status'] == 'captured_partial'
-    assert len(calls) == 4 and sum('gamma-api' in u for u in calls) == 1
-    assert daily.once()['status'] == 'already_captured' and len(calls) == 4
+    assert len(calls) == 5 and sum('gamma-api' in u for u in calls) == 1
+    assert daily.once()['status'] == 'already_captured' and len(calls) == 5
     event['description'] += '\nchanged'
     event['markets'][0]['description'] = event['description']
     daily = DailyCampaign(tmp_path, config.target_date, config.start_at, fetch=fetch,
                           clock=lambda: NOW.replace(hour=13))
     with pytest.raises(ValueError, match='pin'):
         daily.once()
-    assert len(calls) == 5 and len(list(tmp_path.glob('*.json'))) == 1
+    assert len(calls) == 6 and len(list(tmp_path.glob('*.json'))) == 1
     expired = DailyCampaign(tmp_path, config.target_date, '2026-08-01T00:00:00Z',
                             fetch=lambda *_: (_ for _ in ()).throw(AssertionError('no GET')),
                             clock=lambda: NOW)
@@ -856,8 +1002,7 @@ def test_daily_discovery_failure_and_data_api_invalid_response_never_promote(tmp
         if 'gamma-api' in url: return json.dumps(event).encode(), {}
         if 'open-meteo' in url: return b'{"hourly":{}}', {}
         if '/book?' in url:
-            return json.dumps({'market': event['markets'][0]['conditionId'], 'asset_id': '123',
-                               'timestamp': '1793102400000', 'bids': [], 'asks': []}).encode(), {}
+            return _book_for(url, event, at=future)
         if 'aviationweather' in url: return b'', {'Status': 200}
         return b'{bad json', {'Status': 200}
     result = DailyCampaign(tmp_path, config.target_date, config.start_at,
@@ -893,7 +1038,7 @@ def test_preflight_replays_once_without_materializing_rows(tmp_path, monkeypatch
         return original(record)
     monkeypatch.setattr(awc_campaign, '_canonical', counted)
     assert awc_campaign.DailyCampaign(tmp_path, config.target_date, config.start_at,
-                                      fetch=_offline_fetch(event),
+                                      fetch=_offline_fetch(event, at=NOW.replace(hour=13)),
                                       clock=lambda: NOW.replace(hour=13)).once()['sequence'] == 1
     assert visits == [0, 1]  # one replay, then the new row's serialization
 
@@ -959,7 +1104,7 @@ def test_replay_preflight_180_rows_with_large_raw_capture(tmp_path):
 def test_replay_rejects_rechained_prior_pin_drift_before_fetch(tmp_path):
     config, event = fixture()
     Campaign(tmp_path, config, fetch=_offline_fetch(event), clock=lambda: NOW).once()
-    Campaign(tmp_path, config, fetch=_offline_fetch(event),
+    Campaign(tmp_path, config, fetch=_offline_fetch(event, at=NOW.replace(hour=13)),
              clock=lambda: NOW.replace(hour=13)).once()
     second = json.loads((tmp_path / '000001.json').read_bytes())
     gamma = second['captures']['gamma']

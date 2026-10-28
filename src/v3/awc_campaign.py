@@ -31,10 +31,10 @@ from .awc_metar_observation import inspect_awc_source, parse_raw_observations
 MAX_CYCLES = 180  # independent hard disk bound; no recurrence is installed
 MAX_RESOLVED_DAYS = 30
 MAX_DAYS = 45
-LIMITS = {'gamma': 1_000_000, 'forecast': 300_000, 'book': 512_000, 'awc': 256_000,
-          'tokens': 128_000, 'resolution': 128_000}
+LIMITS = {'gamma': 512_000, 'forecast': 128_000, 'book': 256_000,
+          'book_no': 256_000, 'awc': 128_000, 'tokens': 64_000, 'resolution': 64_000}
 # Worst-case JSON escape expansion is six bytes per input byte (e.g. NUL).
-# 6 * sum(LIMITS) = 13,944,000; the remainder covers bounded row metadata.
+# 6 * sum(LIMITS) = 8,448,000; the remainder covers bounded row metadata.
 # Check the serialized row before publishing, including untrusted headers.
 MAX_TAPE_ROW_BYTES = 16_000_000
 APPROVED_OUTPUT_ROOT = Path(__file__).absolute().parents[2] / 'data' / 'awc-campaign'
@@ -232,7 +232,7 @@ def validate_event(config: Config, event: dict) -> dict:
         raise ValueError('unsupported outcomes')
     if not isinstance(market.get('question'), str) or not market['question']:
         raise ValueError('market question missing')
-    return {'market': market, 'token_id': tokens[0]}
+    return {'market': market, 'token_id': tokens[0], 'no_token_id': tokens[1]}
 
 
 def _market_pin(market: dict) -> tuple[str, tuple[str, str]]:
@@ -357,8 +357,15 @@ def public_fetch(url: str, limit: int) -> tuple[bytes, dict]:
 
 def _fetch_response(opener, url, parts, limit):
     try:
-        with opener.open(Request(url, headers={'User-Agent': 'awc-paper-observation/1.0', 'Accept': 'application/json, text/plain'}), timeout=10) as response:
-            if response.status != 200 and not (parts.hostname == 'aviationweather.gov' and response.status == 204):
+        request = Request(url, headers={'User-Agent': 'awc-paper-observation/1.0', 'Accept': 'application/json, text/plain'})
+        try:
+            response = opener.open(request, timeout=10)
+        except HTTPError as exc:
+            if not (parts.hostname == 'clob.polymarket.com' and parts.path == '/book' and exc.code == 404):
+                raise ValueError('public HTTP non-200') from exc
+            response = exc  # preserve bounded 404 body, headers and acquisition time
+        with response:
+            if response.status != 200 and not (parts.hostname == 'aviationweather.gov' and response.status == 204) and not (parts.hostname == 'clob.polymarket.com' and parts.path == '/book' and response.status == 404):
                 raise ValueError('public HTTP non-200')
             length = response.headers.get('Content-Length')
             if length and (not length.isdecimal() or int(length) > limit):
@@ -555,7 +562,7 @@ class Campaign:
                 body, headers = (gamma_response if kind == 'gamma' and gamma_response is not None
                                  else self.fetch(url, LIMITS[kind]))
             except TimeoutError:
-                if kind != 'awc':
+                if kind not in ('awc', 'book_no'):
                     raise
                 captures[kind] = {'url': url, 'request_at': start,
                                   'failed_at': self.clock().astimezone(timezone.utc).isoformat(),
@@ -564,7 +571,7 @@ class Campaign:
             if not isinstance(body, bytes) or len(body) > LIMITS[kind]:
                 raise ValueError('oversized or invalid response')
             status = headers.get('Status', 200)
-            if status != 200 and not (kind == 'awc' and status == 204 and not body):
+            if status != 200 and not (kind == 'awc' and status == 204 and not body) and not (kind == 'book_no' and status == 404):
                 raise ValueError('unexpected source status or 204 body')
             end = self.clock().astimezone(timezone.utc).isoformat()
             text = body.decode('utf-8', errors='strict')
@@ -574,6 +581,12 @@ class Campaign:
                               'sha256': hashlib.sha256(body).hexdigest(), 'body': text}
             if status == 204:
                 captures[kind]['failure_code'] = 'no_data'
+            if kind == 'book_no' and status == 404:
+                # Only the documented no-orderbook reply, never unknown token
+                # or a generic CLOB error, can be persisted as absence.
+                if json.loads(text) != {'error': 'No orderbook exists for the requested token id'}:
+                    raise ValueError('unexpected No book 404')
+                captures[kind]['failure_code'] = 'no_book'
             if kind == 'forecast':
                 captures[kind]['issue_at'] = None  # provider omitted run issuance
             return text
@@ -592,12 +605,42 @@ class Campaign:
         if not isinstance(forecast, dict) or not isinstance(forecast.get('hourly'), dict):
             raise ValueError('invalid forecast')
         # Open-Meteo response lacks a reliable run/issue timestamp. Never infer one.
-        book = json.loads(get('book', 'https://clob.polymarket.com/book?' + urlencode({'token_id': identity['token_id']})))
-        if not isinstance(book, dict) or book.get('market') != market['conditionId'] or book.get('asset_id') != identity['token_id'] or not isinstance(book.get('bids'), list) or not isinstance(book.get('asks'), list) or not re.fullmatch(r'\d{13}', str(book.get('timestamp', ''))):
-            raise ValueError('book identity/timestamp mismatch')
-        book_at = datetime.fromtimestamp(int(book['timestamp']) / 1000, timezone.utc)
-        if book_at > _aware(captures['book']['first_available_at']) + timedelta(seconds=5):
-            raise ValueError('book timestamp ahead of acquisition')
+        def checked_book(kind, token):
+            raw_book = get(kind, 'https://clob.polymarket.com/book?' + urlencode({'token_id': token}))
+            if raw_book is None or captures[kind].get('failure_code'):
+                return None
+            book = json.loads(raw_book)
+            if (not isinstance(book, dict) or book.get('market') != market['conditionId'] or
+                    book.get('asset_id') != token or not isinstance(book.get('bids'), list) or
+                    not isinstance(book.get('asks'), list) or not isinstance(book.get('timestamp'), str) or
+                    not re.fullmatch(r'\d{13}', book['timestamp'])):
+                raise ValueError('book identity/timestamp mismatch')
+            for side in ('bids', 'asks'):
+                for level in book[side]:
+                    if (not isinstance(level, dict) or
+                            not isinstance(level.get('price'), str) or
+                            not isinstance(level.get('size'), str)):
+                        raise ValueError('book level invalid')
+                    try:
+                        price, size = Decimal(level['price']), Decimal(level['size'])
+                    except InvalidOperation as exc:
+                        raise ValueError('book level invalid') from exc
+                    if not (price.is_finite() and size.is_finite() and
+                            Decimal(0) < price <= Decimal(1) and size > 0):
+                        raise ValueError('book level invalid')
+            book_at = datetime.fromtimestamp(int(book['timestamp']) / 1000, timezone.utc)
+            received = _aware(captures[kind]['first_available_at'])
+            if not received - timedelta(seconds=120) <= book_at <= received + timedelta(seconds=5):
+                raise ValueError('book identity/timestamp mismatch')
+            return book
+        checked_book('book', identity['token_id'])
+        no_book = checked_book('book_no', identity['no_token_id'])
+        no_reason = captures['book_no'].get('failure_code')
+        if no_reason:
+            no_status = 'unverified_' + no_reason
+        else:
+            no_status = 'verified_book' if no_book is not None and no_book['asks'] else 'unverified_no_ask'
+        book_evidence = {'Yes': 'verified_book', 'No': no_status}
         raw = get('awc', event['resolutionSource'])
         awc_reason = captures['awc'].get('failure_code')
         if awc_reason:
@@ -646,7 +689,7 @@ class Campaign:
                   'target_date': self.config.target_date, 'station': self.config.station, 'zone': self.config.zone,
                   'campaign_start_at': self.config.start_at, 'rule_sha256': self.config.rule_sha256,
                   'captured_at': now.isoformat(), 'captures': captures, 'observation': obs,
-                  'gamma_label': gamma_label, 'label': label}
+                  'gamma_label': gamma_label, 'label': label, 'book_evidence': book_evidence}
         # Publish only a complete, fsynced row; a signal during creation must
         # never leave a numbered entry that blocks the sequence permanently.
         body = _canonical(record)
@@ -688,7 +731,7 @@ class Campaign:
 
 
 class DailyCampaign:
-    """Manual daily discovery; reuse its Gamma read within the six-GET cycle."""
+    """Manual daily discovery; reuse its Gamma read within the seven-GET cycle."""
     def __init__(self, directory: Path, target_date: str, start_at: str, *, fetch=public_fetch, clock=None):
         self.directory, self.target_date, self.start_at, self.fetch = directory, target_date, start_at, fetch
         self.clock = clock or (lambda: datetime.now(timezone.utc))
