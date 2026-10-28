@@ -42,16 +42,40 @@ def fixture():
              'description': RULES, 'resolutionSource': SOURCE, 'markets': [market]}
     return config, event
 
+def daily_fixture(day='2026-10-28'):
+    """Offline 11-rung shape: lower tail, nine degrees, upper tail."""
+    base, event = fixture()
+    edge = 32 if day == '2026-10-28' else 31
+    event['eventDate'] = day
+    event['slug'] = f'highest-temperature-in-karachi-on-october-{int(day[-2:])}-2026'
+    event['resolutionSource'] = SOURCE.replace('2026-10-28', day)
+    questions = ([f'{edge}°C or below'] + [f'{n}°C' for n in range(edge + 1, edge + 10)] +
+                 [f'{edge + 10}°C or higher'])
+    markets = []
+    for i, bracket in enumerate(questions):
+        market = {**event['markets'][0], 'id': str(6239073 + i),
+                  'question': f'Will the highest temperature in Karachi be {bracket} on October {int(day[-2:])}?',
+                  'conditionId': '0x' + f'{i + 1:064x}',
+                  'clobTokenIds': json.dumps([str(100 + i * 2), str(101 + i * 2)]),
+                  'resolutionSource': event['resolutionSource']}
+        markets.append(market)
+    event['markets'] = markets
+    selected = markets[5]
+    config = Config(**{**base.__dict__, 'slug': event['slug'], 'target_date': day,
+                       'market_id': selected['id']})
+    return config, event
+
 
 def _book_for(url, event, *, bids=None, asks=None, at=NOW):
     token = parse_qs(urlsplit(url).query)['token_id'][0]
-    return json.dumps({'market': event['markets'][0]['conditionId'], 'asset_id': token,
+    market = next((m for m in event['markets'] if token in json.loads(m['clobTokenIds'])), event['markets'][0])
+    return json.dumps({'market': market['conditionId'], 'asset_id': token,
                        'timestamp': str(int(at.timestamp() * 1000)), 'bids': bids if bids is not None else [],
                        'asks': asks if asks is not None else []}).encode(), {'Status': 200}
 
 
 def test_two_exact_books_and_strict_seven_get_ceiling(tmp_path):
-    config, event = fixture()
+    config, event = daily_fixture()
     calls = []
     def fetch(url, limit):
         calls.append((url, limit))
@@ -66,7 +90,7 @@ def test_two_exact_books_and_strict_seven_get_ceiling(tmp_path):
                                         fetch=fetch, clock=lambda: NOW).once()
     assert result['status'] == 'captured_partial'
     assert len(calls) == 5 and len(calls) <= 7
-    assert [parse_qs(urlsplit(u).query)['token_id'][0] for u, _ in calls if '/book?' in u] == ['123', '456']
+    assert [parse_qs(urlsplit(u).query)['token_id'][0] for u, _ in calls if '/book?' in u] == ['110', '111']
     row = json.loads((tmp_path / '000000.json').read_text())
     assert row['book_evidence'] == {'Yes': 'verified_book', 'No': 'verified_book'}
     assert row['captures']['book_no']['body'] != row['captures']['book']['body']
@@ -737,39 +761,97 @@ def test_alarm_on_nested_entry_unmask_rolls_back_both_bounds(monkeypatch):
     assert signal.getitimer(signal.ITIMER_REAL)[0] == 0
 
 
-def test_daily_manifest_discovery_pins_unique_first_rung_and_rule():
-    from src.v3.awc_campaign import discover_daily_manifest
-    config, event = fixture()
-    found = discover_daily_manifest(event, config.target_date, config.start_at)
-    assert found == config
+@pytest.mark.parametrize('day,median', [('2026-10-28', 37), ('2026-10-29', 36)])
+def test_daily_manifest_selects_sorted_median_and_pins_rule(day, median):
+    config, event = daily_fixture(day)
+    assert awc_campaign.discover_daily_manifest(event, day, config.start_at) == config
+    assert f'{median}°C on' in event['markets'][5]['question']
+    for reordered in (list(reversed(event['markets'])), event['markets'][::2] + event['markets'][1::2]):
+        assert awc_campaign.discover_daily_manifest({**event, 'markets': reordered}, day, config.start_at) == config
     for changed in (
-        {**event, 'eventDate': '2026-10-29'},
-        {**event, 'slug': SLUG + '-wrong'},
+        {**event, 'eventDate': '2026-10-30'},
+        {**event, 'slug': event['slug'] + '-wrong'},
         {**event, 'markets': event['markets'] * 2},
-        {**event, 'markets': [{**event['markets'][0], 'question': 'Karachi 32°C or below?'}]},
         {**event, 'resolutionSource': SOURCE.replace('OPKC', 'KJFK')},
     ):
         with pytest.raises(ValueError):
-            discover_daily_manifest(changed, config.target_date, config.start_at)
+            awc_campaign.discover_daily_manifest(changed, day, config.start_at)
     changed = {**event, 'description': RULES + '\nchanged'}
-    changed['markets'] = [{**event['markets'][0], 'description': changed['description']}]
-    assert discover_daily_manifest(changed, config.target_date, config.start_at).rule_sha256 != config.rule_sha256
+    changed['markets'] = [{**m, 'description': changed['description']} for m in event['markets']]
+    assert awc_campaign.discover_daily_manifest(changed, day, config.start_at).rule_sha256 != config.rule_sha256
     with pytest.raises(ValueError, match='pin'):
-        discover_daily_manifest(changed, config.target_date, config.start_at, pinned=config)
+        awc_campaign.discover_daily_manifest(changed, day, config.start_at, pinned=config)
+
+@pytest.mark.parametrize('mutation', [
+    lambda e: e['markets'].pop(),
+    lambda e: e['markets'].append({**e['markets'][-1], 'id': '99999'}),
+    lambda e: e['markets'].__setitem__(4, {**e['markets'][4], 'question': e['markets'][3]['question']}),
+    lambda e: e['markets'].__setitem__(4, {**e['markets'][4], 'question': e['markets'][4]['question'].replace('36°C', '50°C')}),
+    lambda e: e['markets'].__setitem__(0, {**e['markets'][0], 'question': e['markets'][0]['question'].replace('or below', 'or lower')}),
+    lambda e: e['markets'].__setitem__(10, {**e['markets'][10], 'question': e['markets'][10]['question'].replace('or higher', 'or above')}),
+    lambda e: e['markets'].__setitem__(5, {**e['markets'][5], 'question': e['markets'][5]['question'].replace('37°C', '37.0°C')}),
+    lambda e: e['markets'].__setitem__(5, {**e['markets'][5], 'question': e['markets'][5]['question'].replace('Karachi', 'Lahore')}),
+    lambda e: e['markets'].__setitem__(1, {**e['markets'][1], 'resolutionSource': SOURCE.replace('OPKC', 'KJFK')}),
+    lambda e: e['markets'].__setitem__(1, {**e['markets'][1], 'description': RULES + ' changed'}),
+    lambda e: e['markets'].__setitem__(1, {**e['markets'][1], 'conditionId': 'bad'}),
+    lambda e: e['markets'].__setitem__(1, {**e['markets'][1], 'conditionId': e['markets'][2]['conditionId']}),
+    lambda e: e['markets'].__setitem__(1, {**e['markets'][1], 'clobTokenIds': e['markets'][2]['clobTokenIds']}),
+    lambda e: e['markets'].__setitem__(1, {**e['markets'][1], 'outcomes': '["No","Yes"]'}),
+    lambda e: e['markets'].__setitem__(1, {**e['markets'][1], 'question': e['markets'][1]['question'].replace('October 28', 'October 29')}),
+])
+def test_daily_discovery_refuses_incomplete_ambiguous_or_drifting_brackets(mutation):
+    config, event = daily_fixture()
+    mutation(event)
+    with pytest.raises(ValueError):
+        awc_campaign.discover_daily_manifest(event, config.target_date, config.start_at)
+
+def test_daily_rejects_invalid_bracket_before_any_books_or_append(tmp_path):
+    config, event = daily_fixture()
+    event['markets'][1]['resolutionSource'] = SOURCE.replace('OPKC', 'KJFK')
+    requests = []
+    def fetch(url, limit):
+        requests.append(url)
+        return json.dumps(event).encode(), {'Status': 200}
+    with pytest.raises(ValueError):
+        awc_campaign.DailyCampaign(tmp_path, config.target_date, config.start_at,
+                                   fetch=fetch, clock=lambda: NOW).once()
+    assert len(requests) == 1 and not list(tmp_path.glob('*.json'))
+
+def test_daily_pinned_selection_ignores_reordered_books_and_forecast(tmp_path):
+    config, event = daily_fixture()
+    calls = []
+    def fetch(url, limit):
+        calls.append(url)
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: return b'{"hourly":{"temperature_2m":[42]}}', {}
+        if '/book?' in url: return _book_for(url, event, at=NOW.replace(hour=13) if len(calls) > 5 else NOW)
+        if 'aviationweather' in url: return b'', {'Status': 204}
+        raise AssertionError(url)
+    daily = awc_campaign.DailyCampaign(tmp_path, config.target_date, config.start_at, fetch=fetch, clock=lambda: NOW)
+    assert daily.once()['sequence'] == 0
+    event['markets'].reverse()
+    daily = awc_campaign.DailyCampaign(tmp_path, config.target_date, config.start_at, fetch=fetch,
+                                       clock=lambda: NOW.replace(hour=13))
+    assert daily.once()['sequence'] == 1
+    rows = [json.loads((tmp_path / f'{n:06d}.json').read_text()) for n in range(2)]
+    assert [row['market_id'] for row in rows] == [config.market_id] * 2
+    assert [row['rule_sha256'] for row in rows] == [config.rule_sha256] * 2
+    assert [parse_qs(urlsplit(url).query)['token_id'][0] for url in calls if '/book?' in url] == ['110', '111'] * 2
+    assert len(calls) == 10
 
 @pytest.mark.parametrize('field,replacement', [('conditionId', '0x' + 'b'*64),
                                                  ('clobTokenIds', '["999","456"]'),
                                                  ('clobTokenIds', '["456","123"]')])
 def test_daily_legacy_raw_gamma_pins_exact_condition_and_ordered_tokens(tmp_path, field, replacement):
     from src.v3.awc_campaign import DailyCampaign
-    config, event = fixture()
+    config, event = daily_fixture()
     original = _offline_fetch(event)
     assert DailyCampaign(tmp_path, config.target_date, config.start_at,
                          fetch=original, clock=lambda: NOW).once()['status'] == 'captured_partial'
     # Existing row has no explicit condition/token pin: recover it from raw Gamma.
     row = json.loads((tmp_path / '000000.json').read_text())
     assert 'condition_id' not in row
-    event['markets'][0][field] = replacement
+    event['markets'][5][field] = replacement
     calls = []
     def fetch(url, limit):
         calls.append(url)
@@ -973,7 +1055,7 @@ def test_cycle_crosscheck_is_bounded_and_outage_cannot_count_day(tmp_path):
 
 def test_daily_cycle_uses_one_gamma_and_pins_manifest_across_hours(tmp_path):
     from src.v3.awc_campaign import DailyCampaign
-    config, event = fixture()
+    config, event = daily_fixture()
     calls = []
     def fetch(url, limit):
         calls.append(url)
@@ -988,7 +1070,8 @@ def test_daily_cycle_uses_one_gamma_and_pins_manifest_across_hours(tmp_path):
     assert len(calls) == 5 and sum('gamma-api' in u for u in calls) == 1
     assert daily.once()['status'] == 'already_captured' and len(calls) == 5
     event['description'] += '\nchanged'
-    event['markets'][0]['description'] = event['description']
+    for market in event['markets']:
+        market['description'] = event['description']
     daily = DailyCampaign(tmp_path, config.target_date, config.start_at, fetch=fetch,
                           clock=lambda: NOW.replace(hour=13))
     with pytest.raises(ValueError, match='pin'):
@@ -1002,7 +1085,7 @@ def test_daily_cycle_uses_one_gamma_and_pins_manifest_across_hours(tmp_path):
 
 def test_daily_discovery_failure_and_data_api_invalid_response_never_promote(tmp_path):
     from src.v3.awc_campaign import DailyCampaign
-    config, event = fixture()
+    config, event = daily_fixture()
     event['resolutionSource'] = SOURCE.replace('OPKC', 'KJFK')
     requests = []
     def fetch(url, limit):
@@ -1013,8 +1096,8 @@ def test_daily_discovery_failure_and_data_api_invalid_response_never_promote(tmp
                       fetch=fetch, clock=lambda: NOW).once()
     assert len(requests) == 1 and not list(tmp_path.glob('*.json'))
 
-    config, event = fixture()
-    event['markets'][0].update(closed=True, resolvedAt='2026-10-29T00:00:00Z',
+    config, event = daily_fixture()
+    event['markets'][5].update(closed=True, resolvedAt='2026-10-29T00:00:00Z',
                                outcomePrices='["1","0"]')
     future = datetime(2026, 10, 30, tzinfo=timezone.utc)
     def invalid(url, limit):
@@ -1046,7 +1129,7 @@ def test_event_day_cap_does_not_trust_unbacked_status_even_if_ids_differ(tmp_pat
 
 
 def test_preflight_replays_once_without_materializing_rows(tmp_path, monkeypatch):
-    config, event = fixture()
+    config, event = daily_fixture()
     assert awc_campaign.DailyCampaign(tmp_path, config.target_date, config.start_at,
                                       fetch=_offline_fetch(event), clock=lambda: NOW).once()['sequence'] == 0
     visits = []

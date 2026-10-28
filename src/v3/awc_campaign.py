@@ -261,10 +261,10 @@ def _row_pin(row: dict, config: Config):
 
 def discover_daily_manifest(event: dict, target_date: str, start_at: str,
                             *, pinned: Config | None = None, pinned_identity=None) -> Config:
-    """Discover the unique lower-tail rung; pin every identity before collection.
+    """Select the exact center degree of a complete 11-rung bracket.
 
-    The first raw Gamma response may supply a candidate, not an operator-reviewed
-    30-day schedule. Subsequent reads must match the exact immutable candidate.
+    First-seen Gamma is a candidate, not reviewed strategy evidence. The selected
+    event/market/rule/condition/ordered tokens remain pinned to the day's tape.
     """
     day = date.fromisoformat(target_date)
     if day.isoformat() != target_date:
@@ -273,23 +273,41 @@ def discover_daily_manifest(event: dict, target_date: str, start_at: str,
     if not isinstance(event, dict) or event.get('slug') != slug or event.get('eventDate') != target_date:
         raise ValueError('daily event identity mismatch')
     markets = event.get('markets')
-    if not isinstance(markets, list) or not 1 <= len(markets) <= 32 or any(not isinstance(m, dict) for m in markets):
-        raise ValueError('invalid daily markets')
+    if not isinstance(markets, list) or len(markets) != 11 or any(not isinstance(m, dict) for m in markets):
+        raise ValueError('daily bracket must have exactly 11 markets')
     ids = [str(m.get('id')) for m in markets]
     if len(set(ids)) != len(ids) or any(not _ID.fullmatch(v) for v in ids):
         raise ValueError('ambiguous daily market IDs')
-    question = re.compile(r'Will the highest temperature in Karachi be -?\d+°C or below on ' +
-                          re.escape(day.strftime('%B')) + r' ' + str(day.day) + r'\?')
-    rungs = [m for m in markets if isinstance(m.get('question'), str) and question.fullmatch(m['question'])]
-    if len(rungs) != 1:
-        raise ValueError('ambiguous daily lower-tail rung')
     if not isinstance(event.get('description'), str):
         raise ValueError('missing daily rule')
-    config = Config(slug=slug, event_id=str(event.get('id')), target_date=target_date,
-                    station='OPKC', zone='Asia/Karachi', latitude=24.9065, longitude=67.1608,
-                    market_id=str(rungs[0]['id']), start_at=start_at,
-                    rule_sha256=hashlib.sha256(event['description'].encode()).hexdigest())
-    identity = validate_event(config, event)
+    # No partial matching or guessed alternate wording. Reject any extra market,
+    # changed date/city, decimal, duplicate degree, or reordered tail.
+    question = re.compile(r'Will the highest temperature in Karachi be '
+                          r'(?P<degree>-?(?:0|[1-9][0-9]?))°C(?P<tail> or below| or higher)? on ' +
+                          re.escape(day.strftime('%B')) + r' ' + str(day.day) + r'\?')
+    brackets = []
+    conditions, tokens_seen = set(), set()
+    rule_hash = hashlib.sha256(event['description'].encode()).hexdigest()
+    for market in markets:
+        match = question.fullmatch(market.get('question', '')) if isinstance(market.get('question'), str) else None
+        if match is None or str(int(match['degree'])) != match['degree']:
+            raise ValueError('ambiguous daily bracket question')
+        config_for_market = Config(slug=slug, event_id=str(event.get('id')), target_date=target_date,
+                                   station='OPKC', zone='Asia/Karachi', latitude=24.9065, longitude=67.1608,
+                                   market_id=str(market['id']), start_at=start_at, rule_sha256=rule_hash)
+        checked = validate_event(config_for_market, event)
+        condition, tokens = _market_pin(checked['market'])
+        if condition in conditions or any(token in tokens_seen for token in tokens):
+            raise ValueError('ambiguous daily bracket condition or tokens')
+        conditions.add(condition)
+        tokens_seen.update(tokens)
+        brackets.append((int(match['degree']), match['tail'], market, config_for_market, checked))
+    brackets.sort(key=lambda bracket: bracket[0])
+    degrees = [bracket[0] for bracket in brackets]
+    if (degrees != list(range(degrees[0], degrees[0] + 11)) or
+            [bracket[1] for bracket in brackets] != [' or below'] + [None] * 9 + [' or higher']):
+        raise ValueError('daily bracket gaps, duplicates or tail mismatch')
+    _, _, _, config, identity = brackets[5]
     if pinned is not None and config != pinned:
         raise ValueError('daily manifest pin drift')
     if pinned_identity is not None and _market_pin(identity['market']) != pinned_identity:
