@@ -170,6 +170,18 @@ def test_real_gamma_closed_time_and_auto_resolution_give_exact_payout_label():
     assert _label(market, event={**event, 'automaticallyResolved': False},
                   target_date='2026-10-28', fetched_at='2026-10-30T00:00:00Z')['status'] == 'unverified'
 
+@pytest.mark.parametrize('prices', ('[true,false]', '[false,true]', [True, False], [False, True],
+                                          '[1.0,0.0]', [1.0, 0.0]))
+def test_gamma_non_integer_binary_payout_is_not_accepted(prices):
+    market = {'closed': True, 'resolvedAt': '2026-10-29T13:00:00Z', 'outcomePrices': prices}
+    assert _label(market)['status'] == 'unverified'
+
+@pytest.mark.parametrize('prices,winner', [('["1","0"]', 'Yes'), ('["0","1"]', 'No'),
+                                               ([1, 0], 'Yes'), ([0, 1], 'No')])
+def test_gamma_documented_binary_numeric_representations_remain_accepted(prices, winner):
+    market = {'closed': True, 'resolvedAt': '2026-10-29T13:00:00Z', 'outcomePrices': prices}
+    assert _label(market)['winner'] == winner
+
 
 @pytest.mark.parametrize('awc_result,reason', [((b'', {'Status': 204, 'Date': 'Tue, 27 Oct 2026 12:00:00 GMT'}), 'no_data'),
                                              (TimeoutError('timed out'), 'timeout')])
@@ -659,6 +671,59 @@ def test_data_api_requires_exact_both_tokens_condition_event_and_terminal_resolu
                 {'data': [{'condition_id': '0x'+'b'*64, 'status': 'resolved'}]}):
         assert crosscheck_resolution(config, m, label, tokens, bad)['status'] == 'unverified'
     assert crosscheck_resolution(config, m, {'status': 'unverified'}, tokens, resolution)['status'] == 'unverified'
+
+
+@pytest.mark.parametrize('slot,invalid', [(0, False), (1, True), (0, 0.0), (1, 1.0)])
+def test_data_api_outcome_index_requires_integer_slot_not_boolean_or_float(slot, invalid):
+    config, event = fixture()
+    market = event['markets'][0]
+    market.update(closed=True, resolvedAt='2026-10-29T13:00:00Z', outcomePrices='["1","0"]')
+    gamma_label = _label(market)
+    base = {'condition_id': market['conditionId'], 'event_id': int(config.event_id),
+            'event_slug': config.slug, 'resolved': True, 'closed': True, 'module': 'v1_ctf'}
+    tokens = {'data': [
+        {**base, 'token_id': '123', 'opposite_token_id': '456', 'outcome_index': 0,
+         'outcome': 'Yes', 'final_price': 1},
+        {**base, 'token_id': '456', 'opposite_token_id': '123', 'outcome_index': 1,
+         'outcome': 'No', 'final_price': 0},
+    ]}
+    resolution = {'data': [{'condition_id': market['conditionId'], 'status': 'resolved'}]}
+    assert awc_campaign.crosscheck_resolution(config, market, gamma_label, tokens, resolution)['status'] == 'venue_corroborated_final_binary'
+    tokens['data'][slot]['outcome_index'] = invalid
+    assert awc_campaign.crosscheck_resolution(config, market, gamma_label, tokens, resolution)['status'] == 'unverified'
+
+
+def test_forged_boolean_gamma_label_cannot_count_venue_corroborated_day(tmp_path):
+    config, event = fixture()
+    market = event['markets'][0]
+    market.update(closed=True, resolvedAt='2026-10-29T13:00:00Z', outcomePrices='[true,false]')
+    base = {'condition_id': market['conditionId'], 'event_id': int(config.event_id),
+            'event_slug': config.slug, 'resolved': True, 'closed': True, 'module': 'v1_ctf'}
+    tokens = {'data': [
+        {**base, 'token_id': '123', 'opposite_token_id': '456', 'outcome_index': 0,
+         'outcome': 'Yes', 'final_price': 0},
+        {**base, 'token_id': '456', 'opposite_token_id': '123', 'outcome_index': 1,
+         'outcome': 'No', 'final_price': 1},
+    ]}
+    resolution = {'data': [{'condition_id': market['conditionId'], 'status': 'resolved'}]}
+    available_at = '2026-10-30T00:00:00Z'
+    captures = {}
+    for kind, document in [('gamma', event), ('awc', ''), ('tokens', tokens), ('resolution', resolution)]:
+        raw = document if kind == 'awc' else json.dumps(document)
+        captures[kind] = {'body': raw, 'sha256': hashlib.sha256(raw.encode()).hexdigest(), 'status': 200}
+    captures['gamma'].update(url='https://gamma-api.polymarket.com/events/slug/' + config.slug,
+                             first_available_at=available_at)
+    forged_gamma = {'status': 'official_gamma_binary', 'winner': 'No',
+                    'resolved_at': '2026-10-29T13:00:00+00:00',
+                    'basis': 'Gamma closed + resolvedAt + binary outcomePrices'}
+    row = {'sequence': 0, 'previous_sha256': None, 'status': 'captured',
+           'captured_at': available_at,
+           'event_id': config.event_id, 'market_id': config.market_id, 'target_date': config.target_date,
+           'station': config.station, 'zone': config.zone, 'campaign_start_at': config.start_at,
+           'rule_sha256': config.rule_sha256, 'captures': captures, 'gamma_label': forged_gamma,
+           'label': {'status': 'venue_corroborated_final_binary', 'winner': 'No'}}
+    (tmp_path / '000000.json').write_bytes(_canonical(row))
+    assert report(tmp_path)['resolved_event_days'] == 0
 
 
 def test_report_does_not_count_unsubstantiated_finality_claims(tmp_path):

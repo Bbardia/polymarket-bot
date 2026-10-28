@@ -324,7 +324,8 @@ def crosscheck_resolution(config: Config, market: dict, gamma_label: dict,
                     row.get('condition_id') != market['conditionId'] or
                     str(row.get('event_id')) != config.event_id or
                     row.get('event_slug') != config.slug or row.get('module') != 'v1_ctf' or
-                    row.get('outcome_index') != index or row.get('outcome') != ('Yes', 'No')[index] or
+                    type(row.get('outcome_index')) is not int or row['outcome_index'] != index or
+                    row.get('outcome') != ('Yes', 'No')[index] or
                     row.get('resolved') is not True or row.get('closed') is not True):
                 return failure
             price = row.get('final_price')
@@ -488,7 +489,9 @@ def _label(market: dict, *, event: dict | None = None,
         if (target_date and resolved.date() < date.fromisoformat(target_date)) or (fetched_at and resolved > _aware(fetched_at)):
             raise ValueError('resolution outside available window')
         prices = _array(market.get('outcomePrices'))
-        if prices not in (['1', '0'], ['0', '1'], [1, 0], [0, 1]):
+        if (len(prices) != 2 or type(prices[0]) not in (str, int) or
+                type(prices[1]) is not type(prices[0]) or
+                prices not in (['1', '0'], ['0', '1'], [1, 0], [0, 1])):
             raise ValueError('non-binary payout')
     except (ValueError, TypeError, KeyError):
         return {'status': 'unverified', 'reason': 'ambiguous official payout'}
