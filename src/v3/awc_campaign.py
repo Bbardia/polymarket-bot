@@ -547,7 +547,9 @@ class Campaign:
         state = preflight if preflight is not None else _replay(
             self.directory, target_date=self.config.target_date, start_at=self.config.start_at,
             station=self.config.station, config=self.config, hour=now.isoformat()[:13])
-        if now < _aware(self.config.start_at) or now >= _aware(self.config.start_at) + timedelta(days=MAX_DAYS):
+        if (now < _aware(self.config.start_at) or
+                now.astimezone(ZoneInfo('Asia/Karachi')).date() >=
+                _aware(self.config.start_at).astimezone(ZoneInfo('Asia/Karachi')).date() + timedelta(days=MAX_DAYS)):
             return {'status': 'deadline', 'paper_only': True}
         if state['cycles'] >= MAX_CYCLES or state['resolved_event_days'] >= MAX_RESOLVED_DAYS:
             return {'status': 'cap', 'paper_only': True}
@@ -739,7 +741,8 @@ class DailyCampaign:
     def once(self) -> dict:
         with _wall_bound(CYCLE_WALL_SECONDS, ValueError('cycle wall budget exhausted')):
             now = self.clock().astimezone(timezone.utc)
-            expired = now < _aware(self.start_at) or now >= _aware(self.start_at) + timedelta(days=MAX_DAYS)
+            first = _aware(self.start_at).astimezone(ZoneInfo('Asia/Karachi')).date()
+            expired = now < _aware(self.start_at) or now.astimezone(ZoneInfo('Asia/Karachi')).date() >= first + timedelta(days=MAX_DAYS)
             state = _replay(self.directory, target_date=None if expired else self.target_date,
                             start_at=None if expired else self.start_at, station='OPKC',
                             hour=now.isoformat()[:13])
@@ -750,8 +753,7 @@ class DailyCampaign:
             day = date.fromisoformat(self.target_date)
             if day.isoformat() != self.target_date:
                 raise ValueError('invalid target date')
-            if not (_aware(self.start_at).astimezone(ZoneInfo('Asia/Karachi')).date() <= day <=
-                    (_aware(self.start_at) + timedelta(days=MAX_DAYS)).astimezone(ZoneInfo('Asia/Karachi')).date()):
+            if not (first <= day < first + timedelta(days=MAX_DAYS)):
                 raise ValueError('target date outside campaign')
             slug = f'highest-temperature-in-karachi-on-{day.strftime("%B").lower()}-{day.day}-{day.year}'
             if state['already_captured']:
