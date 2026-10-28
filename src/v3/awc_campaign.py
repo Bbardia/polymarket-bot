@@ -157,6 +157,27 @@ _STATION = re.compile(r'[A-Z]{4}')
 _ID = re.compile(r'[0-9]{1,32}')
 _TOKEN = re.compile(r'[0-9]{1,78}')  # decimal uint256 token IDs
 _CONDITION = re.compile(r'0x[0-9a-fA-F]{64}')
+# Reviewed from the public October 28/29 Gamma descriptions. Only the opening
+# observation date and the date inside the *exact* dated AWC URL vary. This is
+# a candidate-capture gate, not settlement approval or trading authorization.
+REVIEWED_DAILY_RULE_SHA256 = 'a5c012c6ee3f2f603f59fdd48937713c2ea27f23a1f35e978f6dab20a293b8f5'
+_REVIEWED_DATE = '<REVIEWED_DATE>'
+
+
+def _reviewed_daily_rule(event: dict, day: date) -> None:
+    description, source = event.get('description'), event.get('resolutionSource')
+    expected_source = ('https://aviationweather.gov/api/data/metar?ids=OPKC&format=raw&date='
+                       f'{day.isoformat()}T22:00:00Z&hours=30')
+    opening_date = f"{day.day} {day.strftime('%b')} '{day.strftime('%y')}"
+    opening = f'on {opening_date}.'
+    if (not isinstance(description, str) or source != expected_source or
+            description.count(opening) != 1 or description.count(expected_source) != 1 or
+            description.count(opening_date) != 1 or description.count(day.isoformat()) != 1):
+        raise ValueError('unreviewed daily rule or AWC source')
+    normalized = description.replace(opening_date, _REVIEWED_DATE, 1).replace(
+        day.isoformat(), _REVIEWED_DATE, 1)
+    if hashlib.sha256(normalized.encode('utf-8')).hexdigest() != REVIEWED_DAILY_RULE_SHA256:
+        raise ValueError('unreviewed daily rule template')
 
 
 @dataclass(frozen=True)
@@ -288,6 +309,7 @@ def discover_daily_manifest(event: dict, target_date: str, start_at: str,
     slug = f'highest-temperature-in-karachi-on-{day.strftime("%B").lower()}-{day.day}-{day.year}'
     if not isinstance(event, dict) or event.get('slug') != slug or event.get('eventDate') != target_date:
         raise ValueError('daily event identity mismatch')
+    _reviewed_daily_rule(event, day)
     markets = event.get('markets')
     if not isinstance(markets, list) or len(markets) != 11 or any(not isinstance(m, dict) for m in markets):
         raise ValueError('daily bracket must have exactly 11 markets')

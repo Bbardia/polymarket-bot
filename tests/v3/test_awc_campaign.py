@@ -24,6 +24,7 @@ def reviewed_test_root(tmp_path, monkeypatch):
 
 
 RULES = '\n'.join(_REQUIRED_RULES)
+REVIEWED_RULE = (Path(__file__).parent / 'fixtures' / 'awc_reviewed_gamma_rule.txt').read_text(encoding='utf-8')
 SLUG = 'highest-temperature-in-karachi-on-october-28-2026'
 SOURCE = 'https://aviationweather.gov/api/data/metar?ids=OPKC&format=raw&date=2026-10-28T22:00:00Z&hours=30'
 NOW = datetime(2026, 10, 27, 12, tzinfo=timezone.utc)
@@ -49,6 +50,7 @@ def daily_fixture(day='2026-10-28'):
     event['eventDate'] = day
     event['slug'] = f'highest-temperature-in-karachi-on-october-{int(day[-2:])}-2026'
     event['resolutionSource'] = SOURCE.replace('2026-10-28', day)
+    event['description'] = REVIEWED_RULE.replace("28 Oct '26", f"{int(day[-2:])} Oct '26").replace('2026-10-28', day)
     questions = ([f'{edge}°C or below'] + [f'{n}°C' for n in range(edge + 1, edge + 10)] +
                  [f'{edge + 10}°C or higher'])
     markets = []
@@ -57,12 +59,13 @@ def daily_fixture(day='2026-10-28'):
                   'question': f'Will the highest temperature in Karachi be {bracket} on October {int(day[-2:])}?',
                   'conditionId': '0x' + f'{i + 1:064x}',
                   'clobTokenIds': json.dumps([str(100 + i * 2), str(101 + i * 2)]),
-                  'resolutionSource': event['resolutionSource']}
+                  'resolutionSource': event['resolutionSource'], 'description': event['description']}
         markets.append(market)
     event['markets'] = markets
     selected = markets[5]
     config = Config(**{**base.__dict__, 'slug': event['slug'], 'target_date': day,
-                       'market_id': selected['id']})
+                       'market_id': selected['id'],
+                       'rule_sha256': hashlib.sha256(event['description'].encode()).hexdigest()})
     return config, event
 
 
@@ -92,6 +95,13 @@ def test_two_exact_books_and_strict_seven_get_ceiling(tmp_path):
     assert len(calls) == 5 and len(calls) <= 7
     assert [parse_qs(urlsplit(u).query)['token_id'][0] for u, _ in calls if '/book?' in u] == ['110', '111']
     row = json.loads((tmp_path / '000000.json').read_text())
+    raw_gamma = row['captures']['gamma']['body'].encode('utf-8')
+    assert row['captures']['gamma']['sha256'] == hashlib.sha256(raw_gamma).hexdigest()
+    replayed = awc_campaign._strict_json_loads(raw_gamma)
+    assert [(m['id'], m['question'], m['conditionId'], tuple(json.loads(m['clobTokenIds'])))
+            for m in replayed['markets']] == [
+                (m['id'], m['question'], m['conditionId'], tuple(json.loads(m['clobTokenIds'])))
+                for m in event['markets']]
     assert row['book_evidence'] == {'Yes': 'verified_book', 'No': 'verified_book'}
     assert row['captures']['book_no']['body'] != row['captures']['book']['body']
     assert row['captures']['book_no']['sha256'] == hashlib.sha256(row['captures']['book_no']['body'].encode()).hexdigest()
@@ -776,11 +786,47 @@ def test_daily_manifest_selects_sorted_median_and_pins_rule(day, median):
     ):
         with pytest.raises(ValueError):
             awc_campaign.discover_daily_manifest(changed, day, config.start_at)
-    changed = {**event, 'description': RULES + '\nchanged'}
+    changed = {**event, 'description': event['description'] + '\nchanged'}
     changed['markets'] = [{**m, 'description': changed['description']} for m in event['markets']]
-    assert awc_campaign.discover_daily_manifest(changed, day, config.start_at).rule_sha256 != config.rule_sha256
-    with pytest.raises(ValueError, match='pin'):
+    with pytest.raises(ValueError, match='unreviewed daily rule'):
+        awc_campaign.discover_daily_manifest(changed, day, config.start_at)
+    with pytest.raises(ValueError, match='unreviewed daily rule'):
         awc_campaign.discover_daily_manifest(changed, day, config.start_at, pinned=config)
+
+
+def test_reviewed_rule_exact_two_date_substitutions_and_real_hashes():
+    assert hashlib.sha256(REVIEWED_RULE.encode()).hexdigest() == 'eb74d0fbf77f57141d6b99148ac185fbdbc382f6d815a72b0daeed089428a1cd'
+    for day, digest in [('2026-10-28', 'eb74d0fbf77f57141d6b99148ac185fbdbc382f6d815a72b0daeed089428a1cd'),
+                        ('2026-10-29', '95b2e910ebeb1d8d51ce1584fdd306271c53e6746482e3159444c7f105fe1ac9')]:
+        config, event = daily_fixture(day)
+        assert hashlib.sha256(event['description'].encode()).hexdigest() == digest
+        assert awc_campaign.discover_daily_manifest(event, day, config.start_at) == config
+
+
+@pytest.mark.parametrize('change', [
+    lambda e: e.update(description=e['description'].replace('Weather Underground Daily Observations table will be used', 'AWC data will be used')),
+    lambda e: e.update(description=e['description'].replace('11:59 PM ET', '10:59 PM ET')),
+    lambda e: e.update(description=e['description'].replace('2026-10-28T22:00:00Z', '2026-10-29T22:00:00Z')),
+    lambda e: e.update(description=e['description'].replace('on 28 Oct', 'on 29 Oct')),
+    lambda e: e.update(description=e['description'] + "\n28 Oct '26"),
+    lambda e: e.update(resolutionSource=e['resolutionSource'].replace('22:00:00Z', '23:00:00Z')),
+    lambda e: e.update(resolutionSource=e['resolutionSource'].replace('hours=30', 'hours=31')),
+    lambda e: e.update(resolutionSource=e['resolutionSource'].replace('date=2026-10-28', 'date=2026-10-29')),
+])
+def test_unreviewed_rule_or_source_stops_before_other_get_and_append(tmp_path, change):
+    config, event = daily_fixture()
+    change(event)
+    event['markets'] = [{**m, 'description': event['description'],
+                         'resolutionSource': event['resolutionSource']} for m in event['markets']]
+    calls = []
+    def fetch(url, limit):
+        calls.append(url)
+        assert 'gamma-api.polymarket.com' in url
+        return json.dumps(event).encode(), {'Status': 200}
+    with pytest.raises(ValueError):
+        awc_campaign.DailyCampaign(tmp_path, config.target_date, config.start_at,
+                                   fetch=fetch, clock=lambda: NOW).once()
+    assert len(calls) == 1 and not list(tmp_path.glob('*.json'))
 
 @pytest.mark.parametrize('mutation', [
     lambda e: e['markets'].pop(),
@@ -1074,7 +1120,7 @@ def test_daily_cycle_uses_one_gamma_and_pins_manifest_across_hours(tmp_path):
         market['description'] = event['description']
     daily = DailyCampaign(tmp_path, config.target_date, config.start_at, fetch=fetch,
                           clock=lambda: NOW.replace(hour=13))
-    with pytest.raises(ValueError, match='pin'):
+    with pytest.raises(ValueError, match='unreviewed daily rule'):
         daily.once()
     assert len(calls) == 6 and len(list(tmp_path.glob('*.json'))) == 1
     expired = DailyCampaign(tmp_path, config.target_date, '2026-08-01T00:00:00Z',
