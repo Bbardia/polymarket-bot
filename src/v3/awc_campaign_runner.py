@@ -98,7 +98,11 @@ def replay(directory: Path, start_at: str):
                     raise ValueError('invalid stop')
                 state['stop_reason'] = row['reason']
             else:
-                if set(row) != {'sequence', 'previous_sha256', 'start_at', 'paper_only', 'kind', 'slot', 'target_date', 'code'}:
+                required = {'sequence', 'previous_sha256', 'start_at', 'paper_only', 'kind', 'slot', 'target_date', 'code'}
+                if (set(row) not in (required, required | {'stage'}) or
+                        ('stage' in row and (kind != 'finished' or row.get('code') != 'invalid_response' or
+                                             not isinstance(row['stage'], str) or
+                                             row['stage'] not in tape.SOURCE_STAGES))):
                     raise ValueError('invalid attempt entry')
                 slot, target = row['slot'], row['target_date']
                 if not isinstance(slot, str) or not isinstance(target, str):
@@ -131,11 +135,14 @@ def replay(directory: Path, start_at: str):
     return state
 
 
-def append(directory: Path, start_at: str, kind: str, slot=None, target_date=None, code=None, *, state=None):
+def append(directory: Path, start_at: str, kind: str, slot=None, target_date=None, code=None, *, stage=None, state=None):
     """Publish a complete fsynced entry atomically; caller owns singleton lock."""
     state = state if state is not None else replay(directory, start_at)
     if state['next'] >= MAX_ENTRIES or state['stop_reason']:
         raise ValueError('journal closed or full')
+    if stage is not None and (kind != 'finished' or code != 'invalid_response' or
+                              not isinstance(stage, str) or stage not in tape.SOURCE_STAGES):
+        raise ValueError('invalid failure stage')
     row = {'sequence': state['next'], 'previous_sha256': state['digest'],
            'start_at': start_at, 'paper_only': True, 'kind': kind}
     if kind == 'stop':
@@ -148,6 +155,8 @@ def append(directory: Path, start_at: str, kind: str, slot=None, target_date=Non
         if not isinstance(slot, datetime) or not isinstance(target_date, str):
             raise ValueError('invalid target date for slot')
         row.update(slot=slot.isoformat(), target_date=target_date, code=code)
+        if stage is not None:
+            row['stage'] = stage
     body = _body(row)
     if len(body) > MAX_ENTRY_BYTES:
         raise ValueError('journal entry too large')
@@ -235,7 +244,7 @@ def tape_state(directory: Path, start_at: str):
 
 
 def _collect(day: str, start_at: str, directory: Path):
-    return tape.DailyCampaign(directory, day, start_at).once()
+    return tape.DailyCampaign(directory, day, start_at, stage_failures=True).once()
 
 
 def once(directory: Path, start_at: str, *, clock=None, collect=None):
@@ -288,18 +297,21 @@ def once(directory: Path, start_at: str, *, clock=None, collect=None):
                 append(journal, start_at, 'missed', stamp, target, state=state)
                 continue
             append(journal, start_at, 'started', stamp, target, state=state)
+            stage = None
             try:
                 result = (collect or _collect)(target, start_at, evidence)
                 code = result['status'] if result.get('status') in RESULTS else 'collector_refused'
             except (TimeoutError, tape.CycleWallExceeded):
                 code = 'timeout'
+            except tape.SourceStageError as exc:
+                code, stage = 'invalid_response', exc.stage
             except (ValueError, TypeError, KeyError, UnicodeError, json.JSONDecodeError):
                 code = 'invalid_response'
             except OSError:
                 code = 'storage_failure'
             except Exception:
                 code = 'internal_failure'
-            append(journal, start_at, 'finished', stamp, target, code, state=state)
+            append(journal, start_at, 'finished', stamp, target, code, stage=stage, state=state)
             if state['attempted'] >= tape.MAX_CYCLES:
                 stop('attempted_slots')
             elif code in RESULTS and tape_state(evidence, start_at)[0] >= tape.MAX_RESOLVED_DAYS:

@@ -281,3 +281,55 @@ def test_fixed_collector_failure_classes(tmp_path, exc, code):
         raise exc
     assert invoke(tmp_path, at(0, 8), fail)['failure_code'] == code
     assert 'secret' not in ''.join(p.read_text() for p in (tmp_path / 'recurring' / 'journal').glob('*.json'))
+
+
+def test_typed_source_failure_only_journals_allowlisted_stage(tmp_path):
+    def fail(*_):
+        raise tape.SourceStageError('forecast') from ValueError('secret=private-url')
+    assert invoke(tmp_path, at(0, 8), fail)['failure_code'] == 'invalid_response'
+    journal = tmp_path / 'recurring' / 'journal'
+    finished = json.loads((journal / '000001.json').read_text())
+    assert finished['stage'] == 'forecast'
+    assert 'secret=' not in (journal / '000001.json').read_text()
+    assert rows(tmp_path)['attempted'] == 1
+    assert not list((tmp_path / 'recurring' / 'tape').glob('*.json'))
+
+
+def test_runner_real_daily_discovery_failure_attributed_without_tape(tmp_path, monkeypatch):
+    calls = []
+    def fetch(url, limit):
+        calls.append(url)
+        raise ValueError('secret=private-url')
+    monkeypatch.setattr(runner, '_collect', lambda day, start, directory:
+                        tape.DailyCampaign(directory, day, start, fetch=fetch,
+                                           clock=lambda: at(0, 8), stage_failures=True).once())
+    result = runner.once(tmp_path / 'recurring', START.isoformat(), clock=lambda: at(0, 8))
+    assert result['failure_code'] == 'invalid_response'
+    finished = json.loads((tmp_path / 'recurring' / 'journal' / '000001.json').read_text())
+    assert finished['stage'] == 'discovery'
+    assert len(calls) == 1 and 'secret=' not in json.dumps(finished)
+    assert not list((tmp_path / 'recurring' / 'tape').glob('*.json'))
+
+
+def test_legacy_two_row_replay_and_stage_schema_rejects_spoofing(tmp_path):
+    journal = tmp_path / 'recurring' / 'journal'
+    runner.append(journal, START.isoformat(), 'started', at(0, 8), '2026-10-28')
+    runner.append(journal, START.isoformat(), 'finished', at(0, 8), '2026-10-28', 'invalid_response')
+    legacy = [(journal / f'{n:06d}.json').read_bytes() for n in range(2)]
+    assert rows(tmp_path)['slots'][at(0, 8).isoformat()] == 'finished'
+    assert [(journal / f'{n:06d}.json').read_bytes() for n in range(2)] == legacy
+    with pytest.raises(ValueError, match='stage'):
+        runner.append(journal, START.isoformat(), 'started', at(0, 14), '2026-10-28', stage='gamma')
+    runner.append(journal, START.isoformat(), 'started', at(0, 14), '2026-10-28')
+    for code, stage in [('invalid_response', 'private-url'), ('captured', 'gamma'),
+                        ('invalid_response', ['gamma'])]:
+        with pytest.raises(ValueError, match='stage'):
+            runner.append(journal, START.isoformat(), 'finished', at(0, 14), '2026-10-28',
+                          code, stage=stage)
+    row = runner.append(journal, START.isoformat(), 'finished', at(0, 14), '2026-10-28',
+                        'invalid_response', stage='gamma')
+    path = journal / '000003.json'
+    for forged in ({**row, 'stage': 'private-url'}, {**row, 'code': 'captured'}):
+        path.write_bytes(runner._body(forged))
+        with pytest.raises(ValueError):
+            rows(tmp_path)

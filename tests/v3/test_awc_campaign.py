@@ -69,6 +69,67 @@ def daily_fixture(day='2026-10-28'):
     return config, event
 
 
+@pytest.mark.parametrize('stage', ['preflight', 'discovery', 'gamma', 'forecast',
+                                    'book', 'book_no', 'awc', 'tokens', 'resolution'])
+def test_daily_invalid_source_stage_is_bounded_and_never_on_tape(tmp_path, monkeypatch, stage):
+    config, event = daily_fixture()
+    event['markets'][5].update(closed=True, resolvedAt='2026-10-29T00:00:00Z',
+                               outcomePrices='["1","0"]')
+    future = datetime(2026, 10, 30, tzinfo=timezone.utc)
+    calls = []
+    if stage == 'preflight':
+        monkeypatch.setattr(awc_campaign, '_replay', lambda *a, **kw: (_ for _ in ()).throw(ValueError('secret=preflight')))
+
+    def fetch(url, limit):
+        if 'gamma-api' in url: kind = 'discovery'
+        elif 'open-meteo' in url: kind = 'forecast'
+        elif '/book?' in url: kind = 'book_no' if 'token_id=111' in url else 'book'
+        elif 'aviationweather' in url: kind = 'awc'
+        elif '/v2/tokens?' in url: kind = 'tokens'
+        elif '/v2/resolutions?' in url: kind = 'resolution'
+        else: raise AssertionError(url)
+        calls.append(kind)
+        if kind == stage:
+            if stage in ('tokens', 'resolution'):
+                return b'{"data":1,"data":2}', {}
+            raise ValueError('secret=private-url')
+        if kind == 'discovery':
+            if stage == 'gamma':
+                broken = {**event, 'id': 'wrong'}
+                return json.dumps(broken).encode(), {}
+            return json.dumps(event).encode(), {}
+        if kind == 'forecast': return b'{"hourly":{}}', {}
+        if kind in ('book', 'book_no'): return _book_for(url, event, at=future)
+        if kind == 'awc': return b'', {'Status': 200}
+        return b'{"data":[]}', {}
+    campaign = (Campaign(tmp_path, config, fetch=fetch, clock=lambda: future, stage_failures=True) if stage == 'gamma'
+                else awc_campaign.DailyCampaign(tmp_path, config.target_date, config.start_at,
+                                                fetch=fetch, clock=lambda: future, stage_failures=True))
+    with pytest.raises(awc_campaign.SourceStageError) as caught:
+        campaign.once()
+    assert caught.value.stage == stage
+    assert 'secret=' not in str(caught.value)
+    assert not list(tmp_path.glob('*.json'))
+    assert len(calls) <= 7
+
+
+def test_tape_serialization_failure_is_not_misattributed_to_last_source(tmp_path, monkeypatch):
+    config, event = fixture()
+    def fetch(url, limit):
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: return b'{"hourly":{}}', {}
+        if '/book?' in url: return _book_for(url, event)
+        if 'aviationweather' in url: return b'', {'Status': 200}
+        raise AssertionError(url)
+    def bad_tape(_):
+        raise ValueError('serialized tape failure')
+    monkeypatch.setattr(awc_campaign, '_canonical', bad_tape)
+    with pytest.raises(ValueError, match='serialized tape failure') as caught:
+        Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW, stage_failures=True).once()
+    assert not isinstance(caught.value, awc_campaign.SourceStageError)
+    assert not list(tmp_path.glob('*.json'))
+
+
 def _book_for(url, event, *, bids=None, asks=None, at=NOW):
     token = parse_qs(urlsplit(url).query)['token_id'][0]
     market = next((m for m in event['markets'] if token in json.loads(m['clobTokenIds'])), event['markets'][0])

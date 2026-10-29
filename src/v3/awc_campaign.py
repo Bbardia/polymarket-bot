@@ -47,6 +47,20 @@ class CycleWallExceeded(ValueError):
     """Distinct deadline failure, not an invalid provider response."""
 
 
+SOURCE_STAGES = frozenset({'preflight', 'discovery', 'gamma', 'forecast',
+                           'book', 'book_no', 'awc', 'tokens', 'resolution'})
+
+
+class SourceStageError(ValueError):
+    """Fixed, non-sensitive attribution for an invalid paper collection response."""
+
+    def __init__(self, stage: str):
+        if stage not in SOURCE_STAGES:
+            raise ValueError('invalid source stage')
+        self.stage = stage
+        super().__init__('invalid response at ' + stage)
+
+
 def _alarm(_signum, _frame):
     now = time.monotonic()
     for deadline, error in _deadlines:
@@ -594,15 +608,29 @@ def _label(market: dict, *, event: dict | None = None,
 
 
 class Campaign:
-    def __init__(self, directory: Path, config: Config, *, fetch=public_fetch, clock=None):
+    def __init__(self, directory: Path, config: Config, *, fetch=public_fetch, clock=None, stage_failures=False):
         self.directory, self.config, self.fetch = directory, config, fetch
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.stage_failures = stage_failures
 
     def once(self) -> dict:
         with _wall_bound(CYCLE_WALL_SECONDS, CycleWallExceeded('cycle wall budget exhausted')):
             return self._once()
 
     def _once(self, *, gamma_response=None, preflight=None) -> dict:
+        self._stage = 'preflight'
+        try:
+            return self._capture(gamma_response=gamma_response, preflight=preflight)
+        except CycleWallExceeded:
+            raise
+        except (ValueError, TypeError, KeyError, UnicodeError, json.JSONDecodeError) as exc:
+            if not self.stage_failures or self._stage is None:
+                raise
+            if isinstance(exc, SourceStageError):
+                raise
+            raise SourceStageError(self._stage) from exc
+
+    def _capture(self, *, gamma_response=None, preflight=None) -> dict:
         now = self.clock().astimezone(timezone.utc)
         state = preflight if preflight is not None else _replay(
             self.directory, target_date=self.config.target_date, start_at=self.config.start_at,
@@ -619,6 +647,7 @@ class Campaign:
         urls = {'gamma': 'https://gamma-api.polymarket.com/events/slug/' + self.config.slug}
         captures = {}
         def get(kind, url):
+            self._stage = kind
             start = self.clock().astimezone(timezone.utc).isoformat()
             try:
                 body, headers = (gamma_response if kind == 'gamma' and gamma_response is not None
@@ -668,6 +697,7 @@ class Campaign:
             raise ValueError('invalid forecast')
         # Open-Meteo response lacks a reliable run/issue timestamp. Never infer one.
         def checked_book(kind, token):
+            self._stage = kind
             raw_book = get(kind, 'https://clob.polymarket.com/book?' + urlencode({'token_id': token}))
             if raw_book is None or captures[kind].get('failure_code'):
                 return 'unverified_' + captures[kind]['failure_code']
@@ -715,11 +745,13 @@ class Campaign:
                    'report_times': [o.observed_at.isoformat() for o in observations],
                    'correction_cutoff_proven': False, 'wu_fallback_proven': False}
         status = 'captured_partial' if awc_reason else 'captured'
+        self._stage = 'gamma'
         gamma_label = _label(market, event=event, target_date=self.config.target_date,
                              fetched_at=captures['gamma']['first_available_at'])
         label = {'status': 'unverified', 'reason': 'AWC unavailable: ' + awc_reason} if awc_reason else {
             'status': 'unverified', 'reason': 'same-venue finality corroboration unavailable'}
         if not awc_reason and gamma_label['status'] == 'official_gamma_binary':
+            self._stage = 'tokens'
             tokens = _array(market['clobTokenIds'])
             checks = (
                 ('tokens', 'https://data-api.polymarket.com/v2/tokens?' +
@@ -745,6 +777,8 @@ class Campaign:
             else:
                 label = crosscheck_resolution(self.config, market, gamma_label,
                                               documents['tokens'], documents['resolution'])
+        # A serialization/append failure is not attributable to a source.
+        self._stage = None
         record = {'sequence': state['cycles'], 'previous_sha256': state['previous_sha256'],
                   'status': status, 'paper_only': True, 'live_eligible': False,
                   'event_id': self.config.event_id, 'market_id': self.config.market_id,
@@ -798,11 +832,25 @@ class Campaign:
 
 class DailyCampaign:
     """Manual daily discovery; reuse its Gamma read within the seven-GET cycle."""
-    def __init__(self, directory: Path, target_date: str, start_at: str, *, fetch=public_fetch, clock=None):
+    def __init__(self, directory: Path, target_date: str, start_at: str, *, fetch=public_fetch, clock=None, stage_failures=False):
         self.directory, self.target_date, self.start_at, self.fetch = directory, target_date, start_at, fetch
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.stage_failures = stage_failures
 
     def once(self) -> dict:
+        self._stage = 'preflight'
+        try:
+            return self._collect_once()
+        except CycleWallExceeded:
+            raise
+        except (ValueError, TypeError, KeyError, UnicodeError, json.JSONDecodeError) as exc:
+            if not self.stage_failures or self._stage is None:
+                raise
+            if isinstance(exc, SourceStageError):
+                raise
+            raise SourceStageError(self._stage) from exc
+
+    def _collect_once(self) -> dict:
         with _wall_bound(CYCLE_WALL_SECONDS, CycleWallExceeded('cycle wall budget exhausted')):
             now = self.clock().astimezone(timezone.utc)
             first = _aware(self.start_at).astimezone(ZoneInfo('Asia/Karachi')).date()
@@ -823,6 +871,7 @@ class DailyCampaign:
             if state['already_captured']:
                 return {'status': 'already_captured', 'paper_only': True}
             url = 'https://gamma-api.polymarket.com/events/slug/' + slug
+            self._stage = 'discovery'
             response = self.fetch(url, LIMITS['gamma'])
             body, _headers = response
             if not isinstance(body, bytes) or len(body) > LIMITS['gamma']:
@@ -830,7 +879,8 @@ class DailyCampaign:
             event = _strict_json_loads(body.decode('utf-8'))
             config = discover_daily_manifest(event, self.target_date, self.start_at,
                                              pinned=state['pinned'], pinned_identity=state['prior_pin'])
-            return Campaign(self.directory, config, fetch=self.fetch, clock=self.clock)._once(
+            return Campaign(self.directory, config, fetch=self.fetch, clock=self.clock,
+                            stage_failures=self.stage_failures)._once(
                 gamma_response=response, preflight=state)
 
 
