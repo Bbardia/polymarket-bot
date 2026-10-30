@@ -46,6 +46,15 @@ _deadlines = []
 class CycleWallExceeded(ValueError):
     """Distinct deadline failure, not an invalid provider response."""
 
+class ForecastUnavailable(ValueError):
+    """Only a transient HTTP failure from the exact public forecast endpoint."""
+
+    def __init__(self, failure_code: str):
+        if failure_code not in ('http_429', 'http_5xx'):
+            raise ValueError('invalid forecast failure code')
+        self.failure_code = failure_code
+        super().__init__('forecast unavailable: ' + failure_code)
+
 
 SOURCE_STAGES = frozenset({'preflight', 'discovery', 'gamma', 'forecast',
                            'book', 'book_no', 'awc', 'tokens', 'resolution'})
@@ -430,16 +439,29 @@ def public_fetch(url: str, limit: int) -> tuple[bytes, dict]:
 
 
 def _fetch_response(opener, url, parts, limit):
+    forecast_endpoint = parts.hostname == 'api.open-meteo.com' and parts.path == '/v1/forecast'
+
+    def transient_code(status):
+        if not forecast_endpoint:
+            return None
+        return 'http_429' if status == 429 else 'http_5xx' if 500 <= status <= 599 else None
     try:
         request = Request(url, headers={'User-Agent': 'awc-paper-observation/1.0', 'Accept': 'application/json, text/plain'})
         try:
             response = opener.open(request, timeout=10)
         except HTTPError as exc:
             if not (parts.hostname == 'clob.polymarket.com' and parts.path == '/book' and exc.code == 404):
+                code = transient_code(exc.code)
+                exc.close()  # never read or persist an error response body
+                if code:
+                    raise ForecastUnavailable(code) from exc
                 raise ValueError('public HTTP non-200') from exc
             response = exc  # preserve bounded 404 body, headers and acquisition time
         with response:
             if response.status != 200 and not (parts.hostname == 'aviationweather.gov' and response.status == 204) and not (parts.hostname == 'clob.polymarket.com' and parts.path == '/book' and response.status == 404):
+                code = transient_code(response.status)
+                if code:
+                    raise ForecastUnavailable(code)
                 raise ValueError('public HTTP non-200')
             length = response.headers.get('Content-Length')
             if length and (not length.isdecimal() or int(length) > limit):
@@ -657,16 +679,23 @@ class Campaign:
         def get(kind, url):
             self._stage = kind
             start = self.clock().astimezone(timezone.utc).isoformat()
+            def unavailable(code):
+                captures[kind] = {'url': url, 'request_at': start,
+                                  'failed_at': self.clock().astimezone(timezone.utc).isoformat(),
+                                  'status': 'timeout' if code == 'timeout' else 'unavailable',
+                                  'failure_code': code}
+                return None
             try:
                 body, headers = (gamma_response if kind == 'gamma' and gamma_response is not None
                                  else self.fetch(url, LIMITS[kind]))
-            except TimeoutError:
-                if kind not in ('awc', 'book_no'):
+            except ForecastUnavailable as exc:
+                if kind != 'forecast':
                     raise
-                captures[kind] = {'url': url, 'request_at': start,
-                                  'failed_at': self.clock().astimezone(timezone.utc).isoformat(),
-                                  'status': 'timeout', 'failure_code': 'timeout'}
-                return None
+                return unavailable(exc.failure_code)
+            except TimeoutError:
+                if kind not in ('awc', 'book_no', 'forecast'):
+                    raise
+                return unavailable('timeout')
             if not isinstance(body, bytes) or len(body) > LIMITS[kind]:
                 raise ValueError('oversized or invalid response')
             status = headers.get('Status', 200)
@@ -700,9 +729,12 @@ class Campaign:
             'latitude': self.config.latitude, 'longitude': self.config.longitude,
             'hourly': 'temperature_2m', 'timezone': self.config.zone,
             'start_date': day.isoformat(), 'end_date': day.isoformat()})
-        forecast = _strict_json_loads(get('forecast', forecast_url))
-        if not isinstance(forecast, dict) or not isinstance(forecast.get('hourly'), dict):
-            raise ValueError('invalid forecast')
+        raw_forecast = get('forecast', forecast_url)
+        forecast_reason = captures['forecast'].get('failure_code')
+        if not forecast_reason:
+            forecast = _strict_json_loads(raw_forecast)
+            if not isinstance(forecast, dict) or not isinstance(forecast.get('hourly'), dict):
+                raise ValueError('invalid forecast')
         # Open-Meteo response lacks a reliable run/issue timestamp. Never infer one.
         def checked_book(kind, token):
             self._stage = kind
@@ -745,6 +777,8 @@ class Campaign:
             obs = {'status': 'unavailable', 'reason': awc_reason,
                    'correction_cutoff_proven': False, 'wu_fallback_proven': False}
         else:
+            if raw is None:
+                raise ValueError('AWC response missing')
             observations = parse_raw_observations(raw, station=self.config.station, target_date=day,
                                                    timezone_name=self.config.zone)
             obs = {'status': 'future_day' if now.astimezone(ZoneInfo(self.config.zone)).date() < day else 'snapshot_not_settlement',
@@ -752,13 +786,18 @@ class Campaign:
                    'rounded_max_c': max((o.rounded_c for o in observations), default=None),
                    'report_times': [o.observed_at.isoformat() for o in observations],
                    'correction_cutoff_proven': False, 'wu_fallback_proven': False}
-        status = 'captured_partial' if awc_reason else 'captured'
+        status = 'captured_partial' if awc_reason or forecast_reason else 'captured'
         self._stage = 'gamma'
         gamma_label = _label(market, event=event, target_date=self.config.target_date,
                              fetched_at=captures['gamma']['first_available_at'])
-        label = {'status': 'unverified', 'reason': 'AWC unavailable: ' + awc_reason} if awc_reason else {
-            'status': 'unverified', 'reason': 'same-venue finality corroboration unavailable'}
-        if not awc_reason and gamma_label['status'] == 'official_gamma_binary':
+        if forecast_reason:
+            reason = 'forecast unavailable: ' + forecast_reason
+        elif awc_reason:
+            reason = 'AWC unavailable: ' + awc_reason
+        else:
+            reason = 'same-venue finality corroboration unavailable'
+        label = {'status': 'unverified', 'reason': reason}
+        if not awc_reason and not forecast_reason and gamma_label['status'] == 'official_gamma_binary':
             self._stage = 'tokens'
             tokens = _array(market['clobTokenIds'])
             checks = (

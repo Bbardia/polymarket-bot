@@ -363,6 +363,119 @@ def test_public_fetch_bounded_clob_404_preserves_body_and_rejects_other_http(mon
     with pytest.raises(ValueError, match='byte limit'):
         public_fetch('https://clob.polymarket.com/book?token_id=456', 5)
 
+@pytest.mark.parametrize('status,code', [(429, 'http_429'), (503, 'http_5xx')])
+def test_only_open_meteo_forecast_transient_http_is_typed_without_read(monkeypatch, status, code):
+    class ForbiddenBody(BytesIO):
+        def read(self, *args) -> bytes:
+            raise AssertionError('error body must not be read')
+    calls = []
+    def open_response(request, timeout):
+        calls.append(request.full_url)
+        raise HTTPError(request.full_url, status, 'secret=provider', Message(), ForbiddenBody(b'secret=body'))
+    monkeypatch.setattr(awc_campaign, 'build_opener', lambda *args: type('Opener', (), {'open': staticmethod(open_response)})())
+    url = 'https://api.open-meteo.com/v1/forecast?latitude=24.9065'
+    with pytest.raises(awc_campaign.ForecastUnavailable) as caught:
+        public_fetch(url, awc_campaign.LIMITS['forecast'])
+    assert caught.value.failure_code == code and 'secret' not in str(caught.value)
+    for other in ('https://api.open-meteo.com/v1/other',
+                  'https://gamma-api.polymarket.com/events/slug/' + SLUG):
+        with pytest.raises(ValueError) as failure:
+            public_fetch(other, 100)
+        assert not isinstance(failure.value, awc_campaign.ForecastUnavailable)
+    assert len(calls) == 3
+
+@pytest.mark.parametrize('status,typed', [(429, True), (500, True), (599, True),
+                                          (400, False), (302, False)])
+def test_forecast_http_status_without_httperror_is_equally_strict(monkeypatch, status, typed):
+    class Response:
+        headers = {'Content-Length': '999999999'}
+        def __init__(self): self.status = status
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+        def read(self, size): pytest.fail('non-200 response body must not be read')
+    monkeypatch.setattr(awc_campaign, 'build_opener', lambda *args: type('Opener', (), {'open': lambda *a, **k: Response()})())
+    with pytest.raises(ValueError) as failure:
+        public_fetch('https://api.open-meteo.com/v1/forecast?latitude=24.9065', 128_000)
+    assert isinstance(failure.value, awc_campaign.ForecastUnavailable) is typed
+
+@pytest.mark.parametrize('failure,code', [(awc_campaign.ForecastUnavailable('http_429'), 'http_429'),
+                                         (awc_campaign.ForecastUnavailable('http_5xx'), 'http_5xx'),
+                                         (TimeoutError('secret=transport'), 'timeout')])
+@pytest.mark.parametrize('awc_status', [200, 204])
+def test_forecast_unavailable_retains_books_awc_but_no_finality(tmp_path, failure, code, awc_status):
+    config, event = fixture()
+    event['markets'][0].update(closed=True, resolvedAt='2026-10-29T13:00:00Z', outcomePrices='["1","0"]')
+    later = datetime(2026, 10, 30, tzinfo=timezone.utc)
+    calls = []
+    def fetch(url, limit):
+        calls.append(url)
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: raise failure
+        if '/book?' in url: return _book_for(url, event, at=later, asks=[{'price': '0.3', 'size': '20'}])
+        if 'aviationweather' in url: return b'', {'Status': awc_status}
+        pytest.fail('Data API must not be fetched when forecast is unavailable')
+    result = Campaign(tmp_path, config, fetch=fetch, clock=lambda: later).once()
+    assert result['status'] == 'captured_partial' and result['label'] == 'unverified'
+    assert len(calls) == 5 and len(calls) <= 7
+    row = json.loads((tmp_path / '000000.json').read_text())
+    assert row['captures']['forecast'] == {'url': calls[1], 'request_at': later.isoformat(),
+                                           'failed_at': later.isoformat(), 'status': 'unavailable' if code != 'timeout' else 'timeout',
+                                           'failure_code': code}
+    assert row['book_evidence'] == {'Yes': 'verified_book', 'No': 'verified_book'}
+    assert row['captures']['awc']['status'] == awc_status
+    assert row['gamma_label']['status'] == 'official_gamma_binary'
+    assert row['label']['status'] == 'unverified' and 'winner' not in row['label']
+    assert 'tokens' not in row['captures'] and 'resolution' not in row['captures']
+    assert report(tmp_path)['resolved_event_days'] == 0 and report(tmp_path)['pending_labels'] == 1
+    assert Campaign(tmp_path, config, fetch=fetch, clock=lambda: later).once()['status'] == 'already_captured'
+    assert len(calls) == 5
+
+@pytest.mark.parametrize('bad', [
+    (b'{"error":"bad"}', {'Status': 400}), (b'', {'Status': 302}),
+    (b'', {'Status': 429}), (b'', {'Status': 503}),
+    (b'{bad', {}), (b'{"hourly":{},"hourly":{}}', {}),
+    (b'{"other":{}}', {}), (b'x' * (awc_campaign.LIMITS['forecast'] + 1), {}),
+])
+def test_invalid_forecast_remains_hard_even_with_other_evidence(tmp_path, bad):
+    config, event = fixture()
+    def fetch(url, limit):
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: return bad
+        pytest.fail('invalid forecast cannot continue to books')
+    with pytest.raises((ValueError, json.JSONDecodeError)):
+        Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW).once()
+    assert not list(tmp_path.glob('*.json'))
+
+def test_cycle_expiry_during_forecast_request_never_becomes_partial(tmp_path, monkeypatch):
+    config, event = fixture()
+    monkeypatch.setattr(awc_campaign, 'CYCLE_WALL_SECONDS', 0.02)
+    def fetch(url, limit):
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: time.sleep(0.1)
+        pytest.fail('cycle must have interrupted forecast read')
+    with pytest.raises(awc_campaign.CycleWallExceeded):
+        Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW).once()
+    assert not list(tmp_path.glob('*.json'))
+
+def test_legacy_capture_replay_then_forecast_partial_revisit(tmp_path):
+    config, event = fixture()
+    def fetch(url, limit):
+        if 'gamma-api' in url: return json.dumps(event).encode(), {}
+        if 'open-meteo' in url: return b'{"hourly":{}}', {}
+        if '/book?' in url: return _book_for(url, event)
+        if 'aviationweather' in url: return b'', {'Status': 204}
+        pytest.fail(url)
+    assert Campaign(tmp_path, config, fetch=fetch, clock=lambda: NOW).once()['status'] == 'captured_partial'
+    old = (tmp_path / '000000.json').read_bytes()
+    def unavailable(url, limit):
+        if 'open-meteo' in url: raise TimeoutError('transient')
+        return fetch(url, limit)
+    later = NOW + timedelta(hours=1)
+    assert Campaign(tmp_path, config, fetch=unavailable, clock=lambda: later).once()['status'] == 'captured_partial'
+    assert (tmp_path / '000000.json').read_bytes() == old
+    assert report(tmp_path)['cycles'] == 2 and report(tmp_path)['pending_labels'] == 2
+    assert report(tmp_path)['resolved_event_days'] == 0
+
 
 def test_identity_rejects_modified_rule_station_source_and_duplicate():
     config, event = fixture()
