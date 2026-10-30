@@ -490,9 +490,34 @@ def test_real_gamma_closed_time_and_auto_resolution_give_exact_payout_label():
     market = {'closed': True, 'automaticallyResolved': True, 'closedTime': '2026-10-29 20:10:50+00',
               'outcomePrices': '["0", "1"]', 'umaResolutionStatuses': '["proposed", "proposed"]'}
     label = _label(market, event=event, target_date='2026-10-28', fetched_at='2026-10-30T00:00:00Z')
-    assert label['status'] == 'official_gamma_binary' and label['winner'] == 'No'
+    assert label == {'status': 'official_gamma_binary', 'winner': 'No',
+                     'resolved_at': '2026-10-29T22:29:47+00:00',
+                     'basis': 'Gamma event+market automaticallyResolved, closedTime, binary outcomePrices'}
     assert _label(market, event={**event, 'automaticallyResolved': False},
                   target_date='2026-10-28', fetched_at='2026-10-30T00:00:00Z')['status'] == 'unverified'
+
+def test_later_gamma_market_close_requires_terminal_flags_binary_payout_and_late_fetch():
+    event = {'closed': True, 'automaticallyResolved': True, 'closedTime': '2026-10-29T19:18:40Z'}
+    market = {'closed': True, 'automaticallyResolved': True,
+              'closedTime': '2026-10-29T19:18:46.256061+00:00', 'outcomePrices': '["1","0"]'}
+    label = _label(market, event=event, target_date='2026-10-29', fetched_at='2026-10-30T05:00:00Z')
+    assert label == {'status': 'official_gamma_binary', 'winner': 'Yes',
+                     'terminal_evidence_after': '2026-10-29T19:18:46.256061+00:00',
+                     'basis': 'Gamma event+market automaticallyResolved, later market closedTime, binary outcomePrices'}
+    assert _label(market, event=event, target_date='2026-10-29',
+                  fetched_at=market['closedTime']) == label
+    for changed_event, changed_market, fetched in (
+        ({**event, 'closed': False}, market, '2026-10-30T05:00:00Z'),
+        ({**event, 'automaticallyResolved': False}, market, '2026-10-30T05:00:00Z'),
+        (event, {**market, 'closed': False}, '2026-10-30T05:00:00Z'),
+        (event, {**market, 'automaticallyResolved': False}, '2026-10-30T05:00:00Z'),
+        (event, market, '2026-10-29T19:18:46Z'),
+        (event, {**market, 'outcomePrices': '["0.9","0.1"]'}, '2026-10-30T05:00:00Z'),
+    ):
+        assert _label(changed_market, event=changed_event, target_date='2026-10-29',
+                      fetched_at=fetched)['status'] == 'unverified'
+    assert _label(market, event=event, target_date='2026-10-30',
+                  fetched_at='2026-10-30T05:00:00Z')['status'] == 'unverified'
 
 @pytest.mark.parametrize('prices', ('[true,false]', '[false,true]', [True, False], [False, True],
                                           '[1.0,0.0]', [1.0, 0.0]))
@@ -1205,6 +1230,70 @@ def test_closed_market_both_documented_404_books_can_corroborate_without_quotes(
         assert row['captures'][kind]['failure_code'] == 'no_book'
     assert row['captures']['awc']['status'] == 200
     assert row['captures']['tokens']['status'] == row['captures']['resolution']['status'] == 200
+    assert report(tmp_path)['resolved_event_days'] == 1
+
+
+def test_later_market_close_new_capture_corroborates_without_recrediting_old_row(tmp_path):
+    config, event = fixture()
+    market = event['markets'][0]
+    event.update(closed=True, automaticallyResolved=True, closedTime='2026-10-29T19:18:40Z')
+    market.update(closed=True, automaticallyResolved=True,
+                  closedTime='2026-10-29T19:18:46.256061+00:00', outcomePrices='["1","0"]')
+    old_at = '2026-10-30T05:00:00+00:00'
+    raw_gamma = json.dumps(event)
+    old_row = {'sequence': 0, 'previous_sha256': None, 'status': 'captured',
+               'event_id': config.event_id, 'market_id': config.market_id,
+               'target_date': config.target_date, 'station': config.station, 'zone': config.zone,
+               'campaign_start_at': config.start_at, 'rule_sha256': config.rule_sha256,
+               'captured_at': old_at,
+               'captures': {'gamma': {'body': raw_gamma, 'sha256': hashlib.sha256(raw_gamma.encode()).hexdigest(),
+                                      'url': 'https://gamma-api.polymarket.com/events/slug/' + config.slug,
+                                      'status': 200, 'first_available_at': old_at}},
+               'gamma_label': {'status': 'unverified', 'reason': 'ambiguous official payout'},
+               'label': {'status': 'unverified', 'reason': 'same-venue finality corroboration unavailable'}}
+    old_bytes = _canonical(old_row)
+    (tmp_path / '000000.json').write_bytes(old_bytes)
+    assert report(tmp_path)['resolved_event_days'] == 0
+    base = {'condition_id': market['conditionId'], 'event_id': int(config.event_id),
+            'event_slug': config.slug, 'resolved': True, 'closed': True, 'module': 'v1_ctf'}
+    tokens = {'data': [
+        {**base, 'token_id': '123', 'opposite_token_id': '456', 'outcome_index': 0,
+         'outcome': 'Yes', 'final_price': 1},
+        {**base, 'token_id': '456', 'opposite_token_id': '123', 'outcome_index': 1,
+         'outcome': 'No', 'final_price': 0}]}
+    resolution = {'data': [{'condition_id': market['conditionId'], 'status': 'resolved'}]}
+    no_book = b'{"error":"No orderbook exists for the requested token id"}'
+    calls = []
+    def fetch(url, limit):
+        calls.append(url)
+        if 'gamma-api' in url: return raw_gamma.encode(), {}
+        if 'open-meteo' in url: return b'{"hourly":{}}', {}
+        if '/book?' in url: return no_book, {'Status': 404}
+        if 'aviationweather' in url: return b'', {'Status': 200}
+        if '/v2/tokens?' in url: return json.dumps(tokens).encode(), {}
+        if '/v2/resolutions?' in url: return json.dumps(resolution).encode(), {}
+        raise AssertionError(url)
+    future = datetime(2026, 10, 30, 6, tzinfo=timezone.utc)
+    result = Campaign(tmp_path, config, fetch=fetch, clock=lambda: future).once()
+    assert result['status'] == 'captured' and result['label'] == 'venue_corroborated_final_binary'
+    assert len(calls) == 7
+    assert (tmp_path / '000000.json').read_bytes() == old_bytes
+    saved = json.loads((tmp_path / '000001.json').read_text())
+    assert saved['gamma_label']['terminal_evidence_after'] == '2026-10-29T19:18:46.256061+00:00'
+    assert 'resolved_at' not in saved['gamma_label']
+    assert report(tmp_path)['resolved_event_days'] == 1
+    for kind, key, value in (('resolution', 'status', 'proposed'),
+                             ('resolution', 'condition_id', '0x' + 'b'*64),
+                             ('tokens', 'final_price', 0)):
+        forged = json.loads(json.dumps(saved))
+        document = json.loads(forged['captures'][kind]['body'])
+        document['data'][0][key] = value
+        body = json.dumps(document)
+        forged['captures'][kind]['body'] = body
+        forged['captures'][kind]['sha256'] = hashlib.sha256(body.encode()).hexdigest()
+        (tmp_path / '000001.json').write_bytes(_canonical(forged))
+        assert report(tmp_path)['resolved_event_days'] == 0
+    (tmp_path / '000001.json').write_bytes(_canonical(saved))
     assert report(tmp_path)['resolved_event_days'] == 1
 
 

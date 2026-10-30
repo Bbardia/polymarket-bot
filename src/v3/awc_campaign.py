@@ -582,19 +582,26 @@ def _label(market: dict, *, event: dict | None = None,
     try:
         # Historical Gamma automatically-resolved events expose closedTime but
         # no resolvedAt. Require both market and event terminal flags there.
+        terminal_evidence_after = None
         if market.get('resolvedAt'):
             resolved = _aware(market['resolvedAt'])
+            evidence_at = resolved
             basis = 'Gamma closed + resolvedAt + binary outcomePrices'
         elif (event and event.get('closed') is True and event.get('automaticallyResolved') is True
               and market.get('automaticallyResolved') is True):
             resolved = _aware(event['closedTime'])
             market_closed = _aware(market['closedTime'])
+            evidence_at = max(resolved, market_closed)
             if market_closed > resolved:
-                raise ValueError('market close after event resolution')
-            basis = 'Gamma event+market automaticallyResolved, closedTime, binary outcomePrices'
+                # The later close is only a lower bound on when both terminal
+                # flags could be observed, not Gamma's actual resolution time.
+                terminal_evidence_after = market_closed.isoformat()
+                basis = 'Gamma event+market automaticallyResolved, later market closedTime, binary outcomePrices'
+            else:
+                basis = 'Gamma event+market automaticallyResolved, closedTime, binary outcomePrices'
         else:
             raise ValueError('no explicit resolution metadata')
-        if (target_date and resolved.date() < date.fromisoformat(target_date)) or (fetched_at and resolved > _aware(fetched_at)):
+        if (target_date and evidence_at.date() < date.fromisoformat(target_date)) or (fetched_at and evidence_at > _aware(fetched_at)):
             raise ValueError('resolution outside available window')
         prices = _array(market.get('outcomePrices'))
         if (len(prices) != 2 or type(prices[0]) not in (str, int) or
@@ -604,7 +611,8 @@ def _label(market: dict, *, event: dict | None = None,
     except (ValueError, TypeError, KeyError):
         return {'status': 'unverified', 'reason': 'ambiguous official payout'}
     return {'status': 'official_gamma_binary', 'winner': 'Yes' if str(prices[0]) == '1' else 'No',
-            'resolved_at': resolved.isoformat(), 'basis': basis}
+            **({'terminal_evidence_after': terminal_evidence_after} if terminal_evidence_after else
+               {'resolved_at': resolved.isoformat()}), 'basis': basis}
 
 
 class Campaign:
